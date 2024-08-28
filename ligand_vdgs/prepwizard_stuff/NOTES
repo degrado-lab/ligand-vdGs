@@ -1,0 +1,17 @@
+First, I saved database_dict checkpoints in pkl format, but my scripts would keep
+on dying because of memory issues. 77k-ish pdbs were able to be processed.
+I changed the output filetype to json, and re-did the database_dict format to exclude 
+use of tuples in dict keys. This method was used on the remaining 22k-ish pdbs. 
+
+Then, with the database_dict that was output, I wrote out the binding sites of each PDB
+to consolidated_BioLiP2_trimmed.
+
+
+============
+Notes for Alan: I need to provide a script to divide pdb database dir into subdirs
+to reduce filesystem burden and be compatible with the pdb mirror format.
+
+
+==========
+in the future: 
+remove entries where it's just an iron sulfur cluster
