@@ -1,0 +1,3 @@
+[submodule "ligand_vdgs/programs/vdG-miner"]
+	path = ligand_vdgs/programs/vdG-miner
+	url = git@github.com:tan-sophia/vdG-miner.git
