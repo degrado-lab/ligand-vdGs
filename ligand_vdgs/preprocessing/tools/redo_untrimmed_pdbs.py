@@ -1,18 +1,13 @@
 '''
 Reduces size of the 50G consolidated_BioLiP2_split/ database by 
-- ...
+- ...placeholder...
 
-Usage: 
+Usage: (TODO: verify) 
 cd $YOUR_SMART-VDMS_DIR
-pip install -e .
-??????? pip install without -e
-python -m smart_vdms.scripts.trim_database
-
-
+pip install -e . # for debugging and developing
+pip install .    # for users
+python -m smart_vdms.tools.redo_untrimmed_pdbs
 '''
-
-
-
 
 import os
 import traceback
@@ -22,24 +17,18 @@ import json
 import prody as pr
 
 from smart_vdms.functions.interactions import add_pdb_to_nr_db_dict
-from smart_vdms.functions.redundancy import print_lig_shell
 
+# TODO: convert to command-line args
 origin_dir = '/home/sophia/DockDesign/databases/consolidated_BioLiP2_split'
-target_dir = '/home/sophia/DockDesign/databases/consolidated_BioLiP2_trimmed'
+target_dir = 'redo_pdbs'
 lig_avg_bfactor_cutoff = 40 # default is 40
-output_database_dict_name = '20240809_database_dict.json'
-overwrite_pdbs = True # If set to true NEED TO ADD code for checking whether a pdbfile already exists (TODO)
-
-
-restart = True
-pdbs_already_done = 'log_processed_pdbs.txt'
-previous_checkpoint_dict = 'checkpoint.pkl'
-
+output_database_dict_name = '20240810_database_dict_remainingpdbs.json'
+overwrite_pdbs = False # TODO: If set to true NEED TO ADD code for checking whether a pdbfile already exists
 
 def main():
                 
     print('Starting...', flush=True)
-    checkpoint_name = output_database_dict_name.rstrip('.pkl') 
+    checkpoint_name = 'checkpoint'+output_database_dict_name
 
     # Iterate through pdb files
     pdbfile_ix = 0
@@ -53,30 +42,15 @@ def main():
     # See get_lig_interacting_chains() for more details. 
     database_dict = {} 
 
-    if restart:
-        with open(pdbs_already_done) as inF:
-            pdbs_done = [i.strip() for i in inF.readlines()]
-        print("Starting pickle load from previous run", flush=True)
-        database_dict = pkl.load(open(previous_checkpoint_dict, 'rb'))
-        #database_dict = json.load(open(previous_checkpoint_dict, 'r'))
-        print("Done with pickle load")
-        print('Num of PDBs processed in a previous run: ', 
-            len([i for i in pdbs_done if i.endswith('.pdb')]))
-
-        print('Converting dict')
-        # Converting keys to strings
-        convert_nested_dict_keys_and_values(database_dict)
-
-    for subdir in os.listdir(origin_dir):
+    for idx, subdir in enumerate(os.listdir(origin_dir)):
+        if idx < 746:
+            continue
         subdir_path = os.path.join(origin_dir, subdir)
 
         pdbfiles = os.listdir(subdir_path)
 
         for pdbfile in pdbfiles:
             pdbfile_ix += 1
-            if restart:
-                if pdbfile in pdbs_done:
-                    continue
             print(pdbfile, flush=True)
             try:
 
@@ -94,29 +68,12 @@ def main():
                 print(e)
                 traceback.print_exc()
 
-            if pdbfile_ix % 1000 == 0:
+            if pdbfile_ix % 100 == 0:
                 print(pdbfile_ix)
                 print(f"Dumping on pdbfile_ix: {pdbfile_ix}", flush=True)
                 json.dump(database_dict, open(checkpoint_name, "w"))
 
-        #if pkl_dumped: # TODO: get rid
-        #    break
-
-    
-    print("Starting final JSON dump", flush=True)
-    json.dump(database_dict, open(output_database_dict_name, "w"))
-    print("Done with final JSON dump", flush=True)
-
-    # Now that the ligand instances have been deduplicated, print out only the binding sites
-    # (10A around the lig)
-    print_lig_shell(database_dict, origin_dir, target_dir, overwrite_pdbs)
-    #print_only_nr_chains_interacting_with_lig(database_dict, origin_dir, target_dir, overwrite_pdbs)
-    
-
     print('Ending...')
-
-    
-
 
 def convert_nested_dict_keys_and_values(d):
     """Recursively converts the keys (tuples to underscore-separated strings)
@@ -151,17 +108,6 @@ def convert_nested_dict_keys_and_values(d):
         # Update the outer dictionary with the updated nested dictionary
         d[outer_key] = updated_nested_dict
 
-
-
-
-
-
-
-
-
-
-
-
 '''
     Select each ligand and determine what chains it interacts with. 
     
@@ -176,16 +122,7 @@ def convert_nested_dict_keys_and_values(d):
     monomers (intra-pdb redundancy). You can additionally make a guess about whether 2 pdbs are
     redundant by seeing if their acc. codes are similar (i.e. in the same series), and their ligs 
     and vdms are on the same chains/resnums (inter-pdb redundancy).
-    
-    
-    '''
-
-
-
-
-
-        
-
+'''
 
 if __name__ == "__main__":
     main()

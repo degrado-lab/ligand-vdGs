@@ -1,0 +1,9 @@
+First, I saved database_dict checkpoints in pkl format, but my scripts would keep
+on dying, and I later discovered that it was because of memory issues. 
+77k-ish pdbs were able to be processed with the pkl checkpoints.
+To address the memory consumption issue, I changed the output filetype to json, 
+and re-did the database_dict format to exclude use of tuples in dict keys. This method 
+was used on the remaining 22k-ish pdbs. 
+
+Then, with the database_dict that was output, I wrote out the binding sites of each PDB
+to consolidated_BioLiP2_trimmed.

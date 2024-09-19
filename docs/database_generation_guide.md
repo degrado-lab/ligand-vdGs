@@ -9,7 +9,7 @@ vdGs. You have two options:
 
 ### Option 1: Setting Up a Custom Parent Database for vdG Extraction
 If you have your own custom PDB database that you want to use as the parent database, follow these instructions to set it up for vdG extraction.
-Explain that you need it in the same database structure as the mirrored RCSB PDB.
+TODO: Explain that you need it in the same database structure as the mirrored RCSB PDB.
 
 ...placeholder for instructions here...
 

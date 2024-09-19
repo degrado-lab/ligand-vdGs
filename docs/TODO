@@ -1,0 +1,13 @@
+- Scrub the database of irrelevant PDBs (like extremely the extremely large complexes - PSI, PSII, ribosomes, interactions with iron sulfur clusters [of which there are many], etc.)
+- Provide a script in `preprocessing/` that divides the parent PDB database into subdirectories in
+the same format as a mirror of the PDB.
+- Remove requirement that a vdm must have a phi and psi recorded, because this precludes terminal residues from being considered as vdms (e.g. phosphates preferentially bind N-terminal residues, which will be discarded because a phi torsion cannot be calculated from N-termini).
+- Automate finding smarts patterns in a query PDB for positive control purposes (refer to vdgs.py for finding smarts).
+- Determine what a "default bond" is in smarts patterns. For example, rdkit would miss examples of bromobenzene if there isn't explicit bond representation. Test case: for the saxitoxin ligand of 6a91, check if the results for 'C1[NH]~C([NH2])~NC1' is the same as without the "~"; it's especially tricky because it's a tautomer.
+- Add instructions in the README for putting vdG-miner in PYTHONPATH.
+- Investigate why there are no GLN vdms in vdGs of carboxamide...
+- Add a note in the README or documentation that when counting the atom indices within a smarts pattern (necessary for specifying symmetric/identical atoms), implicit atoms need to be skipped. For example, in C[NH2]C, the last C would be index 2 (skipping over the H) and not index 3.
+- smarts_to_cgs.py fails for polysaccharides, like 5a0y. The lines suppressing stdout/stderr
+in vdgs/cg.py must be commented out to view obabel errors. Unfortunately, sugars (connected to other residues) fail to be parsed completely and aren't recorded in the output file matches.pkl. This is true for all ligands that are covalently bonded to another residue; investigate to find out other instances of this edge case besides parsing sugars.
+- scripts/validate_known_poses.py, the query CG must have the same number of atoms as the database CG, but it doesn't always. Investigate those cases. This error is observed in the loop that samples the database vdGs (line 108).
+- When writing a wrapper script for vdG-miner's 3 python scripts (see vdG-miner/example_usage.sh), make sure to throw an Exception if downstream output directories (such as vdg_pdbs) have contents that could be accidentally overwritten.
