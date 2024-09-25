@@ -2,45 +2,35 @@
 Given a query structure (a crystal structure of a protein-ligand complex) and its binding site 
 residues, determine whether any vdGs can correctly place the chemical groups within the 
 ligand of the query structure.
+
+Usage: 
+    >> python validate_known_poses.py your_file.yml 
+
 '''
+
+import sys
 import os
+import yaml
 from itertools import combinations, permutations
 import numpy as np
 import prody as pr
 
-query_path = '/wynton/home/degradolab/skt/docking/query_structs/2nta.pdb'
-vdgs_dir = '/wynton/group/degradolab/skt/vdG/databases/vdgs/sulfonamide/vdg_pdbs'
-output_dir = 'vdg_matches/2nta'
+script, yml_file = sys.argv
 
-# Define the binding site residues of the query structure to dock chemical groups onto.
-bindingsite_residues = []
-bindingsite_residues.append(['A', 'A', 217])
-bindingsite_residues.append(['A', 'A', 219])
-#bindingsite_residues.append(['A', 'A', 220])
-#bindingsite_residues.append(['A', 'A', 221])
-#bindingsite_residues.append(['A', 'A', 216])
-#bindingsite_residues.append(['A', 'A', 215])
-#bindingsite_residues.append(['A', 'A', 181])
-### for 2vij ### bindingsite_residues.append(['A', 'A', 294])
-### for 2vij ### bindingsite_residues.append(['A', 'A', 296])
-
-# Define the atoms of the query's ligand chemical group (CG) used as the "ground truth".
-### for 2vij ### query_lig_res = ['B', 'A', 3000]
-### for 2vij ### query_cg_atoms = ['O52', 'S41', 'O53', 'C42', 'N75']
-query_lig_res = ['B', 'A', 301]
-query_cg_atoms = ['O2', 'S2', 'O3', 'N1', 'N2']
-
-# Don't need to redefine these variables
-rmsd_threshold = 0.8 # threshold (Ang) for defining a vdG as a match to the "ground truth".
-
-# ----------------------------------------------------------------------------------------
 def main():
+    # Parse inputs from yml file
+    vdgs_dir, cg_name, query_path, bindingsite_residues, query_lig_res, \
+               query_cg_atoms, rmsd_threshold, out_dir = parse_yaml_input(yml_file)
+
+    
     # Set up output dir
+    pdbname = query_path.split('/')[-1].rstrip('.pdb')
+    output_dir = os.path.join(out_dir, pdbname)
     if os.path.exists(output_dir):
         if os.listdir(output_dir):
             raise ValueError(f'The output directory {output_dir} is not empty. '
-                             'Please remove contents or specify a new output directory '
-                             'to prevent accidental overwriting.')
+                             'Please remove its contents or specify a new output '
+                             'directory to prevent accidental overwriting.')
     else: 
         os.makedirs(output_dir)
 
@@ -61,11 +51,6 @@ def main():
         query_bb_coords[tuple(bsr)] = bbcoords
     # Superpose bb+cg of database vdG onto the query structure and calculate rmsd.
     database_vdg_names = os.listdir(vdgs_dir)
-    
-    #####################print('********************************')
-    #####################print('TESTING ON 2NTA ONLY')
-    #####################print('********************************')
-    #####################database_vdg_names = [z for z in database_vdg_names if ('2nta' in z and z.endswith('pdb'))]
     database_vdg_paths = [os.path.join(vdgs_dir, d) for d in database_vdg_names]
     pdbnames = [i.split('/')[-1] for i in database_vdg_paths]
     assert len(database_vdg_paths) == len(set(pdbnames))
@@ -134,7 +119,6 @@ def main():
                     # Write out just the vdms in this permutation
                     perm_resinds_str = ' '.join([str(i) for i in perm_resinds])
                     perm_resinds_sele = f'resindex {perm_resinds_str}'
-                    print('\t\t', perm_resinds_sele)
                     moved_vdg_perm_resinds_obj = moved_vdg.copy().select(
                         f'({perm_resinds_sele}) or (occupancy > 2.8)') # occ 3 = CG
                     vdg_pdbname = db_vdg_path.rstrip('/').split('/')[-1].rstrip('.pdb')
@@ -264,6 +248,20 @@ def get_database_cg_coords(database_vdg):
     ordered_cg_atoms = [cg_atoms[ind] for ind in sorted_indices]
     ordered_cg_atom_coords = [list(a.getCoords()) for a in ordered_cg_atoms]
     return ordered_cg_atom_coords
+
+def parse_yaml_input(yml_file):
+    with open(yml_file, 'r') as inF:
+        user_data = yaml.load(inF, Loader=yaml.FullLoader)
+    vdgs_dir = user_data['vdgs_dir']
+    cg_name = user_data['cg_name']
+    query_path = user_data['query_path']
+    bindingsite_residues = user_data['bindingsite_residues']
+    query_lig_res = user_data['query_lig']
+    query_cg_atoms = user_data['query_cg_atoms']
+    rmsd_threshold = user_data['rmsd_threshold']
+    out_dir = user_data['out_dir']
+    return vdgs_dir, cg_name, query_path, bindingsite_residues, query_lig_res, \
+           query_cg_atoms, rmsd_threshold, out_dir
 
 if __name__ == "__main__":
     main()

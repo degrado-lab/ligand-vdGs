@@ -3,8 +3,7 @@ The `ligand-vdGs` and `vdG-miner` packages require the input PDB database (the "
 to match the directory structure
 used by the RCSB PDB mirror. This script formats your PDB database to conform to that structure.
 
-Each PDB file 
-will be organized into subdirectories based on the inner two characters of its name. 
+Each PDB file will be organized into subdirectories based on the inner two characters of its name. 
 For example, a PDB file named 
 `1ABC.pdb` will be placed into a subdirectory named `AB`, resulting in the file path `AB/1ABC.pdb`.
 
