@@ -1,4 +1,5 @@
 - Scrub the database of irrelevant PDBs (like extremely the extremely large complexes - PSI, PSII, ribosomes, interactions with iron sulfur clusters [of which there are many], etc.)
+- Migrate relevant smart-vdms scripts in ligand-vdGs. Address the errors in writeoutpdbs_portion_of_trimdatabase_script.log.
 - Provide a script in `preprocessing/` that divides the parent PDB database into subdirectories in
 the same format as a mirror of the PDB.
 - Remove requirement that a vdm must have a phi and psi recorded, because this precludes terminal residues from being considered as vdms (e.g. phosphates preferentially bind N-terminal residues, which will be discarded because a phi torsion cannot be calculated from N-termini).
@@ -13,3 +14,5 @@ in vdgs/cg.py must be commented out to view obabel errors. Unfortunately, sugars
 - When writing a wrapper script for vdG-miner's 3 python scripts (see vdG-miner/example_usage.sh), make sure to throw an Exception if downstream output directories (such as vdg_pdbs) have contents that could be accidentally overwritten.
 - Update format_parent_database.py so that it renames PDBs with unique 4-character identifiers if they aren't already.
 - Add pyyaml to environment.yml
+- Add symmetry for validate_known_poses.py (for example, the sulfonamide oxygens in 2ntr and 2nta)
+- Remove redundant vdGs 

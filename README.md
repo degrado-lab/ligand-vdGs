@@ -2,7 +2,7 @@
 
 ## Description
 
-This package builds upon https://github.com/degrado-lab/vdG-miner by Rian Kormos for generating a [vdG](hyperlink_to_preprint) library. The vdG library is then used for docking ligands into known binding sites.
+This package builds upon https://github.com/degrado-lab/vdG-miner by Rian Kormos for generating a [vdG](hyperlink_to_eventual_preprint) library. The vdG library is then used for docking ligands into known binding sites.
 
 ## Prerequisites
 ...placeholder...Probe, prepwizard/reduce, etc...

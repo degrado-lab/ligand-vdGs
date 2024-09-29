@@ -1,0 +1,34 @@
+# This yml file is used to define a binding site of a known structure, so that
+# specified CGs can be docked into the binding site. 
+
+#--------------------- Please define these variables. -------------------------
+# Path to vdG library
+vdgs_dir: /wynton/group/degradolab/skt/docking/databases/vdg_lib/gem_diol/vdg_pdbs
+
+# CG name (can be a common name or a SMARTS string)
+cg_name: gem_diol 
+
+# Path to the query protein-ligand complex
+query_path: /wynton/home/degradolab/skt/docking/query_structs/6a91.pdb
+
+# Binding site residues of the query structure to dock chemical groups onto.
+# Each residue should be classified by its [PDB segment, chain, residue number].
+bindingsite_residues:
+    - ['A', 'A', 1356]
+
+# Query ligand ([PDB segment, chain, residue number])
+query_lig: ['J', 'A', 1610]
+
+# Atom names of the CG within the query ligand
+query_cg_atoms: ['C10', 'C16', 'O17', 'O18', 'C19']
+#query_cg_atoms: ['C10', 'C16', 'O18', 'O17', 'C19']
+
+# ------------------------------------------------------------------------------------
+#                  Default values set below. Redefine if necessary                    
+# ------------------------------------------------------------------------------------
+
+# RMSD threshold (in Ang) for defining a vdG as a match to the "ground truth".
+rmsd_threshold: 0.8
+
+# Directory to output matches
+out_dir: ../vdm_matches

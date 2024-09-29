@@ -3,9 +3,10 @@ Given a query structure (a crystal structure of a protein-ligand complex) and it
 residues, determine whether any vdGs can correctly place the chemical groups within the 
 ligand of the query structure.
 
-Usage: 
-    >> python validate_known_poses.py your_file.yml 
-
+Usage:
+    >> cd $YOUR_LIGAND_VDGS_DIR
+    >> pip install .
+    >> python -m ligand_vdgs.scripts.validate_known_poses.py $YOUR_YAML_FILE
 '''
 
 import sys
@@ -21,7 +22,6 @@ def main():
     # Parse inputs from yml file
     vdgs_dir, cg_name, query_path, bindingsite_residues, query_lig_res, \
                query_cg_atoms, rmsd_threshold, out_dir = parse_yaml_input(yml_file)
-
     
     # Set up output dir
     pdbname = query_path.split('/')[-1].rstrip('.pdb')
@@ -57,15 +57,18 @@ def main():
     database_vdgs = [pr.parsePDB(d) for d in database_vdg_paths]
 
     # Calc rmsd on pairs of bb residues (incl. CG), but consider whether to add single bb
-    # residues in case there aren't many vdGs matching pairs of bb residues.
+    # residues in case there aren't many vdGs matching pairs of bb residues. 
     num_db_vdg_within_rmsd = 0
-    '''
+    
     # If adding singles: 
     query_res_sets = [[b] for b in bindingsite_residues] + list(
         combinations(bindingsite_residues, 2))
+    
     '''
-    # If only considering pairs: 
+    # If only considering pairs: # note that there may be FGs in solved structures
+    #                            # with only 1 vdM.
     query_res_sets = list(combinations(bindingsite_residues, 2))
+    '''
     
     # Iterate over pairs (and maybe singles) of binding site residues and determine
     # whether any of the vdGs in the database match the "ground truth" binding site
@@ -225,7 +228,7 @@ def get_coords(struct, atomnames, seg, ch, res, pdbpath):
             atom_sel_str = f'chain {ch} and resnum {res} and name {atom}'
 
         atom_sel = struct.select(atom_sel_str) 
-        if len(atom_sel) != 1:
+        if len(atom_sel) != 1 or atom_sel is None:
             raise ValueError(f'segment {seg} chain {ch} resnum {res} name {atom} is '
                              f'expected to select one atom, but it corresponds to '
                              f'{len(atom_sel)} atoms in {pdbpath}')

@@ -44,7 +44,7 @@ def main():
     # Set logfile. If logfile exists, set a new logfile name.
     logfile = os.path.join(out_dir, 'logs', f'{cg}_log')
     if os.path.exists(logfile):
-        logfile = logfile + '_' + time.time()
+        logfile = logfile + '_' + str(time.time())
 
     # Run smarts_to_cg.py
     if trial_run: 
