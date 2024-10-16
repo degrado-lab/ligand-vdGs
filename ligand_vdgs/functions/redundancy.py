@@ -1,6 +1,6 @@
 import os
 import prody as pr
-from smart_vdms.functions.utils import set_up_outdir
+from ligand_vdgs.functions.utils import set_up_outdir
 
 def check_pdbnames(pdbfile1, pdbfile2):
     # Returns True if the pdb names share at least 3 out of 4 characters 

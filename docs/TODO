@@ -2,6 +2,8 @@
 - Migrate relevant smart-vdms scripts in ligand-vdGs. Address the errors in writeoutpdbs_portion_of_trimdatabase_script.log.
 - Provide a script in `preprocessing/` that divides the parent PDB database into subdirectories in
 the same format as a mirror of the PDB.
+- Give usage instructions for trim_database.py
+- Give usage instructions in `preprocessing/protonate_pdbs.py`.
 - Remove requirement that a vdm must have a phi and psi recorded, because this precludes terminal residues from being considered as vdms (e.g. phosphates preferentially bind N-terminal residues, which will be discarded because a phi torsion cannot be calculated from N-termini).
 - Automate finding smarts patterns in a query PDB for positive control purposes (refer to vdgs.py for finding smarts).
 - Determine what a "default bond" is in smarts patterns. For example, rdkit would miss examples of bromobenzene if there isn't explicit bond representation. Test case: for the saxitoxin ligand of 6a91, check if the results for 'C1[NH]~C([NH2])~NC1' is the same as without the "~"; it's especially tricky because it's a tautomer.
@@ -16,3 +18,5 @@ in vdgs/cg.py must be commented out to view obabel errors. Unfortunately, sugars
 - Add pyyaml to environment.yml
 - Add symmetry for validate_known_poses.py (for example, the sulfonamide oxygens in 2ntr and 2nta)
 - Remove redundant vdGs 
+- Figure out why in /wynton/group/degradolab/skt/vdG/databases/vdgs/sulfonamide/vdg_pdbs/2vtd__A_1441_1.pdb, an extra N in "LKM" came along for the ride. And also UNDO the raise ValueError 'The query CG must have the same num. of atoms as the database CG.' in find_matches.py
+- Lack of segments in the BioLiP2 database is causing vdGs to overwrite each other.

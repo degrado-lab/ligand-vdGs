@@ -1,14 +1,16 @@
 '''
 Stand-alone script that uses Schrodinger prepwizard to optimize hydrogens in pdb structures.
 
-My prepwizard flags: 
--disulfides
--glycosylation
+Prepwizard flags: 
+-disulfides (add?)
+-glycosylation (add?)
+-rehtreat
+-noimpref
 
-No waters in my pdbs possibly. check if there are.
+There shouldn't be waters in the BioliP2 database, so you shouldn't need flags for
+treatment of waters, but double check if there are waters in any of the PDBs.
 
-Describe how to input the batch numbers.
-
+TODO: Describe how to input the batch numbers.
 '''
 
 # Script settings. TODO: convert to command line args
@@ -25,7 +27,7 @@ import sys
 import subprocess
 import time
 import argparse
-from smart_vdms.functions.utils import valid_database_subdir_format, set_up_outdir
+from ligand_vdgs.functions.utils import valid_database_subdir_format, set_up_outdir
 
 def determine_subdirs_in_batch(all_subdirs, num_batches, batch_index):
     # Ensure num_batches is at least 1 to avoid division by zero

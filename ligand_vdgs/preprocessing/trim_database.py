@@ -9,10 +9,10 @@ Reduces size of the 50G consolidated_BioLiP2_split/ database by
   series or not - double check that and describe here.)
 
 Usage: (TODO: verify)
-cd $YOUR_SMART-VDMS_DIR
+cd $YOUR_LIGAND-VDGS_DIR
 pip install -e . # for debugging and developing
 pip install .    # for users
-python -m smart_vdms.scripts.trim_database
+python -m ligand_vdgs.preprocessing.trim_database
 
 NOTE the reason this script takes forever is because there are a lot of 
 "ligands" that are like ALAA, ALAB, ALA1, ALA2, etc. and are not actually
@@ -27,8 +27,8 @@ import pickle as pkl
 import json
 import prody as pr
 
-from smart_vdms.functions.interactions import add_pdb_to_nr_db_dict
-from smart_vdms.functions.utils import set_up_outdir
+from ligand_vdgs.functions.interactions import add_pdb_to_nr_db_dict
+from ligand_vdgs.functions.utils import set_up_outdir
 
 origin_dir = '/home/sophia/DockDesign/databases/consolidated_BioLiP2_split'
 target_dir = '/home/sophia/DockDesign/databases/consolidated_BioLiP2_trimmed'

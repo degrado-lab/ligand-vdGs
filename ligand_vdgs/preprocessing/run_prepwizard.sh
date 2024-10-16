@@ -56,6 +56,6 @@ else
   echo "SLURM_ARRAY_TASK_ID does not match any expected values."
 fi
 
-python -m smart_vdms.tools.protonate_pdbs --batch_index $batchInd
+python -m ligand_vdgs.preprocessing.protonate_pdbs --batch_index $batchInd
 
 done

@@ -1,3 +1,3 @@
 This `preprocessing` directory contains scripts for preparing a parent database before extracting vdGs to create a vdG library. 
 
-TODO: merge this documentation with `docs/database_generation_guide.md`.
+The [Database Generation Guide](docs/database_generation_guide.md) located in `vdG-ligands/docs/` describes how these scripts should be used.
