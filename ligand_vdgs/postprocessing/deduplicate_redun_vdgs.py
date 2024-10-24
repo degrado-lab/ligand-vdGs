@@ -3,12 +3,13 @@ Removes redundant vdGs from the vdG library. Redundant vdGs are defined as havin
     1. CG and vdM AA identities/positions (backbones within a specified RMSD threshold)
     2. sequence similarity of residues flanking the vdMs (specified by seq. similarity 
        threshold)
-    3. similar positions of the flanking residues (backbones within a specified RMSD 
+    3. similar positions of the flanking residues (CAs within a specified RMSD 
        threshold)
 '''
 
 import os
 import sys
+from itertools import combinations
 import numpy as np
 import prody as pr
 
@@ -16,7 +17,8 @@ import prody as pr
 
 script, CG = sys.argv
 
-vdg_pdbs_dir = f'/wynton/group/degradolab/skt/docking/databases/vdg_lib/{CG}/vdg_pdbs' # TODO: remove hardcoding
+vdg_pdbs_dir = '/wynton/home/degradolab/skt/docking/redun_trial/sulfonamide_tert/vdg_pdbs'
+#vdg_pdbs_dir = f'/wynton/group/degradolab/skt/docking/databases/vdg_lib/{CG}/vdg_pdbs' # TODO: remove hardcoding
 
 rmsd_thresh = 0.75
 seq_sim_thresh = 0.75
@@ -42,6 +44,7 @@ vdm_combos = {
                                              [  [CG coords], 
                                                 [bb N-Ca-C coords of Ala1, Ala2, Cys3, Phe4], 
                                                 [seq. +/- 5 of Ala1, Ala2, Cys3, Phe4], 
+                                                [CA   +/- 5 of Ala1, Ala2, Cys3, Phe4], 
                                                 [PDB path],
                                                 [PDB seg/chain/resnum of Ala1, Ala2, Cys3, Phe4]
                                              ], 
@@ -72,6 +75,55 @@ def main():
       # Characterize the vdM residues (bb coords, flanking residues, pdb paths, etc.)
       vdms_dict = get_vdm_res_features(prody_obj, pdbpath)
       # Determine the vdM combinations, up to 4 residues
+      vdm_resinds = list(vdms_dict.keys())
+      vdm_subsets = get_vdm_subsets(vdm_resinds)
+      # Iterate over subsets
+      for vdm_subset in vdm_subsets:
+         # Record these features in the same order as in vdm_subset. Then, sort all based on
+         # alphabetical order of the vdm AAs.
+         re_ordered_aas, re_ordered_bbcoords, re_ordered_flankingseqs, re_ordered_CAs, \
+            re_ordered_scrr = reorder_vdg_subset(vdm_subset, vdms_dict)
+
+def reorder_vdg_subset(vdm_subset, vdms_dict):
+   #### Step 1) Recording 
+   aas_of_vdms_in_order = []
+   bb_coords_of_vdms_in_order = []
+   flankingseqs_of_vdms_in_order = []
+   flanking_CA_coords_of_vdms_in_order = []
+   seg_ch_res_of_vdms_in_order = []
+   for _vdmresind in vdm_subset:
+      vdmAA, vdm_features = vdms_dict[_vdmresind]
+      aas_of_vdms_in_order.append(vdmAA)
+      vdm_seg_chain_resnum_resname, bb_coords, flanking_seq_dict = vdm_features
+      seg_ch_res_of_vdms_in_order.append(vdm_seg_chain_resnum_resname)
+      bb_coords_of_vdms_in_order.append(bb_coords)
+      flankingseqs = []
+      flankingCAs = []
+      sorted_flank_indices = sorted(list(flanking_seq_dict.keys()))
+      # Decompress the flanking AA and CA info
+      for flank_ind in sorted_flank_indices:
+         flank_resname, flank_ca = flanking_seq_dict[flank_ind]
+         flankingseqs.append(flank_resname)
+         flankingCAs.append(flank_ca)
+      flankingseqs_of_vdms_in_order.append(flankingseqs)
+      flanking_CA_coords_of_vdms_in_order.append(flankingCAs)
+   #### Step 2) Re-ordering based on alphabetical order
+   super_list = [aas_of_vdms_in_order, bb_coords_of_vdms_in_order, 
+      flankingseqs_of_vdms_in_order, flanking_CA_coords_of_vdms_in_order, 
+      seg_ch_res_of_vdms_in_order]
+   return sort_vdGs_by_AA(super_list)
+
+def sort_vdGs_by_AA(super_list):
+    # Check if all sublists have equal length
+    assert all(len(sublist) == len(super_list[0]) for sublist in super_list)
+    # Combine the sublists into a list of tuples, where each tuple corresponds to the 
+    # elements at the same index
+    combined = list(zip(*super_list))
+    # Sort the combined list based on the first element (from the first sublist)
+    sorted_combined = sorted(combined, key=lambda x: x[0])
+    # Unzip the sorted combined list back into sublists
+    sorted_sublists = list(zip(*sorted_combined))
+    return [list(sublist) for sublist in sorted_sublists]
 
 def get_vdm_res_features(prody_obj, pdbpath):
    # Identify the vdM residues (occ == 2). To be safe, select > 1.5 and < 2.5.
@@ -79,11 +131,8 @@ def get_vdm_res_features(prody_obj, pdbpath):
    vdm_resinds = set(vdm_residues.getResindices())
    # Record features of the vdm residues (bb coords, flanking residues, pdb paths, etc.)
    vdms_dict = {}
-   print('-----------')
-   print(pdbpath)
    for vdm_resind in vdm_resinds:
       vdm_obj = vdm_residues.select(f'resindex {vdm_resind}')
-      print('--------- CENTRAL RES', vdm_obj.getResnums()[0])
       # BB coords
       bb_coords = get_bb_coords(vdm_obj)
 
@@ -128,7 +177,25 @@ def get_vdm_res_features(prody_obj, pdbpath):
                break 
             # Otherwise, continue walking.
             prev_CA = curr_CA
-      # LEFT OFF HERE. I guess now, need to go compare subsets of vdgs for redundancy
+      # Get this vdm resind's PDB identifier (seg, chain, resnum)
+      vdm_seg_chain_resnum_resname = get_res_iden(vdm_obj)
+      # Store all into dict
+      vdm_descript = [vdm_seg_chain_resnum_resname, bb_coords, flanking_seq_dict]
+      vdm_AA = vdm_seg_chain_resnum_resname[-1]
+      assert vdm_resind not in list(vdms_dict.keys())
+      vdms_dict[vdm_resind] = [vdm_AA, vdm_descript]
+   return vdms_dict
+
+def get_res_iden(vdm_obj):
+   seg =     list(set(vdm_obj.getSegnames()))
+   chain =   list(set(vdm_obj.getChids()))
+   resnum =  list(set(vdm_obj.getResnums()))
+   resname = list(set(vdm_obj.getResnames()))
+   assert len(seg) == 1
+   assert len(chain) == 1
+   assert len(resnum) == 1
+   assert len(resname) == 1
+   return seg, chain, resnum, resname 
 
 def found_chain_break(flanking_seq_dict, chain_break_ind):
    # If a chain break is found, overwrite all the subsequent (or preceding) flanking
@@ -143,10 +210,6 @@ def found_chain_break(flanking_seq_dict, chain_break_ind):
       flanking_seq_dict[overwrite_ind] = ['X', None]
    return flanking_seq_dict
 
-
-
-
-
 def get_AA_and_CA_coords(prody_obj, current_resindex):
    if current_resindex < 0: 
       sel_str = f'resindex `{current_resindex}`'
@@ -157,6 +220,9 @@ def get_AA_and_CA_coords(prody_obj, current_resindex):
    if curr_resindex_obj is None:
       AA = 'X'
       CA_coords = None
+   elif curr_resindex_obj.protein is None: # not a residue
+      AA = 'X'
+      CA_coords = None
    else:
       curr_res_AA = list(set(curr_resindex_obj.getResnames()))
       assert len(curr_res_AA) == 1
@@ -165,7 +231,6 @@ def get_AA_and_CA_coords(prody_obj, current_resindex):
       assert len(CA_obj) == 1
       CA_coords = CA_obj.getCoords()[0]
    return AA, CA_coords
-
 
 def get_cg_coords(prody_obj):
    # The CG atoms have their occupancies set to >= 3.0, with unique values (e.g., 3.0, 
@@ -192,9 +257,15 @@ def get_bb_coords(obj):
       bb_coords.append(coord)
    return bb_coords
 
-#def get_vdm_combos():
+def get_vdm_subsets(input_list):
 #   # Group by quadruples, triples, pairs, and singles.
-
+    # Initialize an empty list to store all subsets
+    all_subsets = []
+    # Loop through subset sizes 1 to 4, generate combos, then add to list
+    for r in range(1, 5):
+        subsets = combinations(input_list, r)
+        all_subsets.extend(subsets)
+    return all_subsets
 
 if __name__ == "__main__":
     main()
