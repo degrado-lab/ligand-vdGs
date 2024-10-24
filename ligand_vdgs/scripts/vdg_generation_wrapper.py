@@ -41,13 +41,18 @@ def main():
     if not cg: 
         cg = smarts
 
+    # Set up outdir
+    if trial_run: 
+        out_dir = out_dir.rstrip('/') + '_trial' 
+    out_dir = set_up_outdir(out_dir) 
+
     # Set logfile. If logfile exists, set a new logfile name.
     logfile = os.path.join(out_dir, 'logs', f'{cg}_log')
     if os.path.exists(logfile):
         logfile = logfile + '_' + str(time.time())
 
     # Run smarts_to_cg.py
-    if trial_run: 
+    if trial_run:
         smarts_to_cg_cmd = f'python ligand_vdgs/programs/vdG-miner/vdg_miner/programs/smarts_to_cgs.py -s {smarts} -c {cg} -p {pdb_dir} -o {out_dir} -l {logfile} -t {trial_run}'
     else:
         smarts_to_cg_cmd = f'python ligand_vdgs/programs/vdG-miner/vdg_miner/programs/smarts_to_cgs.py -s {smarts} -c {cg} -p {pdb_dir} -o {out_dir} -l {logfile}'
@@ -65,6 +70,21 @@ def main():
     to_pdbs_cmd = f'python ligand_vdgs/programs/vdG-miner/vdg_miner/programs/fingerprints_to_pdbs.py -c {cg} -m {match_pkl} -l {logfile} -f {fingerprints} -p {pdb_dir} -o {out_dir} -s -e'
 
     subprocess.run(to_pdbs_cmd, shell=True, check=True)
+
+def set_up_outdir(out_dir):
+    # Set up output directory
+    if not os.path.exists(out_dir):
+        os.makedirs(out_dir)
+    else:
+        # Check to see if output directory is empty
+        if os.listdir(out_dir):
+            dir_exists_msg = (
+                  f'\tThe output directory {out_dir} is not empty. Please remove its '
+                  'contents or specify a different output directory path to avoid '
+                  'accidental overwriting.\n')
+            print('\n', dir_exists_msg)
+            raise ValueError(dir_exists_msg)
+    return out_dir
 
 if __name__ == '__main__':
     main()

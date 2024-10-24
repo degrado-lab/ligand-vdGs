@@ -21,7 +21,7 @@ bindingsite_residues:
 query_lig: ['B', 'A', 301]
 
 # Atom names of the CG within the query ligand
-query_cg_atoms: ['O2', 'S2', 'O3', 'N1', 'N2']
+query_cg_atoms: ['O2', 'S2', 'O3', 'N2', 'N1']
 #query_cg_atoms: ['O3', 'S2', 'O2', 'N2', 'N1']
 
 # ------------------------------------------------------------------------------------
@@ -32,4 +32,4 @@ query_cg_atoms: ['O2', 'S2', 'O3', 'N1', 'N2']
 rmsd_threshold: 1
 
 # Directory to output matches
-out_dir: vdm_matches
+out_dir: ../vdg_matches

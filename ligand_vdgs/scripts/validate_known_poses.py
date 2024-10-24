@@ -128,7 +128,14 @@ def main():
                     bsr_flat_list = [str(it) for sublist in q_res_set for it in sublist]
                     bsr_str = '_'.join(bsr_flat_list)
                     output_vdg_name = f'{vdg_pdbname}_{bsr_str}.pdb'
-                    output_vdg_path = os.path.join(output_dir, output_vdg_name)
+                    if len(q_res_set) == 1:
+                        subdir = 'single_res_matches'
+                    elif len(q_res_set) == 2:
+                        subdir = 'double_res_matches'
+                    subdir_path = os.path.join(output_dir, subdir)
+                    output_vdg_path = os.path.join(output_dir, subdir, output_vdg_name)
+                    if not os.path.exists(subdir_path):
+                        os.makedirs(subdir_path)
                     pr.writePDB(output_vdg_path, 
                                 moved_vdg_perm_resinds_obj.copy().select(
                                 'occupancy > 1.5'))
