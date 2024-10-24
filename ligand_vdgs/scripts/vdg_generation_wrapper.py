@@ -47,9 +47,11 @@ def main():
     out_dir = set_up_outdir(out_dir) 
 
     # Set logfile. If logfile exists, set a new logfile name.
-    logfile = os.path.join(out_dir, 'logs', f'{cg}_log')
+    logdir = os.path.join(out_dir, 'logs')
+    logfile = os.path.join(logdir, f'{cg}_log')
     if os.path.exists(logfile):
         logfile = logfile + '_' + str(time.time())
+    write_out_commandline_params(logfile, smarts, cg, pdb_dir, probe_dir, out_dir, logdir)
 
     # Run smarts_to_cg.py
     if trial_run:
@@ -85,6 +87,16 @@ def set_up_outdir(out_dir):
             print('\n', dir_exists_msg)
             raise ValueError(dir_exists_msg)
     return out_dir
+
+def write_out_commandline_params(logfile, smarts, cg, pdb_dir, probe_dir, out_dir, logdir):
+    if not os.path.exists(logdir):
+        os.mkdir(logdir)
+    with open(logfile, 'w') as _log:
+        _log.write(f'SMARTS: {smarts} \n')
+        _log.write(f'CG: {cg} \n')
+        _log.write(f'Parent PDB dir: {pdb_dir} \n')
+        _log.write(f'Probe dir: {probe_dir} \n')
+        _log.write(f'Output dir: {out_dir} \n')
 
 if __name__ == '__main__':
     main()
