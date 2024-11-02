@@ -83,6 +83,8 @@ def main():
          # alphabetical order of the vdm AAs.
          re_ordered_aas, re_ordered_bbcoords, re_ordered_flankingseqs, re_ordered_CAs, \
             re_ordered_scrr = reorder_vdg_subset(vdm_subset, vdms_dict)
+         # Add to `vdm_combos` dict
+         num_vdms_in_subset = len(vdm_subset)
 
 def reorder_vdg_subset(vdm_subset, vdms_dict):
    #### Step 1) Recording 
@@ -195,7 +197,7 @@ def get_res_iden(vdm_obj):
    assert len(chain) == 1
    assert len(resnum) == 1
    assert len(resname) == 1
-   return seg, chain, resnum, resname 
+   return seg[0], chain[0], resnum[0], resname[0]
 
 def found_chain_break(flanking_seq_dict, chain_break_ind):
    # If a chain break is found, overwrite all the subsequent (or preceding) flanking
