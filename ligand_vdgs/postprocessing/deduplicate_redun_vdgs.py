@@ -1,5 +1,5 @@
 '''
-Removes redundant vdGs from the vdG library. Redundant vdGs are defined as having the same: 
+Removes redundant vdGs from the vdG library. vdGs are redundant if they meet all criteria: 
     1. CG and vdM AA identities/positions (backbones within a specified RMSD threshold)
     2. sequence similarity of residues flanking the vdMs (specified by seq. similarity 
        threshold)
@@ -11,6 +11,8 @@ import os
 import sys
 from itertools import combinations
 import numpy as np
+from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.spatial.distance import squareform
 import prody as pr
 
 # TODO: convert the following arguments to argparse-compatible 
@@ -67,7 +69,7 @@ def main():
    # Initialize vdm_combos dict to store the subsets of vdMs within a vdG
    vdm_combos = {}
 
-   # Iterate over the PDBs and CGs that were identified as containing the 
+   # Iterate over the PDBs and CGs that were identified as containing the SMARTS group
    for pdbname in os.listdir(vdg_pdbs_dir):
       pdbpath = os.path.join(vdg_pdbs_dir, pdbname)
       prody_obj = pr.parsePDB(pdbpath)
@@ -84,7 +86,94 @@ def main():
          re_ordered_aas, re_ordered_bbcoords, re_ordered_flankingseqs, re_ordered_CAs, \
             re_ordered_scrr = reorder_vdg_subset(vdm_subset, vdms_dict)
          # Add to `vdm_combos` dict
-         num_vdms_in_subset = len(vdm_subset)
+         vdm_combos = add_vdgs_to_dict(vdm_combos, vdm_subset, re_ordered_aas, 
+            re_ordered_bbcoords, re_ordered_flankingseqs, re_ordered_CAs, re_ordered_scrr,
+            cg_coords, pdbpath)
+   # Evaluate the complete collection of vdGs and determine redundancy 
+   for num_vdms_in_subset, _subsets in vdm_combos.items():
+      for _reordered_AAs, _vdgs in _subsets.items():
+         # vdG subsets that have identical vdm AA compositions may be redudant 
+         if len(_vdgs) <= 1:
+            continue
+         print()
+         print(_reordered_AAs)
+         for b in [v[5] for v in _vdgs]:
+            print(b)
+         compare_vdgs_of_same_AA_comp(_vdgs, rmsd_thresh)
+
+def compare_vdgs_of_same_AA_comp(_vdgs, rmsd_thresh):
+   # vdG subsets that have identical vdm AA compositions may be redudant 
+   all_cg_coords =    [v[0] for v in _vdgs]
+   all_vdm_bbcoords = [v[1] for v in _vdgs]
+   all_flankingseqs = [v[2] for v in _vdgs] 
+   all_flankingCAs =  [v[3] for v in _vdgs]
+   all_pdbpaths =     [v[4] for v in _vdgs]
+   all_vdm_scrr =     [v[5] for v in _vdgs]
+   all_cg_and_vdmbb_coords = []
+   for _cg, _vdmbb in zip(all_cg_coords, all_vdm_bbcoords):
+      flattened_cg_coords = flatten_cg_coords(_cg)
+      flattened_vdmbbs = flatten_vdg_bbs(_vdmbb)
+
+      cg_and_vdmbb = flattened_cg_coords + flattened_vdmbbs
+      cg_and_vdmbb = np.array(cg_and_vdmbb)
+      all_cg_and_vdmbb_coords.append(cg_and_vdmbb)
+   # Cluster these potential redundant vdGs by rmsd of CG + vdm bb coords. If their rmsds 
+   # are larger than the rmsd thershold, then they are automatically considered different 
+   # vdGs.
+   rmsd_dist_matrix = create_rmsd_dist_matrix(all_cg_and_vdmbb_coords)
+   condensed_dist_matrix = squareform(rmsd_dist_matrix)
+   Z = linkage(condensed_dist_matrix, method='single')
+   clusters = fcluster(Z, rmsd_thresh, criterion='distance')
+   cluster_assignments = {} # key = clusnum, value = indices corresponding to that cluster
+   for all_vdgs_index, clusnum in enumerate(clusters):
+      if clusnum not in cluster_assignments.keys():
+         cluster_assignments[clusnum] = []
+      cluster_assignments[clusnum].append(all_vdgs_index)
+   
+def create_rmsd_dist_matrix(coords):
+   n = len(coords)
+   distance_matrix = np.zeros((n, n))
+   for i in range(n):
+      for j in range(i + 1, n):
+         # Align and then calc rmsd 
+         moved_coords_i, transf = pr.superpose(coords[i], coords[j])
+         rmsd = pr.calcRMSD(moved_coords_i, coords[j])
+         distance_matrix[i][j] = rmsd
+         distance_matrix[j][i] = rmsd  # Symmetric matrix
+   return distance_matrix
+
+def flatten_cg_coords(_cg):
+   coords = []
+   for atom in _cg:
+      coords.append(atom)
+   return coords
+
+def flatten_vdg_bbs(_vdmbb):
+   # Flatten backbones to a single list where each element is a numpy array of the x, y, z 
+   # coords of each vdm backbone atom
+   bbs = []
+   for res in _vdmbb:
+      for atom in res:
+         bbs.append(atom)
+   return bbs
+
+def add_vdgs_to_dict(vdm_combos, vdm_subset, re_ordered_aas, re_ordered_bbcoords, 
+                     re_ordered_flankingseqs, re_ordered_CAs, re_ordered_scrr, cg_coords, pdbpath):
+   # Construct the `vdm_combos` dict by categorizing subset of vdgs based on the number of vdms in
+   # each subset, as well as the AA compositions of the vdms. Store each vdg subset as a list
+   # containing [CG coords, backbone N-CA-C coords of the vdms, sequences flanking the vdms,
+   # CA coordinates flanking the vdms, the PDB path, PDB seg/chain/resnum of the vdms]
+   num_vdms_in_subset = len(vdm_subset)
+   if num_vdms_in_subset not in vdm_combos.keys():
+      vdm_combos[num_vdms_in_subset] = {}
+   re_ord_aas_tup = tuple(re_ordered_aas)
+   if re_ord_aas_tup not in vdm_combos[num_vdms_in_subset].keys():
+      vdm_combos[num_vdms_in_subset][re_ord_aas_tup] = []
+   # Add the vdg to `vdm_combos`
+   vdm_combos[num_vdms_in_subset][re_ord_aas_tup].append([cg_coords, re_ordered_bbcoords,
+      re_ordered_flankingseqs, re_ordered_CAs, pdbpath, re_ordered_scrr])
+
+   return vdm_combos
 
 def reorder_vdg_subset(vdm_subset, vdms_dict):
    #### Step 1) Recording 
@@ -260,7 +349,7 @@ def get_bb_coords(obj):
    return bb_coords
 
 def get_vdm_subsets(input_list):
-#   # Group by quadruples, triples, pairs, and singles.
+    # Group by quadruples, triples, pairs, and singles.
     # Initialize an empty list to store all subsets
     all_subsets = []
     # Loop through subset sizes 1 to 4, generate combos, then add to list
