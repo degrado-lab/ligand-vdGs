@@ -4,12 +4,15 @@ Removes redundant vdGs from the vdG library. vdGs are redundant if they meet all
     2. similar positions of the flanking residues (CAs within a specified RMSD 
        threshold)
     3. sequence similarity of residues flanking the vdMs (specified by seq. similarity 
-       threshold)
+       threshold). however, when the clustering is done, it's based on dissimilarity (because
+       the clustering is distance-based)
+    4. lastly, deduplicate vdgs that are identical but are featurized differently solely 
+       because of different permutations of the same binding site
 '''
 
 import os
 import sys
-from itertools import combinations, permutations
+from itertools import combinations, permutations, product
 import numpy as np
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
@@ -19,10 +22,13 @@ import prody as pr
 
 script, CG = sys.argv
 
-vdg_pdbs_dir = '/wynton/home/degradolab/skt/docking/redun_trial/sulfonamide_tert/vdg_pdbs'
+vdg_pdbs_dir = '/wynton/home/degradolab/skt/docking/ligand-vdGs/new_sulf_test_trial/sulfonamide_tert/vdg_pdbs'
 #vdg_pdbs_dir = f'/wynton/group/degradolab/skt/docking/databases/vdg_lib/{CG}/vdg_pdbs' # TODO: remove hardcoding
+outputdir = '/wynton/group/degradolab/skt/docking/databases/vdg_lib'
+out_dir = os.path.join(outputdir, CG, 'nr_vdgs')
+os.makedirs(out_dir, exist_ok=True)
 
-rmsd_thresh = 0.75
+rmsd_thresh = 1
 seq_sim_thresh = 0.75
 num_flanking = 5
 
@@ -78,28 +84,107 @@ def main():
       vdms_dict = get_vdm_res_features(prody_obj, pdbpath)
       # Determine the vdM combinations, up to 4 residues
       vdm_resinds = list(vdms_dict.keys())
-      vdm_subsets = get_vdm_subsets(vdm_resinds)
+      vdg_subsets = get_vdg_subsets(vdm_resinds)
       # Iterate over subsets
-      for vdm_subset in vdm_subsets:
-         # Record these features in the same order as in vdm_subset. Then, sort all based on
+      for vdg_subset in vdg_subsets:
+         # Record these features in the same order as in vdg_subset. Then, sort all based on
          # alphabetical order of the vdm AAs.
          re_ordered_aas, re_ordered_bbcoords, re_ordered_flankingseqs, re_ordered_CAs, \
-            re_ordered_scrr = reorder_vdg_subset(vdm_subset, vdms_dict)
+            re_ordered_scrr = reorder_vdg_subset(vdg_subset, vdms_dict)
          # Add to `vdm_combos` dict
-         vdm_combos = add_vdgs_to_dict(vdm_combos, vdm_subset, re_ordered_aas, 
+         vdm_combos = add_vdgs_to_dict(vdm_combos, vdg_subset, re_ordered_aas, 
             re_ordered_bbcoords, re_ordered_flankingseqs, re_ordered_CAs, re_ordered_scrr,
             cg_coords, pdbpath)
    # Evaluate the complete collection of vdGs and determine redundancy 
+   all_nr_vdgs = []
    for num_vdms_in_subset, _subsets in vdm_combos.items():
       for _reordered_AAs, _vdgs in _subsets.items():
-         # vdG subsets that have identical vdm AA compositions may be redundant 
-         if len(_vdgs) <= 1:
-            nr_vdgs = _vdgs
-         else: 
-            nr_vdgs = compare_vdgs_of_same_AA_comp(_vdgs, rmsd_thresh, _reordered_AAs)
+         # vdG subsets that have identical vdm AA compositions may be redundant
+         if len(_vdgs) <= 1: # automatically not reundant b/c no other vdgs have this vdm combo
+            _vdgs = _vdgs[0]
+            _vdgs = [[i] for i in _vdgs]
+            all_nr_vdgs.append(_vdgs)
+         else:
+            nr_vdgs = get_nr_vdgs_of_same_AA_comp(_vdgs, rmsd_thresh, _reordered_AAs)
+            for n_v in nr_vdgs:
+               all_nr_vdgs.append(n_v)
+   
+   # There are many deduplicates in `nr_vdgs`, because different permutations of the same 
+   # binding site will end up in different clusters. The last step is to account for these
+   # duplicates by printing out only 1 of each binding site. Each PDBcode refers to a unique
+   # CG, even if there are multiple CGs on the same ligand. Determine all the vdms that
+   # interact with a given CG by creating a dict, and from there, determine the subsets
+   # of vdms up to 4 residues.
+   namingdict = {}
+   for nonredun_vdg in all_nr_vdgs:
+      nonredun_vdg_pdb = nonredun_vdg[4]
+      assert len(nonredun_vdg_pdb) == 1
+      nonredun_vdg_pdb = nonredun_vdg_pdb[0]
+      assert len(nonredun_vdg_pdb) == 1 # for some reason, it's doubly nested
+      nonredun_vdg_pdb = nonredun_vdg_pdb[0]
+      pdbcode = nonredun_vdg_pdb.rstrip('/').rstrip('.pdb').split('/')[-1]
+      if pdbcode not in namingdict.keys():
+         namingdict[pdbcode] = []
+      scrr = nonredun_vdg[5]
+      assert len(scrr) == 1
+      scrr = scrr[0]
+      for vdm in scrr:
+         vdmstr = '_'.join([str(z) for z in vdm])
+         if vdmstr not in namingdict[pdbcode]:
+            namingdict[pdbcode].append(vdmstr)
+   
+   # Print out subsets of binding site residues (vdms), separated by the number of
+   # vdms in that subset
+   for pdbcode, list_scrrs in namingdict.items():
+      list_scrrs = sorted(list_scrrs)
+      vdg_subsets = get_vdg_subsets(list_scrrs)
+      num_vdms = len(vdg_subsets)
+      for subset_vdms in vdg_subsets:
+         pr_obj, subset_vdms_scrr_lists, subset_vdms_scrr_strs = isolate_vdg_subset_obj(
+            pdbcode, subset_vdms) 
+         # Write out pdb
+         write_vdg_subset(subset_vdms_scrr_strs, subset_vdms_scrr_lists, pdbcode, pr_obj)
+         
+def isolate_vdg_subset_obj(pdbcode, subset_vdms):
+   # Select just the specified vdms (vdg subset) for printing out
+   # Initialize prody obj for printing out
+   input_vdg_pdbpath = os.path.join(vdg_pdbs_dir, pdbcode + '.pdb')
+   par = pr.parsePDB(input_vdg_pdbpath)
+   pr_obj = par.select('occupancy > 2.8') # occ >= 3 is CG
+   subset_vdms_scrr_lists = []
+   subset_vdms_scrr_strs = []
+   for v_scrr in subset_vdms:
+      subset_vdms_scrr_strs.append(v_scrr)
+      v_scrr_list = v_scrr.split('_')
+      subset_vdms_scrr_lists.append(v_scrr_list)
+   for vdm_scrr, vdm_scrr_str in zip(subset_vdms_scrr_lists, subset_vdms_scrr_strs):
+      if vdm_scrr[0]: # has a pdb segment defined
+         res_obj = par.select(
+            f'segment {vdm_scrr[0]} and chain {vdm_scrr[1]} and resnum {vdm_scrr[2]}')
+      else: # no segment
+         res_obj = par.select(
+            f'chain {vdm_scrr[1]} and resnum {vdm_scrr[2]}')
+      assert len(set(res_obj.getResindices())) == 1
+      vdm_res_name = list(set(res_obj.getResnames()))
+      assert len(vdm_res_name)  == 1
+      assert vdm_res_name[0] == vdm_scrr[3]
+      if pr_obj is None: 
+         pr_obj = res_obj
+      else:
+         pr_obj += res_obj
+      return pr_obj, subset_vdms_scrr_lists, subset_vdms_scrr_strs
+
+def write_vdg_subset(subset_vdms_scrr_strs, subset_vdms_scrr_lists, pdbcode, pr_obj):
+   vdms_str = '_'.join(subset_vdms_scrr_strs)
+   n_vdms_in_subset = str(len(subset_vdms_scrr_lists))
+   outputname = f'{n_vdms_in_subset}_{pdbcode}_{vdms_str}.pdb'
+   outputpath = os.path.join(out_dir, n_vdms_in_subset, outputname)
+   if n_vdms_in_subset not in os.listdir(out_dir):
+      os.mkdir(os.path.join(out_dir, n_vdms_in_subset))
+   pr.writePDB(outputpath, pr_obj)
 
 def get_vdg_permutations(reordered_AAs, _vdgs):
-   permuted_indices = permute_indices(reordered_AAs)
+   permuted_indices = permute_duplicates(reordered_AAs)
    all_permuted_cg_coords = []
    all_permuted_vdm_bbcoords = []
    all_permuted_flankingseqs = []
@@ -130,46 +215,9 @@ def get_vdg_permutations(reordered_AAs, _vdgs):
    return all_permuted_cg_coords, all_permuted_vdm_bbcoords, all_permuted_flankingseqs, \
       all_permuted_flankingCAs, all_permuted_pdbpaths, all_permuted_vdm_scrr
 
-def permute_indices(elements):
-    # Create a mapping from each unique element to its indices
-    index_map = {}
-    for idx, element in enumerate(elements):
-        if element not in index_map:
-            index_map[element] = []
-        index_map[element].append(idx)
-
-    # Generate all permutations of the indices for each unique element
-    all_permuted_indices = [[]]
-
-    for indices in index_map.values():
-        current_permuted_indices = []
-        for perm in permutations(indices):
-            for index_list in all_permuted_indices:
-                current_permuted_indices.append(index_list + list(perm))
-        all_permuted_indices = current_permuted_indices
-
-    return all_permuted_indices
-
-#def elements_in_cg_vdmbb_clusters(indices_of_elements_in_cg_vdmbb_cluster,
-#   all_permuted_cg_coords, all_permuted_vdm_bbcoords, all_permuted_flankingseqs, 
-#   all_permuted_flankingCAs, all_permuted_pdbpaths, all_permuted_vdm_scrr):
-#   cgvdmbb_clus_cg_coords = [all_permuted_cg_coords[index] 
-#                                   for index in indices_of_elements_in_cg_vdmbb_cluster]
-#   cgvdmbb_clus_vdmbb_coords = [all_permuted_vdm_bbcoords[index] for index in 
-#                                indices_of_elements_in_cg_vdmbb_cluster]
-#   cgvdmbb_clus_flankingseqs = [all_permuted_flankingseqs[index] for index in 
-#                                indices_of_elements_in_cg_vdmbb_cluster]
-#   cgvdmbb_clus_flankingCAs = [all_permuted_flankingCAs[index] for index in 
-#                               indices_of_elements_in_cg_vdmbb_cluster]
-#   cgvdmbb_clus_pdbpaths = [all_permuted_pdbpaths[index] for index in 
-#                            indices_of_elements_in_cg_vdmbb_cluster]
-#   cgvdmbb_clus_vdm_scrr = [all_permuted_vdm_scrr[index] for index in 
-#                            indices_of_elements_in_cg_vdmbb_cluster]
-#   return cgvdmbb_clus_cg_coords, cgvdmbb_clus_vdmbb_coords, cgvdmbb_clus_flankingseqs, \
-#      cgvdmbb_clus_flankingCAs, cgvdmbb_clus_pdbpaths, cgvdmbb_clus_vdm_scrr
-
 def elements_in_clusters(indices_of_elements_in_cluster, cg_coords, vdm_bbcoords, flankingseqs, 
    flankingCAs, pdbpaths, vdm_scrrs):
+   assert len(cg_coords) == len(pdbpaths)
    clus_cg_coords = [cg_coords[index] for index in indices_of_elements_in_cluster]
    clus_vdmbb_coords = [vdm_bbcoords[index] for index in indices_of_elements_in_cluster]
    clus_flankingseqs = [flankingseqs[index] for index in indices_of_elements_in_cluster]
@@ -179,29 +227,61 @@ def elements_in_clusters(indices_of_elements_in_cluster, cg_coords, vdm_bbcoords
    return clus_cg_coords, clus_vdmbb_coords, clus_flankingseqs, \
       clus_flankingCAs, clus_pdbpaths, clus_vdm_scrr
 
+def permute_duplicates(seq):
+    # Dictionary to store indices for each element in the sequence
+    seen = {}
+    for i, item in enumerate(seq):
+        if item not in seen:
+            seen[item] = []
+        seen[item].append(i)
+
+    permute_groups = [] # list of all index groups that have duplicates
+    for indices in seen.values():
+        if len(indices) > 1:  # only interested in elements with duplicates
+            permute_groups.append(indices)
+
+    if not permute_groups: # no duplicates, so return the original index list
+        return [list(range(len(seq)))]
+    
+    # generate all possible permutations of indices within each group of duplicates
+    permuted_idx_lists = []
+    for perm_combination in product(*[permutations(group) for group in permute_groups]):
+        # start with the list of original indices
+        permuted_idx = list(range(len(seq)))
+
+        # flatten the product of permutations and assign them to the corresponding positions
+        for group_idx, perm in zip(permute_groups, perm_combination):
+            for orig_idx, new_idx in zip(group_idx, perm):
+                permuted_idx[orig_idx] = new_idx
+
+        permuted_idx_lists.append(permuted_idx)
+    
+    return permuted_idx_lists
+
 def combine_cg_and_vdmbb_coords(all_permuted_cg_coords, all_permuted_vdm_bbcoords):
    all_cg_and_vdmbb_coords = []
-   for _cg, _vdmbb in zip(all_permuted_cg_coords, all_permuted_vdm_bbcoords):
+   for _cg, _vdmbb_per_res in zip(all_permuted_cg_coords, all_permuted_vdm_bbcoords):
+      vdg_cg_amd_vdmbb = []
       flattened_cg_coords = flatten_cg_coords(_cg)
-      flattened_vdmbbs = flatten_vdg_bbs(_vdmbb)
+      flattened_vdmbbs = flatten_vdg_bbs(_vdmbb_per_res)
       cg_and_vdmbb = flattened_cg_coords + flattened_vdmbbs
       cg_and_vdmbb = np.array(cg_and_vdmbb)
       all_cg_and_vdmbb_coords.append(cg_and_vdmbb)
    return all_cg_and_vdmbb_coords
 
-def compare_vdgs_of_same_AA_comp(_vdgs, rmsd_thresh, reordered_AAs):
+def get_nr_vdgs_of_same_AA_comp(_vdgs, rmsd_thresh, reordered_AAs):
    # vdG subsets that have identical vdm AA compositions may be redudant.
    # First, get all permutations for equivalent AAs. For example, if the vdms are 
    # [Ala1, Ala2, Glu], then we need to sample [Ala1, Ala2, Glu] and [Ala2, Ala1, Glu].
    # The easiest way to get the permutations is to label by the index of the ordered AAs
    
-   print(reordered_AAs)
+   #print(reordered_AAs)
    all_permuted_cg_coords, all_permuted_vdm_bbcoords, all_permuted_flankingseqs, \
       all_permuted_flankingCAs, all_permuted_pdbpaths, all_permuted_vdm_scrr = \
       get_vdg_permutations(reordered_AAs, _vdgs)
    
    # Analyze all permutations of the vdgs.
-   # First, calc rmsd between all permutations 
+   # First, calc rmsd between all permutations
    all_cg_and_vdmbb_coords = combine_cg_and_vdmbb_coords(all_permuted_cg_coords, 
                                                          all_permuted_vdm_bbcoords)
 
@@ -211,7 +291,7 @@ def compare_vdgs_of_same_AA_comp(_vdgs, rmsd_thresh, reordered_AAs):
    # value is a list of the indices of the vdGs (indexing is relative position in 
    # all_permuted_cg_coords, all_permuted_vdm_bbcoords, etc.) that belong in that cluster.
    cgvdmbb_cluster_assignments = get_hierarchical_clusters(all_cg_and_vdmbb_coords, 
-      rmsd_thresh) # `cluster_assignments` dict not ordered by cluster size
+      rmsd_thresh, None_in_coords=True) # `cluster_assignments` dict not ordered by cluster size
    
    nr_vdgs = []
    for cgvdmbb_clusnum, indices_of_elements_in_cg_vdmbb_cluster in \
@@ -223,7 +303,7 @@ def compare_vdgs_of_same_AA_comp(_vdgs, rmsd_thresh, reordered_AAs):
          cgvdmbb_clus_flankingCAs, cgvdmbb_clus_pdbpaths, cgvdmbb_clus_vdm_scrr = \
          elements_in_clusters(indices_of_elements_in_cg_vdmbb_cluster, 
          all_permuted_cg_coords, all_permuted_vdm_bbcoords, all_permuted_flankingseqs,
-         all_permuted_flankingCAs, all_permuted_pdbpaths, all_permuted_vdm_scrr) 
+         all_permuted_flankingCAs, all_permuted_pdbpaths, all_permuted_vdm_scrr)
       
       # If there's only 1 element in the cluster, then it's automatically nonredundant b/c its
       # CG+vdm bb position (binding pose) doesn't match any other vdG's binding pose
@@ -234,7 +314,8 @@ def compare_vdgs_of_same_AA_comp(_vdgs, rmsd_thresh, reordered_AAs):
          nr_vdgs.append(vdg_descript)
          continue
       
-      # Next thing to do in the redundancy filtering is to look at rmsd of those flanking 
+      # Otherwise, if there's >1 element in the cluster, it's possible that the vdgs within 
+      # this cluster are redundant. Next thing to look at is rmsd of those flanking 
       # bb stretches. Align and cluster.
       flattened_flankingCAs_for_vdgs_in_cgvdmbb_cluster = []
       for vdg_flankingCAs in cgvdmbb_clus_flankingCAs:
@@ -271,12 +352,67 @@ def compare_vdgs_of_same_AA_comp(_vdgs, rmsd_thresh, reordered_AAs):
                flankingCAs_clus_flankingseqs, flankingCAs_clus_flankingCAs,
                flankingCAs_clus_pdbpaths, flankingCAs_clus_vdm_scrr] # these 6 define a vdg
             nr_vdgs.append(vdg_descript)
+            continue
          
-         # if it made it over here, then it can still be redundant so check the flanking seqs.
-   # LEFT OFF HERE. 
-
+         # Otherwise, if there's more than 1 element in the cluster, it's possible that the vdgs
+         # within this cluster are redundant. Next metric to cluster on is sequence dissimilarity 
+         # of the residues +/- of the vdms.
+         flattened_flankingseqs_for_vdgs_in_flankingCA_clus = []
+         
+         for vdg_flankingseq in flankingCAs_clus_flankingseqs:
+            flat_vdg_flankingseq = []
+            for vdm_res in vdg_flankingseq:
+               flat_vdg_flankingseq += vdm_res
+            flattened_flankingseqs_for_vdgs_in_flankingCA_clus.append(flat_vdg_flankingseq)
+         seqsim_clus_assignments = get_hierarchical_clusters(
+            flattened_flankingseqs_for_vdgs_in_flankingCA_clus, seq_sim_thresh)
+         # If the vdgs belong in the same cluster based on sequence similarity (and therefore
+         # backbones and cg+vdmbb binding pose), then the vdgs are redundant. Select only one
+         # to add to the `nr_vdgs` list.
+         for seqsim_clusnum, indices_of_elements_in_flankingseq_clus in \
+            seqsim_clus_assignments.items():
+            flankingseq_clus_cg_coords, flankingseq_clus_vdmbb_coords, \
+               flankingseq_clus_flankingseqs, flankingseq_clus_flankingCAs, \
+               flankingseq_clus_pdbpaths, flankingseq_clus_vdm_scrr = \
+               elements_in_clusters(indices_of_elements_in_flankingseq_clus, \
+               flankingCAs_clus_cg_coords, flankingCAs_clus_vdmbb_coords, \
+               flankingCAs_clus_flankingseqs, flankingCAs_clus_flankingCAs, \
+               flankingCAs_clus_pdbpaths, flankingCAs_clus_vdm_scrr)
+           
+            if len(indices_of_elements_in_flankingseq_clus) <= 1:
+               vdg_descript = [flankingseq_clus_cg_coords, flankingseq_clus_vdmbb_coords, 
+               flankingseq_clus_flankingseqs, flankingseq_clus_flankingCAs, 
+               flankingseq_clus_pdbpaths, flankingseq_clus_vdm_scrr]
+               nr_vdgs.append(vdg_descript)
+               for b in vdg_descript:
+                  assert len(b) == 1
+               continue
+            
+            else: # select only one, so use index 0 for indices_of_elements_in_flankingseq_clus
+               flankingseq_clus_cg_coords, flankingseq_clus_vdmbb_coords, \
+               flankingseq_clus_flankingseqs, flankingseq_clus_flankingCAs, \
+               flankingseq_clus_pdbpaths, flankingseq_clus_vdm_scrr = \
+               elements_in_clusters([0], \
+               flankingCAs_clus_cg_coords, flankingCAs_clus_vdmbb_coords, \
+               flankingCAs_clus_flankingseqs, flankingCAs_clus_flankingCAs, \
+               flankingCAs_clus_pdbpaths, flankingCAs_clus_vdm_scrr)
+               vdg_descript = [flankingseq_clus_cg_coords, flankingseq_clus_vdmbb_coords,
+                  flankingseq_clus_flankingseqs, flankingseq_clus_flankingCAs, 
+                  flankingseq_clus_pdbpaths, flankingseq_clus_vdm_scrr]
+               for b in vdg_descript:
+                  assert len(b) == 1
+               nr_vdgs.append(vdg_descript)
+              
    return nr_vdgs 
-  
+
+def calc_seq_similarity(list1, list2):
+    # Count how many residues match
+    matches = sum(1 for a, b in zip(list1, list2) if a == b)
+
+    # Calculate the percentage of matches
+    match_percentage = (matches / len(list1)) * 100
+    return match_percentage
+
 def get_overlapping_res_coords(list1, list2):
     list1_overlap = []
     list2_overlap = []
@@ -289,13 +425,19 @@ def get_overlapping_res_coords(list1, list2):
     
     return np.array(list1_overlap), np.array(list2_overlap)
 
-def get_hierarchical_clusters(coords, rmsd_thresh, None_in_coords=False):
+def get_hierarchical_clusters(data, thresh, None_in_coords=False):
    # Returns dict where key = cluster number and value = indices of the list elements that
    # belong in that cluster. This dict is not ordered by size.
-   rmsd_dist_matrix = create_rmsd_dist_matrix(coords, None_in_coords)
-   condensed_dist_matrix = squareform(rmsd_dist_matrix)
+   # `data` is either a list of coords, or a list of sequences.
+   # None_inc_coords is a param that distinguishes whether `data` is coordinates or sequences.
+   # This distinction is important because rmsd cannot be calculated on non-coordinates, so if 
+   # any residues are "None" for either of the 2 vdgs being compared, that whole residue is 
+   # discounted.
+
+   dist_matrix = create_dist_matrix(data, None_in_coords) # dist is either rmsd or % seq sim
+   condensed_dist_matrix = squareform(dist_matrix)
    Z = linkage(condensed_dist_matrix, method='single')
-   clusters = fcluster(Z, rmsd_thresh, criterion='distance')
+   clusters = fcluster(Z, thresh, criterion='distance')
    cluster_assignments = {} # key = clusnum, value = indices of `coords` belonging to that cluster
    for all_vdgs_index, clusnum in enumerate(clusters):
       if clusnum not in cluster_assignments.keys():
@@ -303,25 +445,27 @@ def get_hierarchical_clusters(coords, rmsd_thresh, None_in_coords=False):
       cluster_assignments[clusnum].append(all_vdgs_index)
    return cluster_assignments  
 
-def create_rmsd_dist_matrix(coords, None_in_coords):
-   n = len(coords)
+def create_dist_matrix(data, None_in_coords):
+   n = len(data)
    distance_matrix = np.zeros((n, n))
    for i in range(n):
       for j in range(i + 1, n):
-         # Align and then calc rmsd. If "None" is in the list of coords (which is what would
-         # happen if rmsd is being calculated on stretches of backbone and terminal residues
-         # are missing), then select only the overlapping residues where a coordinate could be
-         # extracted for both elements being measured.
-         coords_i = coords[i]
-         coords_j = coords[j]
-         if None_in_coords: 
-            coords_i, coords_j = get_overlapping_res_coords(coords_i, coords_j)
-         moved_coords_i, transf = pr.superpose(coords_i, coords_j)
-         rmsd = pr.calcRMSD(moved_coords_i, coords_j)
-         #if None_in_coords:
-         #   print(rmsd)
-         distance_matrix[i][j] = rmsd
-         distance_matrix[j][i] = rmsd  # Symmetric matrix
+         # Align and then calc rmsd or seq dissimilarity. If "None" is in the list of coords 
+         # (which is what would happen if rmsd is being calculated on stretches of backbone
+         # and terminal residues are missing), then select only the overlapping residues 
+         # where a coordinate could be extracted for both elements being measured.
+         data_i = data[i]
+         data_j = data[j]
+         if None_in_coords: # calc rmsd 
+            data_i, data_j = get_overlapping_res_coords(data_i, data_j)
+            moved_coords_i, transf = pr.superpose(data_i, data_j)
+            rmsd = pr.calcRMSD(moved_coords_i, data_j)
+            value = rmsd
+         else: # calc seq similarity
+            seq_sim = calc_seq_similarity(data_i, data_j)
+            value = (100 - seq_sim) / 2 # clustering is distance-based, so the metric is DISsimilarity
+         distance_matrix[i][j] = value 
+         distance_matrix[j][i] = value   # Symmetric matrix
    return distance_matrix
 
 def flatten_cg_coords(_cg):
@@ -339,13 +483,13 @@ def flatten_vdg_bbs(_vdmbb):
          bbs.append(atom)
    return bbs
 
-def add_vdgs_to_dict(vdm_combos, vdm_subset, re_ordered_aas, re_ordered_bbcoords, 
+def add_vdgs_to_dict(vdm_combos, vdg_subset, re_ordered_aas, re_ordered_bbcoords, 
                      re_ordered_flankingseqs, re_ordered_CAs, re_ordered_scrr, cg_coords, pdbpath):
    # Construct the `vdm_combos` dict by categorizing subset of vdgs based on the number of vdms in
    # each subset, as well as the AA compositions of the vdms. Store each vdg subset as a list
    # containing [CG coords, backbone N-CA-C coords of the vdms, sequences flanking the vdms,
    # CA coordinates flanking the vdms, the PDB path, PDB seg/chain/resnum of the vdms]
-   num_vdms_in_subset = len(vdm_subset)
+   num_vdms_in_subset = len(vdg_subset)
    if num_vdms_in_subset not in vdm_combos.keys():
       vdm_combos[num_vdms_in_subset] = {}
    re_ord_aas_tup = tuple(re_ordered_aas)
@@ -353,18 +497,19 @@ def add_vdgs_to_dict(vdm_combos, vdm_subset, re_ordered_aas, re_ordered_bbcoords
       vdm_combos[num_vdms_in_subset][re_ord_aas_tup] = []
    # Add the vdg to `vdm_combos`
    vdm_combos[num_vdms_in_subset][re_ord_aas_tup].append([cg_coords, re_ordered_bbcoords,
-      re_ordered_flankingseqs, re_ordered_CAs, pdbpath, re_ordered_scrr])
+      re_ordered_flankingseqs, re_ordered_CAs, [pdbpath], re_ordered_scrr])
 
    return vdm_combos
 
-def reorder_vdg_subset(vdm_subset, vdms_dict):
-   #### Step 1) Recording 
+def reorder_vdg_subset(vdg_subset, vdms_dict):
+   '''Reorders vdms alphabetically.'''
+   # First, record
    aas_of_vdms_in_order = []
    bb_coords_of_vdms_in_order = []
    flankingseqs_of_vdms_in_order = []
    flanking_CA_coords_of_vdms_in_order = []
    seg_ch_res_of_vdms_in_order = []
-   for _vdmresind in vdm_subset:
+   for _vdmresind in vdg_subset:
       vdmAA, vdm_features = vdms_dict[_vdmresind]
       aas_of_vdms_in_order.append(vdmAA)
       vdm_seg_chain_resnum_resname, bb_coords, flanking_seq_dict = vdm_features
@@ -380,7 +525,7 @@ def reorder_vdg_subset(vdm_subset, vdms_dict):
          flankingCAs.append(flank_ca)
       flankingseqs_of_vdms_in_order.append(flankingseqs)
       flanking_CA_coords_of_vdms_in_order.append(flankingCAs)
-   #### Step 2) Re-ordering based on alphabetical order
+   # Then, re-order based on alphabetical order
    super_list = [aas_of_vdms_in_order, bb_coords_of_vdms_in_order, 
       flankingseqs_of_vdms_in_order, flanking_CA_coords_of_vdms_in_order, 
       seg_ch_res_of_vdms_in_order]
@@ -530,7 +675,7 @@ def get_bb_coords(obj):
       bb_coords.append(coord)
    return bb_coords
 
-def get_vdm_subsets(input_list):
+def get_vdg_subsets(input_list):
     # Group by quadruples, triples, pairs, and singles.
     # Initialize an empty list to store all subsets
     all_subsets = []
