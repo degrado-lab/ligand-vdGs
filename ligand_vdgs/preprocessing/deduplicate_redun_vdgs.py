@@ -29,7 +29,7 @@ def parse_args():
 #                        "previous step.")
     parser.add_argument('-v', "--vdglib-dir", type=str, required=True,
                         help="Directory for the vdms of this CG.")
-    parser.add_argument('-r', "--rmsd", default=1, 
+    parser.add_argument('-r', "--rmsd", default=1.5, 
                         help="RMSD threshold for clustering to determine redundancy.")
     parser.add_argument('-s', "--seq", default=0.75,
                         help="Sequence similarity threshold for clustering sequences "
@@ -96,6 +96,11 @@ def main():
 
    # Iterate over the PDBs and CGs that were identified as containing the SMARTS group
    for pdbname in os.listdir(vdg_pdbs_dir):
+      ####### for testing ########
+      #if '6jsf' not in pdbname and '7myu' not in pdbname:
+      #   continue
+      #print(pdbname)
+      ####### for testing ########
       pdbpath = os.path.join(vdg_pdbs_dir, pdbname)
       prody_obj = pr.parsePDB(pdbpath)
       cg_coords = get_cg_coords(prody_obj)
@@ -193,7 +198,7 @@ def isolate_vdg_subset_obj(pdbcode, subset_vdms, vdg_pdbs_dir):
          pr_obj = res_obj
       else:
          pr_obj += res_obj
-      return pr_obj, subset_vdms_scrr_lists, subset_vdms_scrr_strs
+   return pr_obj, subset_vdms_scrr_lists, subset_vdms_scrr_strs
 
 def write_vdg_subset(subset_vdms_scrr_strs, subset_vdms_scrr_lists, pdbcode, pr_obj,
                      out_dir):
@@ -201,7 +206,7 @@ def write_vdg_subset(subset_vdms_scrr_strs, subset_vdms_scrr_lists, pdbcode, pr_
    n_vdms_in_subset = str(len(subset_vdms_scrr_lists))
    outputname = f'{n_vdms_in_subset}_{pdbcode}_{vdms_str}.pdb'
    outputpath = os.path.join(out_dir, n_vdms_in_subset, outputname)
-   if n_vdms_in_subset not in os.listdir(out_dir):
+   if str(n_vdms_in_subset) not in os.listdir(out_dir):
       os.mkdir(os.path.join(out_dir, n_vdms_in_subset))
    pr.writePDB(outputpath, pr_obj)
 
@@ -297,7 +302,8 @@ def get_nr_vdgs_of_same_AA_comp(_vdgs, rmsd_thresh, seq_sim_thresh, reordered_AA
    # [Ala1, Ala2, Glu], then we need to sample [Ala1, Ala2, Glu] and [Ala2, Ala1, Glu].
    # The easiest way to get the permutations is to label by the index of the ordered AAs
    
-   #print(reordered_AAs)
+   print(reordered_AAs)
+   
    all_permuted_cg_coords, all_permuted_vdm_bbcoords, all_permuted_flankingseqs, \
       all_permuted_flankingCAs, all_permuted_pdbpaths, all_permuted_vdm_scrr = \
       get_vdg_permutations(reordered_AAs, _vdgs)
@@ -314,7 +320,7 @@ def get_nr_vdgs_of_same_AA_comp(_vdgs, rmsd_thresh, seq_sim_thresh, reordered_AA
    # all_permuted_cg_coords, all_permuted_vdm_bbcoords, etc.) that belong in that cluster.
    cgvdmbb_cluster_assignments = get_hierarchical_clusters(all_cg_and_vdmbb_coords, 
       rmsd_thresh, None_in_coords=True) # `cluster_assignments` dict not ordered by cluster size
-   
+
    nr_vdgs = []
    for cgvdmbb_clusnum, indices_of_elements_in_cg_vdmbb_cluster in \
       cgvdmbb_cluster_assignments.items():
@@ -485,7 +491,7 @@ def create_dist_matrix(data, None_in_coords):
             value = rmsd
          else: # calc seq similarity
             seq_sim = calc_seq_similarity(data_i, data_j)
-            value = (100 - seq_sim) / 2 # clustering is distance-based, so the metric is DISsimilarity
+            value = (100 - seq_sim) / 100 # clustering is distance-based, so the metric is DISsimilarity
          distance_matrix[i][j] = value 
          distance_matrix[j][i] = value   # Symmetric matrix
    return distance_matrix

@@ -3,10 +3,10 @@
 
 #--------------------- Please define these variables. -------------------------
 # Path to vdG library
-vdgs_dir: /wynton/group/degradolab/skt/docking/databases/vdg_lib/C1CCOC([NH2])=N1/vdg_pdbs
+vdgs_dir: /wynton/group/degradolab/skt/docking/databases/vdg_lib/pyrazine/nr_vdgs/2
 
 # CG name (can be a common name or a SMARTS string)
-cg_name: C1CCOC([NH2])=N1
+cg_name: pyrazine 
 
 # Path to the query protein-ligand complex
 query_path: /wynton/home/degradolab/skt/docking/query_structs/6C2I.pdb
@@ -14,15 +14,14 @@ query_path: /wynton/home/degradolab/skt/docking/query_structs/6C2I.pdb
 # Binding site residues of the query structure to dock chemical groups onto.
 # Each residue should be classified by its [PDB segment, chain, residue number].
 bindingsite_residues:
-    - ['A', 'A', 31]
-    - ['A', 'A', 227]
-    - ['A', 'A', 229]
+    - ['A', 'A', 12]
+    - ['A', 'A', 231]
 
 # Query ligand ([PDB segment, chain, residue number])
 query_lig: ['H', 'A', 407]
 
 # Atom names of the CG within the query ligand
-query_cg_atoms: ['C9', 'C11', 'C12', 'O13', 'C14', 'N16', 'N15']
+query_cg_atoms: ['N21', 'C19', 'C25', 'N24', 'C23', 'C22']
 
 # ------------------------------------------------------------------------------------
 #                  Default values set below. Redefine if necessary                    

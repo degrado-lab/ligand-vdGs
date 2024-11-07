@@ -13,10 +13,6 @@ the same format as a mirror of the PDB.
 - smarts_to_cgs.py fails for polysaccharides, like 5a0y. The lines suppressing stdout/stderr
 in vdgs/cg.py must be commented out to view obabel errors. Unfortunately, sugars (connected to other residues) fail to be parsed completely and aren't recorded in the output file matches.pkl. This is true for all ligands that are covalently bonded to another residue; investigate to find out other instances of this edge case besides parsing sugars.
 - scripts/validate_known_poses.py, the query CG must have the same number of atoms as the database CG, but it doesn't always. Investigate those cases. This error is observed in the loop that samples the database vdGs (line 108).
-- When writing a wrapper script for vdG-miner's 3 python scripts (see vdG-miner/example_usage.sh), make sure to throw an Exception if downstream output directories (such as vdg_pdbs) have contents that could be accidentally overwritten.
-- Update format_parent_database.py so that it renames PDBs with unique 4-character identifiers if they aren't already.
 - Add pyyaml to environment.yml
 - Add symmetry for validate_known_poses.py (for example, the sulfonamide oxygens in 2ntr and 2nta)
-- Remove redundant vdGs 
 - Figure out why in /wynton/group/degradolab/skt/vdG/databases/vdgs/sulfonamide/vdg_pdbs/2vtd__A_1441_1.pdb, an extra N in "LKM" came along for the ride. And also UNDO the raise ValueError 'The query CG must have the same num. of atoms as the database CG.' in find_matches.py
-- Lack of segments in the BioLiP2 database is causing vdGs to overwrite each other.
