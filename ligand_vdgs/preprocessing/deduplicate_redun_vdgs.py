@@ -12,25 +12,34 @@ Removes redundant vdGs from the vdG library. vdGs are redundant if they meet all
 
 import os
 import sys
+import argparse
 from itertools import combinations, permutations, product
 import numpy as np
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
 import prody as pr
 
-# TODO: convert the following arguments to argparse-compatible 
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-c', "--cg", type=str, 
+                        help="The common name for the chemical group. Defaults to the "
+                        "SMARTS pattern.")
+#    parser.add_argument('-v', "--vdg-dir", type=str, required=True,
+#                        help="Path to the directory containing the vdg PDBs created in the "
+#                        "previous step.")
+    parser.add_argument('-v', "--vdglib-dir", type=str, required=True,
+                        help="Directory for the vdms of this CG.")
+    parser.add_argument('-r', "--rmsd", default=1, 
+                        help="RMSD threshold for clustering to determine redundancy.")
+    parser.add_argument('-s', "--seq", default=0.75,
+                        help="Sequence similarity threshold for clustering sequences "
+                        "flanking the vdM to determine redundancy. This should be a value "
+                        "between 0 and 1. Values > seq will be considered redundant.")
+    parser.add_argument('-f', "--flank", default=5,
+                        help="Number of residues flanking the vdms for which to calculate "
+                        "sequence similarity and backbone similarity.")
 
-script, CG = sys.argv
-
-vdg_pdbs_dir = '/wynton/home/degradolab/skt/docking/ligand-vdGs/new_sulf_test_trial/sulfonamide_tert/vdg_pdbs'
-#vdg_pdbs_dir = f'/wynton/group/degradolab/skt/docking/databases/vdg_lib/{CG}/vdg_pdbs' # TODO: remove hardcoding
-outputdir = '/wynton/group/degradolab/skt/docking/databases/vdg_lib'
-out_dir = os.path.join(outputdir, CG, 'nr_vdgs')
-os.makedirs(out_dir, exist_ok=True)
-
-rmsd_thresh = 1
-seq_sim_thresh = 0.75
-num_flanking = 5
+    return parser.parse_args()
 
 '''
 Characterize all subsets of vdMs within each vdG, up to 4 vdMs (i.e., all quadruples, 
@@ -72,6 +81,16 @@ when checking for redundancy.
 '''
 
 def main():
+   args = parse_args()
+   CG = args.cg
+   rmsd_thresh = args.rmsd
+   seq_sim_thresh = args.seq
+   num_flanking = args.flank
+   vdglib_dir = args.vdglib_dir
+   vdg_pdbs_dir = os.path.join(vdglib_dir, 'vdg_pdbs')
+   out_dir = os.path.join(vdglib_dir, 'nr_vdgs')
+   os.makedirs(out_dir, exist_ok=True)
+
    # Initialize vdm_combos dict to store the subsets of vdMs within a vdG
    vdm_combos = {}
 
@@ -81,7 +100,7 @@ def main():
       prody_obj = pr.parsePDB(pdbpath)
       cg_coords = get_cg_coords(prody_obj)
       # Characterize the vdM residues (bb coords, flanking residues, pdb paths, etc.)
-      vdms_dict = get_vdm_res_features(prody_obj, pdbpath)
+      vdms_dict = get_vdm_res_features(prody_obj, pdbpath, num_flanking)
       # Determine the vdM combinations, up to 4 residues
       vdm_resinds = list(vdms_dict.keys())
       vdg_subsets = get_vdg_subsets(vdm_resinds)
@@ -105,7 +124,8 @@ def main():
             _vdgs = [[i] for i in _vdgs]
             all_nr_vdgs.append(_vdgs)
          else:
-            nr_vdgs = get_nr_vdgs_of_same_AA_comp(_vdgs, rmsd_thresh, _reordered_AAs)
+            nr_vdgs = get_nr_vdgs_of_same_AA_comp(_vdgs, rmsd_thresh, 
+               seq_sim_thresh, _reordered_AAs)
             for n_v in nr_vdgs:
                all_nr_vdgs.append(n_v)
    
@@ -141,11 +161,12 @@ def main():
       num_vdms = len(vdg_subsets)
       for subset_vdms in vdg_subsets:
          pr_obj, subset_vdms_scrr_lists, subset_vdms_scrr_strs = isolate_vdg_subset_obj(
-            pdbcode, subset_vdms) 
+            pdbcode, subset_vdms, vdg_pdbs_dir) 
          # Write out pdb
-         write_vdg_subset(subset_vdms_scrr_strs, subset_vdms_scrr_lists, pdbcode, pr_obj)
+         write_vdg_subset(subset_vdms_scrr_strs, subset_vdms_scrr_lists, pdbcode, pr_obj,
+                          out_dir)
          
-def isolate_vdg_subset_obj(pdbcode, subset_vdms):
+def isolate_vdg_subset_obj(pdbcode, subset_vdms, vdg_pdbs_dir):
    # Select just the specified vdms (vdg subset) for printing out
    # Initialize prody obj for printing out
    input_vdg_pdbpath = os.path.join(vdg_pdbs_dir, pdbcode + '.pdb')
@@ -174,7 +195,8 @@ def isolate_vdg_subset_obj(pdbcode, subset_vdms):
          pr_obj += res_obj
       return pr_obj, subset_vdms_scrr_lists, subset_vdms_scrr_strs
 
-def write_vdg_subset(subset_vdms_scrr_strs, subset_vdms_scrr_lists, pdbcode, pr_obj):
+def write_vdg_subset(subset_vdms_scrr_strs, subset_vdms_scrr_lists, pdbcode, pr_obj,
+                     out_dir):
    vdms_str = '_'.join(subset_vdms_scrr_strs)
    n_vdms_in_subset = str(len(subset_vdms_scrr_lists))
    outputname = f'{n_vdms_in_subset}_{pdbcode}_{vdms_str}.pdb'
@@ -269,7 +291,7 @@ def combine_cg_and_vdmbb_coords(all_permuted_cg_coords, all_permuted_vdm_bbcoord
       all_cg_and_vdmbb_coords.append(cg_and_vdmbb)
    return all_cg_and_vdmbb_coords
 
-def get_nr_vdgs_of_same_AA_comp(_vdgs, rmsd_thresh, reordered_AAs):
+def get_nr_vdgs_of_same_AA_comp(_vdgs, rmsd_thresh, seq_sim_thresh, reordered_AAs):
    # vdG subsets that have identical vdm AA compositions may be redudant.
    # First, get all permutations for equivalent AAs. For example, if the vdms are 
    # [Ala1, Ala2, Glu], then we need to sample [Ala1, Ala2, Glu] and [Ala2, Ala1, Glu].
@@ -543,7 +565,7 @@ def sort_vdGs_by_AA(super_list):
     sorted_sublists = list(zip(*sorted_combined))
     return [list(sublist) for sublist in sorted_sublists]
 
-def get_vdm_res_features(prody_obj, pdbpath):
+def get_vdm_res_features(prody_obj, pdbpath, num_flanking):
    # Identify the vdM residues (occ == 2). To be safe, select > 1.5 and < 2.5.
    vdm_residues = prody_obj.select('(occupancy) > 1.5 and (occupancy < 2.5)')
    vdm_resinds = set(vdm_residues.getResindices())

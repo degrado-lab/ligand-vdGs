@@ -42,6 +42,7 @@ def main():
         cg = smarts
 
     # Set up outdir
+    out_dir = os.path.join(out_dir, cg)
     if trial_run: 
         out_dir = out_dir.rstrip('/') + '_trial' 
     out_dir = set_up_outdir(out_dir) 
@@ -62,16 +63,21 @@ def main():
     subprocess.run(smarts_to_cg_cmd, shell=True, check=True)
 
     # Run generate_fingerprints.py
-    match_pkl = os.path.join(out_dir, cg, f'{cg}_matches.pkl') # output from smarts_to_cg.py
+    match_pkl = os.path.join(out_dir, f'{cg}_matches.pkl') # output from smarts_to_cg.py
     fingerprints_cmd = f'python ligand_vdgs/programs/vdG-miner/vdg_miner/programs/generate_fingerprints.py -c {cg} -l {logfile} -m {match_pkl} -p {pdb_dir} -b {probe_dir} -o {out_dir}'
 
     subprocess.run(fingerprints_cmd, shell=True, check=True)
 
     # Run fingerprints_to_pdbs.py
-    fingerprints = os.path.join(out_dir, cg, 'fingerprints') # output from generate_fingerprints.py
+    fingerprints = os.path.join(out_dir, 'fingerprints') # output from generate_fingerprints.py
     to_pdbs_cmd = f'python ligand_vdgs/programs/vdG-miner/vdg_miner/programs/fingerprints_to_pdbs.py -c {cg} -m {match_pkl} -l {logfile} -f {fingerprints} -p {pdb_dir} -o {out_dir} -s -e'
 
     subprocess.run(to_pdbs_cmd, shell=True, check=True)
+
+    # Run deduplicate_redun_vdgs.py
+    deduplicate_cmd = f'python ligand_vdgs/preprocessing/deduplicate_redun_vdgs.py --cg {cg} --vdglib-dir {out_dir}'
+
+    subprocess.run(deduplicate_cmd, shell=True, check=True)
 
 def set_up_outdir(out_dir):
     # Set up output directory
