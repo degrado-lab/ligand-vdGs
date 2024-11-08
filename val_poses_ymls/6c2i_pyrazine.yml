@@ -3,7 +3,7 @@
 
 #--------------------- Please define these variables. -------------------------
 # Path to vdG library
-vdgs_dir: /wynton/group/degradolab/skt/docking/databases/vdg_lib/pyrazine/nr_vdgs/2
+vdgs_dir: /wynton/group/degradolab/skt/docking/databases/vdg_lib/pyrazine
 
 # CG name (can be a common name or a SMARTS string)
 cg_name: pyrazine 
@@ -31,4 +31,4 @@ query_cg_atoms: ['N21', 'C19', 'C25', 'N24', 'C23', 'C22']
 rmsd_threshold: 0.5
 
 # Directory to output matches
-out_dir: ../vdg_matches
+out_dir: vdg_matches

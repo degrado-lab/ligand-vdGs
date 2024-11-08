@@ -13,6 +13,6 @@ hostname
 
 conda activate smart_vdms_env
 
-python ligand_vdgs/scripts/vdg_generation_wrapper.py -s "[nX2]1cc[nX2]cc1" -c pyrazine -p $YOUR_PDB_DIR/ -b $YOUR_PROBE_FILES -o $YOUR_OUTPUT_DIR -t 10000 
+python ligand_vdgs/scripts/vdg_generation_wrapper.py -s "[nX2]1cc[nX2]cc1" -c pyrazine -p $YOUR_PDB_DIR/ -b $YOUR_PROBE_FILES -o $YOUR_OUTPUT_DIR
 
 date
