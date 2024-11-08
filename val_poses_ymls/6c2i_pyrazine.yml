@@ -31,4 +31,4 @@ query_cg_atoms: ['N21', 'C19', 'C25', 'N24', 'C23', 'C22']
 rmsd_threshold: 0.5
 
 # Directory to output matches
-out_dir: vdm_matches
+out_dir: ../vdg_matches

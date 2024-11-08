@@ -4,9 +4,7 @@ residues, determine whether any vdGs can correctly place the chemical groups wit
 ligand of the query structure.
 
 Usage:
-    >> cd $YOUR_LIGAND_VDGS_DIR
-    >> pip install .
-    >> python -m ligand_vdgs.scripts.validate_known_poses.py $YOUR_YAML_FILE
+    >> python validate_known_poses.py $YOUR_YAML_FILE
 '''
 
 import sys
@@ -25,7 +23,7 @@ def main():
     
     # Set up output dir
     pdbname = query_path.split('/')[-1].rstrip('.pdb')
-    output_dir = os.path.join(out_dir, pdbname)
+    output_dir = os.path.join(out_dir, yml_file.rstrip('.yml').split('/')[-1])
     if os.path.exists(output_dir):
         if os.listdir(output_dir):
             raise ValueError(f'The output directory {output_dir} is not empty. '
@@ -46,19 +44,9 @@ def main():
     query_bb_coords = {}
     for bsr in bindingsite_residues:
         bsr_seg, bsr_chain, bsr_resnum = bsr
-        bbcoords = get_coords(query_struct, ['N', 'CA', 'C'], bsr_seg, bsr_chain, bsr_resnum,
+        bbcoords = get_coords(query_struct, ['N', 'CA', 'C', 'O'], bsr_seg, bsr_chain, bsr_resnum,
                               query_path)
         query_bb_coords[tuple(bsr)] = bbcoords
-    # Superpose bb+cg of database vdG onto the query structure and calculate rmsd.
-    database_vdg_names = os.listdir(vdgs_dir)
-    database_vdg_paths = [os.path.join(vdgs_dir, d) for d in database_vdg_names]
-    pdbnames = [i.split('/')[-1] for i in database_vdg_paths]
-    assert len(database_vdg_paths) == len(set(pdbnames))
-    database_vdgs = [pr.parsePDB(d) for d in database_vdg_paths]
-
-    # Calc rmsd on pairs of bb residues (incl. CG), but consider whether to add single bb
-    # residues in case there aren't many vdGs matching pairs of bb residues. 
-    num_db_vdg_within_rmsd = 0
     
     # If adding singles: 
     query_res_sets = [[b] for b in bindingsite_residues] + list(
@@ -74,6 +62,29 @@ def main():
     # whether any of the vdGs in the database match the "ground truth" binding site
     # residues and CG positions of the query structure.
     for q_res_set in query_res_sets:
+
+        if len(q_res_set) == 1:
+            subdir = 'single_res_matches'
+            if 'nr_vdgs' not in vdgs_dir: 
+                vdgs_dir = os.path.join(rf"{vdgs_dir}", 'nr_vdgs', '1')
+            database_vdg_names = os.listdir(vdgs_dir)
+
+        elif len(q_res_set) == 2:
+            subdir = 'double_res_matches'
+            if 'nr_vdgs' not in vdgs_dir: 
+                vdgs_dir = os.path.join(rf"{vdgs_dir}", 'nr_vdgs', '2')
+            database_vdg_names = os.listdir(vdgs_dir)
+        else:
+            assert False
+
+        database_vdg_paths = [os.path.join(vdgs_dir, d) for d in database_vdg_names]
+        pdbnames = [i.split('/')[-1] for i in database_vdg_paths]
+        assert len(database_vdg_paths) == len(set(pdbnames))
+        database_vdgs = [pr.parsePDB(d) for d in database_vdg_paths]
+
+        # Calc rmsd on pairs of bb residues (incl. CG), but consider whether to add single bb
+        # residues in case there aren't many vdGs matching pairs of bb residues. 
+        num_db_vdg_within_rmsd = 0
         q_bbcoords_list = [query_bb_coords[tuple(r)] for r in q_res_set]
         q_flattened_bb_list = [item for sublist in q_bbcoords_list for item in sublist]
         q_bb_and_cg = np.array(q_flattened_bb_list + q_cg_coords)
@@ -115,7 +126,6 @@ def main():
                                                                  q_bb_and_cg)
                 rmsd = round(pr.calcRMSD(moved_db_vdg_bb_cg_coords, q_bb_and_cg), 2)
                 if rmsd < rmsd_threshold:
-                    print('\tRMSD', rmsd)
                     num_db_vdg_within_rmsd += 1
                     moved_vdg = pr.applyTransformation(transf, database_vdg.copy())
                     
@@ -125,23 +135,18 @@ def main():
                     moved_vdg_perm_resinds_obj = moved_vdg.copy().select(
                         f'({perm_resinds_sele}) or (occupancy > 2.8)') # occ 3 = CG
                     vdg_pdbname = db_vdg_path.rstrip('/').split('/')[-1].rstrip('.pdb')
-                    bsr_flat_list = [str(it) for sublist in q_res_set for it in sublist]
-                    bsr_str = '_'.join(bsr_flat_list)
-                    output_vdg_name = f'{vdg_pdbname}_{bsr_str}.pdb'
-                    if len(q_res_set) == 1:
-                        subdir = 'single_res_matches'
-                    elif len(q_res_set) == 2:
-                        subdir = 'double_res_matches'
-                    subdir_path = os.path.join(output_dir, subdir)
-                    output_vdg_path = os.path.join(output_dir, subdir, output_vdg_name)
-                    if not os.path.exists(subdir_path):
-                        os.makedirs(subdir_path)
-                    pr.writePDB(output_vdg_path, 
-                                moved_vdg_perm_resinds_obj.copy().select(
-                                'occupancy > 1.5'))
+                    for sublist in q_res_set:
+                        bsr_flat_list = [str(it) for it in sublist]
+                        bsr_str = '_'.join(bsr_flat_list)
+                        output_vdg_name = f'{vdg_pdbname}_{bsr_str}.pdb'
+                        subdir_path = os.path.join(output_dir, subdir)
+                        output_vdg_path = os.path.join(output_dir, subdir, output_vdg_name)
+                        if not os.path.exists(subdir_path):
+                            os.makedirs(subdir_path)
+                        pr.writePDB(output_vdg_path, 
+                                    moved_vdg_perm_resinds_obj.copy().select(
+                                    'occupancy > 1.5'))
     
-    print('Num database VDG matches that should be printed out: ', num_db_vdg_within_rmsd)
-
 def get_database_vdm_bb_coords(database_vdg, query_vdm_resnames, db_vdg_path):
     '''output
     Returns bb coordinates of all valid permutations that match the order of
@@ -164,7 +169,7 @@ def get_database_vdm_bb_coords(database_vdg, query_vdm_resnames, db_vdg_path):
         match_resinds = [db_vdm_resinds[ind] for ind in match_inds] # map to the resinds
         bb_coords = [] # if 2 res: [res1 N, res1 CA, res1 C, res2 N, res2 CA, res2C]
         for match_r in match_resinds:
-            for bbatom in ['N', 'CA', 'C']:
+            for bbatom in ['N', 'CA', 'C', 'O']:
                 bbatom_coords = get_coords_from_resindex(database_vdg, match_r, bbatom, 
                                                          db_vdg_path)
                 bb_coords.append(bbatom_coords)
