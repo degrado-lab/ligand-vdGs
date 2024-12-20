@@ -13,6 +13,6 @@ hostname
 
 conda activate smart_vdms_env
 
-python ligand_vdgs/scripts/vdg_generation_wrapper.py -s "[NX3&H0][SD4](C)(=O)(=O)" -c sulfonamide_tert -p /wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2/ -b /wynton/group/degradolab/skt/docking/databases/probe_output/ -o /wynton/group/degradolab/skt/docking/databases/vdg_lib -t 2000
+python ligand_vdgs/scripts/vdg_generation_wrapper.py -s "[NX3&H0][SD4](C)(=O)(=O)" -c sulfonamide_tert -p /wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2/ -b /wynton/group/degradolab/skt/docking/databases/probe_output/ -o /wynton/group/degradolab/skt/docking/databases/vdg_lib
 
 date

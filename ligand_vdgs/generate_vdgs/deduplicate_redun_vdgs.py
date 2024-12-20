@@ -1,4 +1,6 @@
 '''
+WARNING: incomplete.
+
 Removes redundant vdGs from the vdG library. vdGs are redundant if they meet all criteria: 
     1. CG and vdM AA identities and binding pose (backbones within a specified RMSD threshold)
     2. similar positions of the flanking residues (CAs within a specified RMSD 
@@ -8,6 +10,19 @@ Removes redundant vdGs from the vdG library. vdGs are redundant if they meet all
        the clustering is distance-based)
     4. lastly, deduplicate vdgs that are identical but are featurized differently solely 
        because of different permutations of the same binding site
+
+NOTE: there isn't any check in this script to catch instances where the output dir already
+exists or already has files.
+
+TODO: consider if 1.5 rmsd threshold is ok. For example, 
+pyrazine/nr_vdgs/2/2_7myu__A_401_1__A_11_GLY__A_13_GLY.pdb and 
+pyrazine/nr_vdgs/2/2_6jsf__A_510_1__A_35_GLY__A_37_GLY.pdb are too similar. Issue is that 
+increasing threshold will allow dissimilar vdms (when there is only 1 vdm in the subset) to
+be regarded as the same. Ideally, rmsd threshold should scale by number of atoms.
+Also, 2_7myu__A_401_1__A_12_GLN__A_13_GLY and 2_6jsf__A_510_1__A_36_GLN__A_37_GLY.
+Curiously, if I do
+      `if '6jsf' not in pdbname and '7myu' not in pdbname:`
+then only 7myu is printed out, and we don't get the 6jsf one in the first place.
 '''
 
 import os
@@ -58,8 +73,8 @@ Example:
 vdm_combos = { 
               4: {
                     (Ala, Ala, Cys, Phe): [
-                                             [  [CG coords], 
-                                                [bb N-Ca-C coords of Ala1, Ala2, Cys3, Phe4], 
+                   #                          [  [CG coords], 
+                   #                             [bb N-Ca-C coords of Ala1, Ala2, Cys3, Phe4], 
                                                 [seq. +/- 5 of Ala1, Ala2, Cys3, Phe4], 
                                                 [CA   +/- 5 of Ala1, Ala2, Cys3, Phe4], 
                                                 [PDB path],
@@ -95,11 +110,13 @@ def main():
    vdm_combos = {}
 
    # Iterate over the PDBs and CGs that were identified as containing the SMARTS group
-   for pdbname in os.listdir(vdg_pdbs_dir):
+   vdg_pdbs_in_dir = os.listdir(vdg_pdbs_dir)
+   #vdg_pdbs_in_dir = vdg_pdbs_in_dir[209:212] + vdg_pdbs_in_dir[355:365] # FOR TESTING ONLY. DELETE.
+   #vdg_pdbs_in_dir = vdg_pdbs_in_dir[209:365] # workssss for 6jsf
+   for pdbname in vdg_pdbs_in_dir:
       ####### for testing ########
       #if '6jsf' not in pdbname and '7myu' not in pdbname:
       #   continue
-      #print(pdbname)
       ####### for testing ########
       pdbpath = os.path.join(vdg_pdbs_dir, pdbname)
       prody_obj = pr.parsePDB(pdbpath)
@@ -115,6 +132,8 @@ def main():
          # alphabetical order of the vdm AAs.
          re_ordered_aas, re_ordered_bbcoords, re_ordered_flankingseqs, re_ordered_CAs, \
             re_ordered_scrr = reorder_vdg_subset(vdg_subset, vdms_dict)
+         #if re_ordered_aas != ['GLN', 'GLY']: # TESTING! DELETE!
+         #   continue
          # Add to `vdm_combos` dict
          vdm_combos = add_vdgs_to_dict(vdm_combos, vdg_subset, re_ordered_aas, 
             re_ordered_bbcoords, re_ordered_flankingseqs, re_ordered_CAs, re_ordered_scrr,
@@ -122,12 +141,15 @@ def main():
    # Evaluate the complete collection of vdGs and determine redundancy 
    all_nr_vdgs = []
    for num_vdms_in_subset, _subsets in vdm_combos.items():
+      #if num_vdms_in_subset != 2: # TESTING! DELETE!
+      #   continue 
       for _reordered_AAs, _vdgs in _subsets.items():
          # vdG subsets that have identical vdm AA compositions may be redundant
          if len(_vdgs) <= 1: # automatically not reundant b/c no other vdgs have this vdm combo
             _vdgs = _vdgs[0]
             _vdgs = [[i] for i in _vdgs]
             all_nr_vdgs.append(_vdgs)
+            print('LENGTH OF _VDGS IS <=1')
          else:
             nr_vdgs = get_nr_vdgs_of_same_AA_comp(_vdgs, rmsd_thresh, 
                seq_sim_thresh, _reordered_AAs)
@@ -160,6 +182,10 @@ def main():
    
    # Print out subsets of binding site residues (vdms), separated by the number of
    # vdms in that subset
+   print()
+   print('printing out')
+   print('REMEMBER TO MOVE TESTING ONLY LINES')
+   print()
    for pdbcode, list_scrrs in namingdict.items():
       list_scrrs = sorted(list_scrrs)
       vdg_subsets = get_vdg_subsets(list_scrrs)
@@ -302,8 +328,6 @@ def get_nr_vdgs_of_same_AA_comp(_vdgs, rmsd_thresh, seq_sim_thresh, reordered_AA
    # [Ala1, Ala2, Glu], then we need to sample [Ala1, Ala2, Glu] and [Ala2, Ala1, Glu].
    # The easiest way to get the permutations is to label by the index of the ordered AAs
    
-   print(reordered_AAs)
-   
    all_permuted_cg_coords, all_permuted_vdm_bbcoords, all_permuted_flankingseqs, \
       all_permuted_flankingCAs, all_permuted_pdbpaths, all_permuted_vdm_scrr = \
       get_vdg_permutations(reordered_AAs, _vdgs)
@@ -332,6 +356,11 @@ def get_nr_vdgs_of_same_AA_comp(_vdgs, rmsd_thresh, seq_sim_thresh, reordered_AA
          elements_in_clusters(indices_of_elements_in_cg_vdmbb_cluster, 
          all_permuted_cg_coords, all_permuted_vdm_bbcoords, all_permuted_flankingseqs,
          all_permuted_flankingCAs, all_permuted_pdbpaths, all_permuted_vdm_scrr)
+      
+      print()
+      print('CLUSTER', cgvdmbb_clusnum)
+      print('confused')
+
       
       # If there's only 1 element in the cluster, then it's automatically nonredundant b/c its
       # CG+vdm bb position (binding pose) doesn't match any other vdG's binding pose
@@ -467,10 +496,15 @@ def get_hierarchical_clusters(data, thresh, None_in_coords=False):
    Z = linkage(condensed_dist_matrix, method='single')
    clusters = fcluster(Z, thresh, criterion='distance')
    cluster_assignments = {} # key = clusnum, value = indices of `coords` belonging to that cluster
+   print(clusters)
    for all_vdgs_index, clusnum in enumerate(clusters):
       if clusnum not in cluster_assignments.keys():
          cluster_assignments[clusnum] = []
       cluster_assignments[clusnum].append(all_vdgs_index)
+   
+   for a, b in cluster_assignments.items():
+      print('SDFSDFSDFSDF', a, b)
+   
    return cluster_assignments  
 
 def create_dist_matrix(data, None_in_coords):

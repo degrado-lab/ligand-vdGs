@@ -1,7 +1,7 @@
 '''
 The `ligand-vdGs` and `vdG-miner` packages require the input PDB database (the "parent database")
 to match the directory structure
-used by the RCSB PDB mirror. This script formats your PDB database to conform to that structure.
+used in the RCSB PDB mirror. This script formats your PDB database to conform to that structure.
 
 Each PDB file will be organized into subdirectories based on the inner two characters of its name. 
 For example, a PDB file named 
@@ -10,7 +10,10 @@ For example, a PDB file named
 Please note that your PDB files should be named with a 4-character identifier (XXXX.pdb).
 
 Usage: 
-    python -m ligand_vdgs.tools.format_parent_database \
+    >> cd $YOUR_LIGAND-VDGS_DIR
+    >> pip install -e . # for debugging and developing
+    >> pip install .    # for users
+    >> python -m ligand_vdgs.tools.format_parent_database \
         --pdb-input-dir <input_dir> \
         --pdb-output-dir <output_dir>
 '''

@@ -1,5 +1,7 @@
 '''
-Stand-alone script that uses Schrodinger prepwizard to optimize hydrogens in pdb structures.
+This script automates batch execution of the Schrodinger prepwizard program to optimize
+hydrogens for all pdb structures in the parent databse. This script isn't meant for 
+direct execution in most cases. Use s02_run_prepwizard.sh as the main entry point instead. 
 
 Prepwizard flags: 
 -disulfides (add?)
@@ -19,7 +21,7 @@ input_pdb_database_dir = '/home/sophia/DockDesign/databases/consolidated_BioLiP2
 output_dir = '/home/sophia/DockDesign/databases/prepwizard_BioLiP2'
 overwrite = False
 prepwizard_bin_path = '/home/rkormos/schrodinger2024-1/utilities/prepwizard'
-num_batches_total = 15
+num_batches_total = 15 # TODO: SHOULD NOT BE HARDCODED
 logdir = './prepwizard_logs'
 
 import os
