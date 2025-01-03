@@ -8,16 +8,16 @@ Reduces size of the 50G consolidated_BioLiP2_split/ database by
   (there's some logic about taking a guess at whether the pdbs are within the same
   series or not - double check that and describe here.)
 
-Usage: (TODO: verify)
+Usage: 
 cd $YOUR_LIGAND-VDGS_DIR
 pip install -e . # for debugging and developing
-pip install .    # for users
+pip install .    # for general usage
 python -m ligand_vdgs.preprocessing.trim_database
 
-NOTE the reason this script takes forever is because there are a lot of 
+NOTE: the reason this script takes forever for BioLiP2 is because there are a lot of 
 "ligands" that are like ALAA, ALAB, ALA1, ALA2, etc. and are not actually
 ligands; they're amino acids, but the pdb files are so large that there are not
-enough chain columns that they run into each other.
+enough chain columns that they run into each other. TODO: filter out those PDBs.
 '''
 
 import os
