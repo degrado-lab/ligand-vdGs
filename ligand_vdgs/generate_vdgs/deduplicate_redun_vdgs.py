@@ -11,18 +11,7 @@ Removes redundant vdGs from the vdG library. vdGs are redundant if they meet all
     4. lastly, deduplicate vdgs that are identical but are featurized differently solely 
        because of different permutations of the same binding site
 
-NOTE: there isn't any check in this script to catch instances where the output dir already
-exists or already has files.
-
-TODO: consider if 1.5 rmsd threshold is ok. For example, 
-pyrazine/nr_vdgs/2/2_7myu__A_401_1__A_11_GLY__A_13_GLY.pdb and 
-pyrazine/nr_vdgs/2/2_6jsf__A_510_1__A_35_GLY__A_37_GLY.pdb are too similar. Issue is that 
-increasing threshold will allow dissimilar vdms (when there is only 1 vdm in the subset) to
-be regarded as the same. Ideally, rmsd threshold should scale by number of atoms.
-Also, 2_7myu__A_401_1__A_12_GLN__A_13_GLY and 2_6jsf__A_510_1__A_36_GLN__A_37_GLY.
-Curiously, if I do
-      `if '6jsf' not in pdbname and '7myu' not in pdbname:`
-then only 7myu is printed out, and we don't get the 6jsf one in the first place.
+TODO: add warning if user already has files in the output dir.
 '''
 
 import os
@@ -44,8 +33,6 @@ def parse_args():
 #                        "previous step.")
     parser.add_argument('-v', "--vdglib-dir", type=str, required=True,
                         help="Directory for the vdms of this CG.")
-    parser.add_argument('-r', "--rmsd", default=1.5, 
-                        help="RMSD threshold for clustering to determine redundancy.")
     parser.add_argument('-s', "--seq", default=0.75,
                         help="Sequence similarity threshold for clustering sequences "
                         "flanking the vdM to determine redundancy. This should be a value "
@@ -98,7 +85,6 @@ when checking for redundancy.
 def main():
    args = parse_args()
    CG = args.cg
-   rmsd_thresh = args.rmsd
    seq_sim_thresh = args.seq
    num_flanking = args.flank
    vdglib_dir = args.vdglib_dir
@@ -111,8 +97,6 @@ def main():
 
    # Iterate over the PDBs and CGs that were identified as containing the SMARTS group
    vdg_pdbs_in_dir = os.listdir(vdg_pdbs_dir)
-   #vdg_pdbs_in_dir = vdg_pdbs_in_dir[209:212] + vdg_pdbs_in_dir[355:365] # FOR TESTING ONLY. DELETE.
-   #vdg_pdbs_in_dir = vdg_pdbs_in_dir[209:365] # workssss for 6jsf
    for pdbname in vdg_pdbs_in_dir:
       ####### for testing ########
       #if '6jsf' not in pdbname and '7myu' not in pdbname:
@@ -132,8 +116,6 @@ def main():
          # alphabetical order of the vdm AAs.
          re_ordered_aas, re_ordered_bbcoords, re_ordered_flankingseqs, re_ordered_CAs, \
             re_ordered_scrr = reorder_vdg_subset(vdg_subset, vdms_dict)
-         #if re_ordered_aas != ['GLN', 'GLY']: # TESTING! DELETE!
-         #   continue
          # Add to `vdm_combos` dict
          vdm_combos = add_vdgs_to_dict(vdm_combos, vdg_subset, re_ordered_aas, 
             re_ordered_bbcoords, re_ordered_flankingseqs, re_ordered_CAs, re_ordered_scrr,
@@ -141,75 +123,49 @@ def main():
    # Evaluate the complete collection of vdGs and determine redundancy 
    all_nr_vdgs = []
    for num_vdms_in_subset, _subsets in vdm_combos.items():
-      #if num_vdms_in_subset != 2: # TESTING! DELETE!
-      #   continue 
       for _reordered_AAs, _vdgs in _subsets.items():
+         print('Processing vdgs containing', _reordered_AAs)
          # vdG subsets that have identical vdm AA compositions may be redundant
          if len(_vdgs) <= 1: # automatically not reundant b/c no other vdgs have this vdm combo
-            _vdgs = _vdgs[0]
-            _vdgs = [[i] for i in _vdgs]
-            all_nr_vdgs.append(_vdgs)
-            print('LENGTH OF _VDGS IS <=1')
+            single_vdg = _vdgs[0]
+            all_nr_vdgs.append(single_vdg)
          else:
-            nr_vdgs = get_nr_vdgs_of_same_AA_comp(_vdgs, rmsd_thresh, 
+            nr_vdgs = get_nr_vdgs_of_same_AA_comp(_vdgs, 
                seq_sim_thresh, _reordered_AAs)
             for n_v in nr_vdgs:
                all_nr_vdgs.append(n_v)
    
-   # There are many deduplicates in `nr_vdgs`, because different permutations of the same 
-   # binding site will end up in different clusters. The last step is to account for these
-   # duplicates by printing out only 1 of each binding site. Each PDBcode refers to a unique
-   # CG, even if there are multiple CGs on the same ligand. Determine all the vdms that
-   # interact with a given CG by creating a dict, and from there, determine the subsets
-   # of vdms up to 4 residues.
+   # There are many duplicates in `nr_vdgs`, because different permutations of vdms in the same 
+   # binding site will end up in different clusters, therefore appearing to be unique. 
+   # The last step is to account for these duplicates by gathering all vdg subset residues and 
+   # ordering them by scrr to determine which vdgs are identical.
+   
    namingdict = {}
    for nonredun_vdg in all_nr_vdgs:
       nonredun_vdg_pdb = nonredun_vdg[4]
-      assert len(nonredun_vdg_pdb) == 1
-      nonredun_vdg_pdb = nonredun_vdg_pdb[0]
-      assert len(nonredun_vdg_pdb) == 1 # for some reason, it's doubly nested
-      nonredun_vdg_pdb = nonredun_vdg_pdb[0]
       pdbcode = nonredun_vdg_pdb.rstrip('/').rstrip('.pdb').split('/')[-1]
       if pdbcode not in namingdict.keys():
          namingdict[pdbcode] = []
       scrr = nonredun_vdg[5]
-      assert len(scrr) == 1
-      scrr = scrr[0]
-      for vdm in scrr:
-         vdmstr = '_'.join([str(z) for z in vdm])
-         if vdmstr not in namingdict[pdbcode]:
-            namingdict[pdbcode].append(vdmstr)
-   
-   # Print out subsets of binding site residues (vdms), separated by the number of
-   # vdms in that subset
-   print()
-   print('printing out')
-   print('REMEMBER TO MOVE TESTING ONLY LINES')
-   print()
+      sorted_scrr = sorted(scrr)
+      if sorted_scrr not in namingdict[pdbcode]:
+         namingdict[pdbcode].append(sorted_scrr)
+
+   # Print out each vdg (separated by the # of vdms in the vdg)
    for pdbcode, list_scrrs in namingdict.items():
-      list_scrrs = sorted(list_scrrs)
-      vdg_subsets = get_vdg_subsets(list_scrrs)
-      num_vdms = len(vdg_subsets)
-      for subset_vdms in vdg_subsets:
-         pr_obj, subset_vdms_scrr_lists, subset_vdms_scrr_strs = isolate_vdg_subset_obj(
-            pdbcode, subset_vdms, vdg_pdbs_dir) 
+      for vdg_scrr in list_scrrs:
+         vdg_scrr_str = '_'.join(['_'.join([str(z) for z in v_s]) for v_s in vdg_scrr])
+         pr_obj = isolate_vdg_subset_obj(pdbcode, vdg_scrr, vdg_pdbs_dir)
          # Write out pdb
-         write_vdg_subset(subset_vdms_scrr_strs, subset_vdms_scrr_lists, pdbcode, pr_obj,
-                          out_dir)
+         write_vdg_subset(pdbcode, vdg_scrr, vdg_scrr_str, pr_obj, out_dir)
          
-def isolate_vdg_subset_obj(pdbcode, subset_vdms, vdg_pdbs_dir):
+def isolate_vdg_subset_obj(pdbcode, vdg_scrr, vdg_pdbs_dir):
    # Select just the specified vdms (vdg subset) for printing out
    # Initialize prody obj for printing out
    input_vdg_pdbpath = os.path.join(vdg_pdbs_dir, pdbcode + '.pdb')
    par = pr.parsePDB(input_vdg_pdbpath)
    pr_obj = par.select('occupancy > 2.8') # occ >= 3 is CG
-   subset_vdms_scrr_lists = []
-   subset_vdms_scrr_strs = []
-   for v_scrr in subset_vdms:
-      subset_vdms_scrr_strs.append(v_scrr)
-      v_scrr_list = v_scrr.split('_')
-      subset_vdms_scrr_lists.append(v_scrr_list)
-   for vdm_scrr, vdm_scrr_str in zip(subset_vdms_scrr_lists, subset_vdms_scrr_strs):
+   for vdm_scrr in vdg_scrr:
       if vdm_scrr[0]: # has a pdb segment defined
          res_obj = par.select(
             f'segment {vdm_scrr[0]} and chain {vdm_scrr[1]} and resnum {vdm_scrr[2]}')
@@ -220,17 +176,15 @@ def isolate_vdg_subset_obj(pdbcode, subset_vdms, vdg_pdbs_dir):
       vdm_res_name = list(set(res_obj.getResnames()))
       assert len(vdm_res_name)  == 1
       assert vdm_res_name[0] == vdm_scrr[3]
-      if pr_obj is None: 
-         pr_obj = res_obj
-      else:
-         pr_obj += res_obj
-   return pr_obj, subset_vdms_scrr_lists, subset_vdms_scrr_strs
+      pr_obj += res_obj
+      # Ensure the correct number of vdms in this vdg
+      num_resinds = len(set(pr_obj.getResindices()))
+   assert num_resinds == len(vdg_scrr) + 1 # +1 is because CG counts as a resind
+   return pr_obj
 
-def write_vdg_subset(subset_vdms_scrr_strs, subset_vdms_scrr_lists, pdbcode, pr_obj,
-                     out_dir):
-   vdms_str = '_'.join(subset_vdms_scrr_strs)
-   n_vdms_in_subset = str(len(subset_vdms_scrr_lists))
-   outputname = f'{n_vdms_in_subset}_{pdbcode}_{vdms_str}.pdb'
+def write_vdg_subset(pdbcode, vdg_scrr, vdg_scrr_str, pr_obj, out_dir):
+   n_vdms_in_subset = str(len(vdg_scrr))
+   outputname = f'{n_vdms_in_subset}_{pdbcode}_{vdg_scrr_str}.pdb'
    outputpath = os.path.join(out_dir, n_vdms_in_subset, outputname)
    if str(n_vdms_in_subset) not in os.listdir(out_dir):
       os.mkdir(os.path.join(out_dir, n_vdms_in_subset))
@@ -322,7 +276,7 @@ def combine_cg_and_vdmbb_coords(all_permuted_cg_coords, all_permuted_vdm_bbcoord
       all_cg_and_vdmbb_coords.append(cg_and_vdmbb)
    return all_cg_and_vdmbb_coords
 
-def get_nr_vdgs_of_same_AA_comp(_vdgs, rmsd_thresh, seq_sim_thresh, reordered_AAs):
+def get_nr_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs):
    # vdG subsets that have identical vdm AA compositions may be redudant.
    # First, get all permutations for equivalent AAs. For example, if the vdms are 
    # [Ala1, Ala2, Glu], then we need to sample [Ala1, Ala2, Glu] and [Ala2, Ala1, Glu].
@@ -343,7 +297,7 @@ def get_nr_vdgs_of_same_AA_comp(_vdgs, rmsd_thresh, seq_sim_thresh, reordered_AA
    # value is a list of the indices of the vdGs (indexing is relative position in 
    # all_permuted_cg_coords, all_permuted_vdm_bbcoords, etc.) that belong in that cluster.
    cgvdmbb_cluster_assignments = get_hierarchical_clusters(all_cg_and_vdmbb_coords, 
-      rmsd_thresh, None_in_coords=True) # `cluster_assignments` dict not ordered by cluster size
+      None_in_coords=True) # `cluster_assignments` dict not ordered by cluster size
 
    nr_vdgs = []
    for cgvdmbb_clusnum, indices_of_elements_in_cg_vdmbb_cluster in \
@@ -357,20 +311,15 @@ def get_nr_vdgs_of_same_AA_comp(_vdgs, rmsd_thresh, seq_sim_thresh, reordered_AA
          all_permuted_cg_coords, all_permuted_vdm_bbcoords, all_permuted_flankingseqs,
          all_permuted_flankingCAs, all_permuted_pdbpaths, all_permuted_vdm_scrr)
       
-      print()
-      print('CLUSTER', cgvdmbb_clusnum)
-      print('confused')
-
-      
       # If there's only 1 element in the cluster, then it's automatically nonredundant b/c its
       # CG+vdm bb position (binding pose) doesn't match any other vdG's binding pose
       if len(indices_of_elements_in_cg_vdmbb_cluster) <= 1:
-         vdg_descript = [cgvdmbb_clus_cg_coords, cgvdmbb_clus_vdmbb_coords, 
-            cgvdmbb_clus_flankingseqs, cgvdmbb_clus_flankingCAs, cgvdmbb_clus_pdbpaths, 
-            cgvdmbb_clus_vdm_scrr] # these 6 elements define a vdg
+         vdg_descript = [cgvdmbb_clus_cg_coords[0], cgvdmbb_clus_vdmbb_coords[0], 
+            cgvdmbb_clus_flankingseqs[0], cgvdmbb_clus_flankingCAs[0], cgvdmbb_clus_pdbpaths[0], 
+            cgvdmbb_clus_vdm_scrr[0]] # these 6 elements define a vdg
          nr_vdgs.append(vdg_descript)
          continue
-      
+
       # Otherwise, if there's >1 element in the cluster, it's possible that the vdgs within 
       # this cluster are redundant. Next thing to look at is rmsd of those flanking 
       # bb stretches. Align and cluster.
@@ -388,7 +337,7 @@ def get_nr_vdgs_of_same_AA_comp(_vdgs, rmsd_thresh, seq_sim_thresh, reordered_AA
       # C-terminal residues. Only select residues that have CA coords in both of the vdgs whose
       # rmsd is being calculated.
       flankingbb_cluster_assignments = get_hierarchical_clusters(
-         flattened_flankingCAs_for_vdgs_in_cgvdmbb_cluster, rmsd_thresh, None_in_coords=True)
+         flattened_flankingCAs_for_vdgs_in_cgvdmbb_cluster, None_in_coords=True)
       for flankingCAs_clusnum, indices_of_elements_in_flankingCAs_cluster in \
          flankingbb_cluster_assignments.items():
          # For each cluster determined by rmsd between CA coords flanking the vdms, gather the
@@ -405,12 +354,12 @@ def get_nr_vdgs_of_same_AA_comp(_vdgs, rmsd_thresh, seq_sim_thresh, reordered_AA
          # If there's only 1 element in the cluster, then it's automatically nonredundant b/c 
          # its binding site backbone doesn't match any other vdG's binding site
          if len(indices_of_elements_in_flankingCAs_cluster) <= 1:
-            vdg_descript = [flankingCAs_clus_cg_coords, flankingCAs_clus_vdmbb_coords,
-               flankingCAs_clus_flankingseqs, flankingCAs_clus_flankingCAs,
-               flankingCAs_clus_pdbpaths, flankingCAs_clus_vdm_scrr] # these 6 define a vdg
+            vdg_descript = [flankingCAs_clus_cg_coords[0], flankingCAs_clus_vdmbb_coords[0],
+               flankingCAs_clus_flankingseqs[0], flankingCAs_clus_flankingCAs[0],
+               flankingCAs_clus_pdbpaths[0], flankingCAs_clus_vdm_scrr[0]] # these 6 define a vdg
             nr_vdgs.append(vdg_descript)
             continue
-         
+
          # Otherwise, if there's more than 1 element in the cluster, it's possible that the vdgs
          # within this cluster are redundant. Next metric to cluster on is sequence dissimilarity 
          # of the residues +/- of the vdms.
@@ -422,7 +371,7 @@ def get_nr_vdgs_of_same_AA_comp(_vdgs, rmsd_thresh, seq_sim_thresh, reordered_AA
                flat_vdg_flankingseq += vdm_res
             flattened_flankingseqs_for_vdgs_in_flankingCA_clus.append(flat_vdg_flankingseq)
          seqsim_clus_assignments = get_hierarchical_clusters(
-            flattened_flankingseqs_for_vdgs_in_flankingCA_clus, seq_sim_thresh)
+            flattened_flankingseqs_for_vdgs_in_flankingCA_clus, seq_sim_thresh=seq_sim_thresh)
          # If the vdgs belong in the same cluster based on sequence similarity (and therefore
          # backbones and cg+vdmbb binding pose), then the vdgs are redundant. Select only one
          # to add to the `nr_vdgs` list.
@@ -437,13 +386,10 @@ def get_nr_vdgs_of_same_AA_comp(_vdgs, rmsd_thresh, seq_sim_thresh, reordered_AA
                flankingCAs_clus_pdbpaths, flankingCAs_clus_vdm_scrr)
            
             if len(indices_of_elements_in_flankingseq_clus) <= 1:
-               vdg_descript = [flankingseq_clus_cg_coords, flankingseq_clus_vdmbb_coords, 
-               flankingseq_clus_flankingseqs, flankingseq_clus_flankingCAs, 
-               flankingseq_clus_pdbpaths, flankingseq_clus_vdm_scrr]
+               vdg_descript = [flankingseq_clus_cg_coords[0], flankingseq_clus_vdmbb_coords[0], 
+               flankingseq_clus_flankingseqs[0], flankingseq_clus_flankingCAs[0], 
+               flankingseq_clus_pdbpaths[0], flankingseq_clus_vdm_scrr[0]]
                nr_vdgs.append(vdg_descript)
-               for b in vdg_descript:
-                  assert len(b) == 1
-               continue
             
             else: # select only one, so use index 0 for indices_of_elements_in_flankingseq_clus
                flankingseq_clus_cg_coords, flankingseq_clus_vdmbb_coords, \
@@ -453,11 +399,9 @@ def get_nr_vdgs_of_same_AA_comp(_vdgs, rmsd_thresh, seq_sim_thresh, reordered_AA
                flankingCAs_clus_cg_coords, flankingCAs_clus_vdmbb_coords, \
                flankingCAs_clus_flankingseqs, flankingCAs_clus_flankingCAs, \
                flankingCAs_clus_pdbpaths, flankingCAs_clus_vdm_scrr)
-               vdg_descript = [flankingseq_clus_cg_coords, flankingseq_clus_vdmbb_coords,
-                  flankingseq_clus_flankingseqs, flankingseq_clus_flankingCAs, 
-                  flankingseq_clus_pdbpaths, flankingseq_clus_vdm_scrr]
-               for b in vdg_descript:
-                  assert len(b) == 1
+               vdg_descript = [flankingseq_clus_cg_coords[0], flankingseq_clus_vdmbb_coords[0],
+                  flankingseq_clus_flankingseqs[0], flankingseq_clus_flankingCAs[0], 
+                  flankingseq_clus_pdbpaths[0], flankingseq_clus_vdm_scrr[0]]
                nr_vdgs.append(vdg_descript)
               
    return nr_vdgs 
@@ -482,28 +426,29 @@ def get_overlapping_res_coords(list1, list2):
     
     return np.array(list1_overlap), np.array(list2_overlap)
 
-def get_hierarchical_clusters(data, thresh, None_in_coords=False):
+def get_hierarchical_clusters(data, None_in_coords=False, seq_sim_thresh=None):
    # Returns dict where key = cluster number and value = indices of the list elements that
    # belong in that cluster. This dict is not ordered by size.
    # `data` is either a list of coords, or a list of sequences.
-   # None_inc_coords is a param that distinguishes whether `data` is coordinates or sequences.
+   # None_in_coords is a param that distinguishes whether `data` is coordinates or sequences.
    # This distinction is important because rmsd cannot be calculated on non-coordinates, so if 
    # any residues are "None" for either of the 2 vdgs being compared, that whole residue is 
    # discounted.
 
+   num_coords = len(data[0])
+   thresh = normalize_rmsd(num_coords)
    dist_matrix = create_dist_matrix(data, None_in_coords) # dist is either rmsd or % seq sim
    condensed_dist_matrix = squareform(dist_matrix)
    Z = linkage(condensed_dist_matrix, method='single')
-   clusters = fcluster(Z, thresh, criterion='distance')
+   if seq_sim_thresh:
+      clusters = fcluster(Z, seq_sim_thresh, criterion='distance')
+   else:
+      clusters = fcluster(Z, thresh, criterion='distance')
    cluster_assignments = {} # key = clusnum, value = indices of `coords` belonging to that cluster
-   print(clusters)
    for all_vdgs_index, clusnum in enumerate(clusters):
       if clusnum not in cluster_assignments.keys():
          cluster_assignments[clusnum] = []
       cluster_assignments[clusnum].append(all_vdgs_index)
-   
-   for a, b in cluster_assignments.items():
-      print('SDFSDFSDFSDF', a, b)
    
    return cluster_assignments  
 
@@ -559,7 +504,7 @@ def add_vdgs_to_dict(vdm_combos, vdg_subset, re_ordered_aas, re_ordered_bbcoords
       vdm_combos[num_vdms_in_subset][re_ord_aas_tup] = []
    # Add the vdg to `vdm_combos`
    vdm_combos[num_vdms_in_subset][re_ord_aas_tup].append([cg_coords, re_ordered_bbcoords,
-      re_ordered_flankingseqs, re_ordered_CAs, [pdbpath], re_ordered_scrr])
+      re_ordered_flankingseqs, re_ordered_CAs, pdbpath, re_ordered_scrr])
 
    return vdm_combos
 
@@ -746,6 +691,25 @@ def get_vdg_subsets(input_list):
         subsets = combinations(input_list, r)
         all_subsets.extend(subsets)
     return all_subsets
+
+def normalize_rmsd(num_atoms):
+    # Smoothly scale rmsd threshold by the number of atoms.
+    # Lower bound 1.5A with 5 atoms and upper bound 2.5A with 20 atoms.
+    min_atoms = 5
+    min_threshold = 1.5  
+    max_atoms = 20
+    max_threshold = 2.5  
+    
+    if num_atoms < min_atoms:
+        return min_threshold  # below 5 atoms, use the minimum threshold (1.5 Å)
+    if num_atoms > max_atoms:
+        return max_threshold  # above 20 atoms, use the maximum threshold (2.5 Å)
+    
+    # Linear scaling for atoms between 5 and 20
+    scaling_factor = (num_atoms - min_atoms) / (max_atoms - min_atoms)
+    threshold = min_threshold + scaling_factor * (max_threshold - min_threshold)
+    
+    return threshold
 
 if __name__ == "__main__":
     main()
