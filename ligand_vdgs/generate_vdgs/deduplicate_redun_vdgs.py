@@ -34,7 +34,7 @@ def parse_args():
 #                        "previous step.")
     parser.add_argument('-v', "--vdglib-dir", type=str, required=True,
                         help="Directory for the vdms of this CG.")
-    parser.add_argument('-s', "--seq", default=0.75,
+    parser.add_argument('-s', "--seq", default=0.50,
                         help="Sequence similarity threshold for clustering sequences "
                         "flanking the vdM to determine redundancy. This should be a value "
                         "between 0 and 1. Values > seq will be considered redundant.")
@@ -436,10 +436,23 @@ def get_nr_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs):
 
 def calc_seq_similarity(list1, list2):
     # Count how many residues match
+    list1 = [i for i in list1 if i != 'vdm']
+    list2 = [i for i in list2 if i != 'vdm']
+    assert len(list1) == len(list2)
+    # Exclude residues if at least one of them is an "X"
+    indices_to_exclude = []
+    for ind in range(len(list1)):
+         if list1[ind] == 'X' or list2[ind] == 'X':
+            indices_to_exclude.append(ind)
+    list1 = [item for idx, item in enumerate(list1) if idx not in indices_to_exclude]
+    list2 = [item for idx, item in enumerate(list2) if idx not in indices_to_exclude]
     matches = sum(1 for a, b in zip(list1, list2) if a == b)
 
     # Calculate the percentage of matches
-    match_percentage = (matches / len(list1)) * 100
+    if len(list1) == 0:
+        match_percentage = 0
+    else:
+        match_percentage = (matches / len(list1)) * 100
     return match_percentage
 
 def get_overlapping_res_coords(list1, list2):
@@ -469,7 +482,8 @@ def get_hierarchical_clusters(data, None_in_coords=False, seq_sim_thresh=None):
    condensed_dist_matrix = squareform(dist_matrix)
    Z = linkage(condensed_dist_matrix, method='single')
    if seq_sim_thresh:
-      clusters = fcluster(Z, seq_sim_thresh, criterion='distance')
+      seq_dissimilarity_thresh = 1 - seq_sim_thresh
+      clusters = fcluster(Z, seq_dissimilarity_thresh, criterion='distance')
    else:
       clusters = fcluster(Z, thresh, criterion='distance')
    cluster_assignments = {} # key = clusnum, value = indices of `coords` belonging to that cluster
@@ -724,9 +738,9 @@ def normalize_rmsd(num_atoms):
     # Smoothly scale rmsd threshold by the number of atoms.
     # Lower bound 1.5A with 5 atoms and upper bound 2.5A with 20 atoms.
     min_atoms = 5
-    min_threshold = 1.5  
+    min_threshold = 0.4
     max_atoms = 20
-    max_threshold = 2.5  
+    max_threshold = 1.3 
     
     if num_atoms < min_atoms:
         return min_threshold  # below 5 atoms, use the minimum threshold (1.5 Å)
