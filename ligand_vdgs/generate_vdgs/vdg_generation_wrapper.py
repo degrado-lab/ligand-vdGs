@@ -76,7 +76,7 @@ def main():
     subprocess.run(to_pdbs_cmd, shell=True, check=True)
 
     # Run deduplicate_redun_vdgs.py
-    deduplicate_cmd = f'python ligand_vdgs/preprocessing/deduplicate_redun_vdgs.py --cg "{cg}" --vdglib-dir {out_dir}'
+    deduplicate_cmd = f'python ligand_vdgs/generate_vdgs/deduplicate_redun_vdgs.py --cg "{cg}" --vdglib-dir {out_dir} -l "{logfile}"'
 
     subprocess.run(deduplicate_cmd, shell=True, check=True)
 

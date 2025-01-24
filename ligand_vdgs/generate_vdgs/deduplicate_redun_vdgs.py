@@ -17,6 +17,7 @@ TODO: add warning if user already has files in the output dir.
 import os
 import sys
 import argparse
+import time
 from itertools import combinations, permutations, product
 import numpy as np
 from scipy.cluster.hierarchy import linkage, fcluster
@@ -40,7 +41,8 @@ def parse_args():
     parser.add_argument('-f', "--flank", default=5,
                         help="Number of residues flanking the vdms for which to calculate "
                         "sequence similarity and backbone similarity.")
-
+    parser.add_argument('-l', "--logfile", help="Path to log file.")
+    
     return parser.parse_args()
 
 '''
@@ -83,15 +85,20 @@ when checking for redundancy.
 '''
 
 def main():
+   start_time = time.time()
    args = parse_args()
    CG = args.cg
    seq_sim_thresh = args.seq
    num_flanking = args.flank
+   logfile = args.logfile
    vdglib_dir = args.vdglib_dir
    vdg_pdbs_dir = os.path.join(vdglib_dir, 'vdg_pdbs')
    out_dir = os.path.join(vdglib_dir, 'nr_vdgs')
    os.makedirs(out_dir, exist_ok=True)
 
+   with open(logfile, 'a') as file:
+        file.write(f"{'='*20} Starting deduplicate_reun_vdgs.py run {'='*20} \n")
+   
    # Initialize vdm_combos dict to store the subsets of vdMs within a vdG
    vdm_combos = {}
 
@@ -124,7 +131,6 @@ def main():
    all_nr_vdgs = []
    for num_vdms_in_subset, _subsets in vdm_combos.items():
       for _reordered_AAs, _vdgs in _subsets.items():
-         print('Processing vdgs containing', _reordered_AAs)
          # vdG subsets that have identical vdm AA compositions may be redundant
          if len(_vdgs) <= 1: # automatically not reundant b/c no other vdgs have this vdm combo
             single_vdg = _vdgs[0]
@@ -159,6 +165,28 @@ def main():
          # Write out pdb
          write_vdg_subset(pdbcode, vdg_scrr, vdg_scrr_str, pr_obj, out_dir)
          
+   # Print out time elapsed
+   seconds = time.time() - start_time
+   hours = seconds // 3600
+   minutes = (seconds % 3600) // 60
+   seconds = seconds % 60
+   seconds = round(seconds, 2)
+    
+   # Write out results to log file
+   with open(logfile, 'a') as file:
+      num_vdg_pdbs = len(vdg_pdbs_in_dir)
+      num_nr_singles =  len(os.listdir(os.path.join(out_dir, '1')))
+      num_nr_pairs =    len(os.listdir(os.path.join(out_dir, '2')))
+      num_nr_triplets = len(os.listdir(os.path.join(out_dir, '3')))
+      num_nr_quad =     len(os.listdir(os.path.join(out_dir, '4')))
+      file.write(f'\tNumber of vdg subsets from {num_vdg_pdbs} vdgs:\n')
+      file.write(f'\t\tNonredundant single vdms: {num_nr_singles}\n')
+      file.write(f'\t\tNonredundant vdm pairs: {num_nr_pairs}\n')
+      file.write(f'\t\tNonredundant vdm triplets: {num_nr_triplets}\n')
+      file.write(f'\t\tNonredundant vdm quadruplets: {num_nr_quad}\n')
+      file.write(f"Completed deduplicate_redun_vdgs.py in {hours} h, ")
+      file.write(f"{minutes} mins, and {seconds} secs \n") 
+
 def isolate_vdg_subset_obj(pdbcode, vdg_scrr, vdg_pdbs_dir):
    # Select just the specified vdms (vdg subset) for printing out
    # Initialize prody obj for printing out
