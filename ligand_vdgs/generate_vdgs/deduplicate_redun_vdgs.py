@@ -10,8 +10,6 @@ Removes redundant vdGs from the vdG library. vdGs are redundant if they meet all
        the clustering is distance-based)
     4. lastly, deduplicate vdgs that are identical but are featurized differently solely 
        because of different permutations of the same binding site
-
-TODO: add warning if user already has files in the output dir.
 '''
 
 import os
@@ -95,6 +93,11 @@ def main():
    vdg_pdbs_dir = os.path.join(vdglib_dir, 'vdg_pdbs')
    out_dir = os.path.join(vdglib_dir, 'nr_vdgs')
    os.makedirs(out_dir, exist_ok=True)
+   if len(os.listdir(out_dir)) > 0:
+      print(f'The output dir {out_dir} is not empty. Remove files or define a new output dir '
+            'name to prevent accidental overwriting.')
+      sys.exit(1)
+
 
    with open(logfile, 'a') as file:
         file.write(f"{'='*20} Starting deduplicate_reun_vdgs.py run {'='*20} \n")
