@@ -3,7 +3,7 @@
 
 #--------------------- Please define these variables. -------------------------
 # Path to vdG library
-vdgs_dir: /wynton/group/degradolab/skt/docking/databases/vdg_lib/sulfonamide_tert/vdg_pdbs
+vdgs_dir: /wynton/group/degradolab/skt/docking/databases/vdg_lib/sulfonamide_tert
 
 # CG name (can be a common name or a SMARTS string)
 cg_name: sulfonamide_tert
@@ -21,14 +21,14 @@ bindingsite_residues:
 query_lig: ['B', 'A', 401]
 
 # Atom names of the CG within the query ligand
-query_cg_atoms: ['O2', 'S1', 'O3', 'C15', 'N2']
+query_cg_atoms: ['N2', 'S1', 'C15', 'O3', 'O2']
 
 # ------------------------------------------------------------------------------------
 #                  Default values set below. Redefine if necessary                    
 # ------------------------------------------------------------------------------------
 
 # RMSD threshold (in Ang) for defining a vdG as a match to the "ground truth".
-rmsd_threshold: 1.5
+rmsd_threshold: 0.5
 
 # Directory to output matches
-out_dir: vdm_matches
+out_dir: vdg_matches

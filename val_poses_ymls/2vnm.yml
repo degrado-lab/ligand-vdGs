@@ -3,7 +3,7 @@
 
 #--------------------- Please define these variables. -------------------------
 # Path to vdG library
-vdgs_dir: /wynton/group/degradolab/skt/docking/databases/vdg_lib/sulfonamide_tert/vdg_pdbs
+vdgs_dir: /wynton/group/degradolab/skt/docking/databases/vdg_lib/sulfonamide_tert
 
 # CG name (can be a common name or a SMARTS string)
 cg_name: sulfonamide_tert
@@ -30,4 +30,4 @@ query_cg_atoms: ['O10', 'S08', 'O09', 'C07', 'N11']
 rmsd_threshold: 0.8
 
 # Directory to output matches
-out_dir: ../vdg_matches
+out_dir: vdg_matches

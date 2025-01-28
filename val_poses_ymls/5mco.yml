@@ -3,10 +3,10 @@
 
 #--------------------- Please define these variables. -------------------------
 # Path to vdG library
-vdgs_dir: /wynton/group/degradolab/skt/docking/databases/vdg_lib/sulfonamide/vdg_pdbs
+vdgs_dir: /wynton/group/degradolab/skt/docking/databases/vdg_lib/sulfonamide_tert
 
 # CG name (can be a common name or a SMARTS string)
-cg_name: sulfonamide
+cg_name: sulfonamide_tert
 
 # Path to the query protein-ligand complex
 query_path: /wynton/home/degradolab/skt/docking/query_structs/5mco.pdb
@@ -29,7 +29,7 @@ query_cg_atoms: ['C9', 'C11', 'C12', 'O13', 'C14', 'N16', 'N15']
 # ------------------------------------------------------------------------------------
 
 # RMSD threshold (in Ang) for defining a vdG as a match to the "ground truth".
-rmsd_threshold: 0.5
+rmsd_threshold: 0.8
 
 # Directory to output matches
-out_dir: vdm_matches
+out_dir: vdg_matches

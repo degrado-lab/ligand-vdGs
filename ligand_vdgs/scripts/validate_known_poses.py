@@ -48,9 +48,9 @@ def main():
                               query_path)
         query_bb_coords[tuple(bsr)] = bbcoords
     
-    # If adding singles: 
+    # Get subsets of vdg residues
     query_res_sets = [[b] for b in bindingsite_residues] + list(
-        combinations(bindingsite_residues, 2))
+        combinations(bindingsite_residues, 4))
     
     '''
     # If only considering pairs: # note that there may be FGs in solved structures
@@ -58,7 +58,7 @@ def main():
     query_res_sets = list(combinations(bindingsite_residues, 2))
     '''
     
-    # Iterate over pairs (and maybe singles) of binding site residues and determine
+    # Iterate over subsets of binding site residues and determine
     # whether any of the vdGs in the database match the "ground truth" binding site
     # residues and CG positions of the query structure.
     for q_res_set in query_res_sets:
@@ -73,6 +73,16 @@ def main():
             subdir = 'double_res_matches'
             if 'nr_vdgs' not in vdgs_dir: 
                 vdgs_dir = os.path.join(rf"{vdgs_dir}", 'nr_vdgs', '2')
+            database_vdg_names = os.listdir(vdgs_dir)
+        elif len(q_res_set) == 3:
+            subdir = 'triple_res_matches'
+            if 'nr_vdgs' not in vdgs_dir: 
+                vdgs_dir = os.path.join(rf"{vdgs_dir}", 'nr_vdgs', '3')
+            database_vdg_names = os.listdir(vdgs_dir)
+        elif len(q_res_set) == 4:
+            subdir = 'quad_res_matches'
+            if 'nr_vdgs' not in vdgs_dir: 
+                vdgs_dir = os.path.join(rf"{vdgs_dir}", 'nr_vdgs', '4')
             database_vdg_names = os.listdir(vdgs_dir)
         else:
             assert False
