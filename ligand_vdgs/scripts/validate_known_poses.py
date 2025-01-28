@@ -50,8 +50,10 @@ def main():
     
     # Get subsets of vdg residues
     query_res_sets = [[b] for b in bindingsite_residues] + list(
-        combinations(bindingsite_residues, 4))
-    
+        combinations(bindingsite_residues, 2))  + list(
+        combinations(bindingsite_residues, 3)) + list(
+        combinations(bindingsite_residues, 4)
+        )
     '''
     # If only considering pairs: # note that there may be FGs in solved structures
     #                            # with only 1 vdM.
@@ -65,36 +67,27 @@ def main():
 
         if len(q_res_set) == 1:
             subdir = 'single_res_matches'
-            if 'nr_vdgs' not in vdgs_dir: 
-                vdgs_dir = os.path.join(rf"{vdgs_dir}", 'nr_vdgs', '1')
-            database_vdg_names = os.listdir(vdgs_dir)
+            _vdgs_dir = os.path.join(rf"{vdgs_dir}", 'nr_vdgs', '1')
 
         elif len(q_res_set) == 2:
             subdir = 'double_res_matches'
-            if 'nr_vdgs' not in vdgs_dir: 
-                vdgs_dir = os.path.join(rf"{vdgs_dir}", 'nr_vdgs', '2')
-            database_vdg_names = os.listdir(vdgs_dir)
+            _vdgs_dir = os.path.join(rf"{vdgs_dir}", 'nr_vdgs', '2')
         elif len(q_res_set) == 3:
             subdir = 'triple_res_matches'
-            if 'nr_vdgs' not in vdgs_dir: 
-                vdgs_dir = os.path.join(rf"{vdgs_dir}", 'nr_vdgs', '3')
-            database_vdg_names = os.listdir(vdgs_dir)
+            _vdgs_dir = os.path.join(rf"{vdgs_dir}", 'nr_vdgs', '3')
         elif len(q_res_set) == 4:
             subdir = 'quad_res_matches'
-            if 'nr_vdgs' not in vdgs_dir: 
-                vdgs_dir = os.path.join(rf"{vdgs_dir}", 'nr_vdgs', '4')
-            database_vdg_names = os.listdir(vdgs_dir)
+            _vdgs_dir = os.path.join(rf"{vdgs_dir}", 'nr_vdgs', '4')
         else:
             assert False
 
-        database_vdg_paths = [os.path.join(vdgs_dir, d) for d in database_vdg_names]
+        database_vdg_names = os.listdir(_vdgs_dir)
+        database_vdg_paths = [os.path.join(_vdgs_dir, d) for d in database_vdg_names]
         pdbnames = [i.split('/')[-1] for i in database_vdg_paths]
         assert len(database_vdg_paths) == len(set(pdbnames))
         database_vdgs = [pr.parsePDB(d) for d in database_vdg_paths]
 
-        # Calc rmsd on pairs of bb residues (incl. CG), but consider whether to add single bb
-        # residues in case there aren't many vdGs matching pairs of bb residues. 
-        num_db_vdg_within_rmsd = 0
+        # Calc rmsd on subsets of bb residues (incl. CG) 
         q_bbcoords_list = [query_bb_coords[tuple(r)] for r in q_res_set]
         q_flattened_bb_list = [item for sublist in q_bbcoords_list for item in sublist]
         q_bb_and_cg = np.array(q_flattened_bb_list + q_cg_coords)
@@ -136,7 +129,6 @@ def main():
                                                                  q_bb_and_cg)
                 rmsd = round(pr.calcRMSD(moved_db_vdg_bb_cg_coords, q_bb_and_cg), 2)
                 if rmsd < rmsd_threshold:
-                    num_db_vdg_within_rmsd += 1
                     moved_vdg = pr.applyTransformation(transf, database_vdg.copy())
                     
                     # Write out just the vdms in this permutation
@@ -145,20 +137,21 @@ def main():
                     moved_vdg_perm_resinds_obj = moved_vdg.copy().select(
                         f'({perm_resinds_sele}) or (occupancy > 2.8)') # occ 3 = CG
                     vdg_pdbname = db_vdg_path.rstrip('/').split('/')[-1].rstrip('.pdb')
-                    for sublist in q_res_set:
-                        bsr_flat_list = [str(it) for it in sublist]
+                    output_vdg_name = f'{vdg_pdbname}'
+                    for residue in q_res_set:
+                        bsr_flat_list = [str(it) for it in residue]
                         bsr_str = '_'.join(bsr_flat_list)
-                        output_vdg_name = f'{vdg_pdbname}_{bsr_str}.pdb'
-                        subdir_path = os.path.join(output_dir, subdir)
-                        output_vdg_path = os.path.join(output_dir, subdir, output_vdg_name)
-                        if not os.path.exists(subdir_path):
-                            os.makedirs(subdir_path)
-                        pr.writePDB(output_vdg_path, 
-                                    moved_vdg_perm_resinds_obj.copy().select(
+                        output_vdg_name += f'_{bsr_str}'
+                    subdir_path = os.path.join(output_dir, subdir)
+                    output_vdg_path = os.path.join(output_dir, subdir, output_vdg_name)
+                    if not os.path.exists(subdir_path):
+                        os.makedirs(subdir_path)
+                    pr.writePDB(output_vdg_path, 
+                                moved_vdg_perm_resinds_obj.copy().select(
                                     'occupancy > 1.5'))
     
 def get_database_vdm_bb_coords(database_vdg, query_vdm_resnames, db_vdg_path):
-    '''output
+    '''
     Returns bb coordinates of all valid permutations that match the order of
     query_vdm_resnames
     '''
