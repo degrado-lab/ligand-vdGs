@@ -50,7 +50,7 @@ def main():
     for pdb in os.listdir(pdb_input_dir):
         print(pdb)
         # Ensure that the PDB has exactly 4 characters
-        pdbcode = pdb.rstrip('.pdb')
+        pdbcode = pdb.removesuffix('.pdb')
         if len(pdbcode) != 4:
             raise ValueError('PDB file names are expected to have 4 characters ("XXXX.pdb"). '
                              'Invalid file: {}'.format(os.path.join(pdb_input_dir, pdb)))

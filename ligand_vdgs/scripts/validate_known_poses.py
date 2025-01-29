@@ -22,8 +22,8 @@ def main():
                query_cg_atoms, rmsd_threshold, out_dir = parse_yaml_input(yml_file)
     
     # Set up output dir
-    pdbname = query_path.split('/')[-1].rstrip('.pdb')
-    output_dir = os.path.join(out_dir, yml_file.rstrip('.yml').split('/')[-1])
+    pdbname = query_path.split('/')[-1].removesuffix('.pdb')
+    output_dir = os.path.join(out_dir, yml_file.removesuffix('.yml').split('/')[-1])
     if os.path.exists(output_dir):
         if os.listdir(output_dir):
             raise ValueError(f'The output directory {output_dir} is not empty. '
@@ -136,7 +136,7 @@ def main():
                     perm_resinds_sele = f'resindex {perm_resinds_str}'
                     moved_vdg_perm_resinds_obj = moved_vdg.copy().select(
                         f'({perm_resinds_sele}) or (occupancy > 2.8)') # occ 3 = CG
-                    vdg_pdbname = db_vdg_path.rstrip('/').split('/')[-1].rstrip('.pdb')
+                    vdg_pdbname = db_vdg_path.rstrip('/').split('/')[-1].removesuffix('.pdb')
                     output_vdg_name = f'{vdg_pdbname}'
                     for residue in q_res_set:
                         bsr_flat_list = [str(it) for it in residue]
