@@ -365,13 +365,16 @@ def get_output_pdbpath(pdb_name, first_vdm_scrr, vdgscrrs, cluster_dirname, clus
     base_pdb = os.path.basename(pdb_name)
     base_pdbname = base_pdb.removesuffix('.pdb')
     vdmAA_str = '_'.join([x[3] for x in first_vdm_scrr])
-    vdg_scrr_str = '_'.join(['_'.join([str(z) for z in v_s]) for v_s in vdgscrrs])
+    sorted_vdg_scrr_str = '_'.join(sorted(['_'.join([str(z) for z in v_s]) for v_s in vdgscrrs]))
     if tempdir: 
-        cluster_subdirname = os.path.join(cluster_dirname, 'temp', str(num_vdms), vdmAA_str, f'cluster_{cluster_num}')
+        cluster_subdirname = os.path.join(cluster_dirname, 'temp', str(num_vdms), vdmAA_str, 
+                                          f'cluster_{cluster_num}')
     else:
-        cluster_subdirname = os.path.join(cluster_dirname, str(num_vdms), vdmAA_str, f'cluster_{cluster_num}')
+        cluster_subdirname = os.path.join(cluster_dirname, str(num_vdms), vdmAA_str,
+                                          f'cluster_{cluster_num}')
     os.makedirs(cluster_subdirname, exist_ok=True)
-    output_pdbpath = os.path.join(cluster_subdirname, f'clus{cluster_num}_{base_pdbname}_{vdg_scrr_str}.pdb')
+    output_pdbpath = os.path.join(cluster_subdirname, 
+                                  f'clus{cluster_num}_{base_pdbname}_{sorted_vdg_scrr_str}.pdb')
     return output_pdbpath, vdmAA_str
 
 def flatten_AA_permuted_bbatoms(all_AA_permuted_bbatoms_to_align, all_AA_permuted_pdbpaths, 

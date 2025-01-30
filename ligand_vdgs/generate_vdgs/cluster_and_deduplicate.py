@@ -14,6 +14,8 @@ import os
 import sys
 import argparse
 import time
+import shutil
+import re
 from itertools import combinations, permutations, product
 import numpy as np
 from scipy.cluster.hierarchy import linkage, fcluster
@@ -361,10 +363,11 @@ def get_nr_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs, vdglib_dir
                       all_AA_permuted_vdm_scrr, out_clus_dir='cg_vdmbb_clusters',
                       all_AA_permuted_bbatoms_to_align=all_AA_permuted_vdm_bbcoords,
                       symmetry_classes=symmetry_classes)
-   out_clus_temp_dir = os.path.join(vdglib_dir, 'cg_vdmbb_clusters', 'temp')
-   # shutil rmtree the out_clus_temp_dir
+   clean_up_out_clus_dir(vdglib_dir, out_clus_dir='cg_vdmbb_clusters')
+   
    nr_vdgs = []
    return nr_vdgs
+ 
    #for cgvdmbb_clusnum, indices_of_elements_in_cg_vdmbb_cluster in \
    #   cgvdmbb_cluster_assignments.items():
    #   # Within these clusters (because each of these clusters are nonredundant from each
@@ -805,6 +808,33 @@ def check_output_cluster_dirs(vdglib_dir):
                'Please remove the files or specify a different output directory.')
             return has_files
    return has_files      
+
+def clean_up_out_clus_dir(vdglib_dir, out_clus_dir):
+   # Remove temp dirs and if there are more than one centroids in a clus (a result of
+   # the deduplication/merging process of multiple permutations of identical AAs
+   # in the same binding sites), keep only one of them named 'centroid'.
+   out_clus_temp_dir = os.path.join(vdglib_dir, out_clus_dir, 'temp')
+   shutil.rmtree(out_clus_temp_dir) 
+   # Remove 'centroid' from pdb names if there are >1 in a clus dir
+   output_clus_path = os.path.join(vdglib_dir, out_clus_dir)
+   for num_vdms in os.listdir(output_clus_path):
+      num_vdms_dir = os.path.join(output_clus_path, num_vdms)
+      for reordered_aa in os.listdir(num_vdms_dir):
+         reordered_aa_dir = os.path.join(num_vdms_dir, reordered_aa)
+         for clusnum in os.listdir(reordered_aa_dir):
+            clusnum_dir = os.path.join(reordered_aa_dir, clusnum)
+            seen_centroid = False
+            for clus_pdb in os.listdir(clusnum_dir):
+               if 'centroid' not in clus_pdb: 
+                  continue
+               else:
+                  if seen_centroid == False:
+                     seen_centroid = True
+                  else: # remove 'centroid' from name
+                     new_name = re.sub('_centroid', '', clus_pdb)
+                     new_name_path = os.path.join(clusnum_dir, new_name)
+                     old_name_path = os.path.join(clusnum_dir, clus_pdb)
+                     os.rename(old_name_path, new_name_path)
 
 if __name__ == "__main__":
     main()
