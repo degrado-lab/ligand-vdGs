@@ -108,10 +108,9 @@ def main():
             'dir name to prevent accidental overwriting.')
       sys.exit(1)
 
-   if output_clusters:
-      has_clustered_files = check_output_cluster_dirs(vdglib_dir)
-      if has_clustered_files:
-         sys.exit(1)
+   has_clustered_files = check_output_cluster_dirs(vdglib_dir)
+   if has_clustered_files:
+      sys.exit(1)
 
    with open(logfile, 'a') as file:
         file.write(f"{'='*20} Starting deduplicate_reun_vdgs.py run {'='*20} \n")
@@ -155,25 +154,26 @@ def main():
          else:
             nr_vdgs = get_nr_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, _reordered_AAs, 
                                                   vdglib_dir, cg_indices_to_align,
-                                                  symmetry_classes, output_clusters)
+                                                  symmetry_classes)
             for n_v in nr_vdgs:
                all_nr_vdgs.append(n_v)
    
-   # There are many duplicates in `nr_vdgs`, because different AA permutations of vdms in the same 
-   # binding site will end up in different clusters, therefore appearing to be unique. 
-   # The last step is to account for these duplicates by gathering all vdg subset residues and 
-   # ordering them by scrr to determine which vdgs are identical.
-   
-   namingdict = {}
-   for nonredun_vdg in all_nr_vdgs:
-      nonredun_vdg_pdb = nonredun_vdg[4]
-      pdbcode = nonredun_vdg_pdb.rstrip('/').removesuffix('.pdb').split('/')[-1]
-      if pdbcode not in namingdict.keys():
-         namingdict[pdbcode] = []
-      scrr = nonredun_vdg[5]
-      sorted_scrr = sorted(scrr)
-      if sorted_scrr not in namingdict[pdbcode]:
-         namingdict[pdbcode].append(sorted_scrr)
+   return
+#   # There are many duplicates in `nr_vdgs`, because different AA permutations of vdms in the same 
+#   # binding site will end up in different clusters, therefore appearing to be unique. 
+#   # The last step is to account for these duplicates by gathering all vdg subset residues and 
+#   # ordering them by scrr to determine which vdgs are identical.
+#   
+#   namingdict = {}
+#   for nonredun_vdg in all_nr_vdgs:
+#      nonredun_vdg_pdb = nonredun_vdg[4]
+#      pdbcode = nonredun_vdg_pdb.rstrip('/').removesuffix('.pdb').split('/')[-1]
+#      if pdbcode not in namingdict.keys():
+#         namingdict[pdbcode] = []
+#      scrr = nonredun_vdg[5]
+#      sorted_scrr = sorted(scrr)
+#      if sorted_scrr not in namingdict[pdbcode]:
+#         namingdict[pdbcode].append(sorted_scrr)
 
    # Print out each vdg (separated by the # of vdms in the vdg)
    for pdbcode, list_scrrs in namingdict.items():
@@ -325,7 +325,7 @@ def combine_cg_and_vdmbb_coords(all_AA_permuted_cg_coords, all_AA_permuted_vdm_b
    return all_cg_and_vdmbb_coords
 
 def get_nr_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs, vdglib_dir, 
-                                cg_indices_to_align, symmetry_classes, output_clusters):
+                                cg_indices_to_align, symmetry_classes):
    # vdG subsets that have identical vdm AA compositions may be redudant.
    # First, get all permutations for equivalent AAs. For example, if the vdms are 
    # [Ala1, Ala2, Glu], then we need to sample [Ala1, Ala2, Glu] and [Ala2, Ala1, Glu].
@@ -352,19 +352,19 @@ def get_nr_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs, vdglib_dir
    num_cg_atoms = len(first_vdg_cg_coords)
    num_coords_to_align = num_cg_atoms + (num_vdms * 3)
    rmsd_cutoff = normalize_rmsd(num_coords_to_align)
-   print(f'rmsd for {num_coords_to_align} atoms to align: {rmsd_cutoff}')
+   #print(f'\nrmsd for {num_coords_to_align} atoms to align: {rmsd_cutoff}')
    if cg_indices_to_align is None:
       cg_indices_to_align = list(range(num_cg_atoms))
 
-   cluster_structures(vdglib_dir, rmsd_cutoff, cg_indices_to_align, all_AA_permuted_pdbpaths, 
+   cgvdmbb_cluster_assignments = cluster_structures(vdglib_dir, rmsd_cutoff, 
+                      cg_indices_to_align, all_AA_permuted_pdbpaths, 
                       all_AA_permuted_vdm_scrr, out_clus_dir='cg_vdmbb_clusters',
                       all_AA_permuted_bbatoms_to_align=all_AA_permuted_vdm_bbcoords,
                       symmetry_classes=symmetry_classes)
-
-   #cgvdmbb_cluster_assignments = get_hierarchical_clusters(all_cg_and_vdmbb_coords, 
-   #   None_in_coords=True) # `cluster_assignments` dict not ordered by cluster size
-
-   #nr_vdgs = []
+   out_clus_temp_dir = os.path.join(vdglib_dir, 'cg_vdmbb_clusters', 'temp')
+   # shutil rmtree the out_clus_temp_dir
+   nr_vdgs = []
+   return nr_vdgs
    #for cgvdmbb_clusnum, indices_of_elements_in_cg_vdmbb_cluster in \
    #   cgvdmbb_cluster_assignments.items():
    #   # Within these clusters (because each of these clusters are nonredundant from each
@@ -468,7 +468,7 @@ def get_nr_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs, vdglib_dir
    #               flankingseq_clus_flankingseqs[0], flankingseq_clus_flankingCAs[0], 
    #               flankingseq_clus_pdbpaths[0], flankingseq_clus_vdm_scrr[0]]
    #            nr_vdgs.append(vdg_descript)
-   #           
+              
    return nr_vdgs 
 
 def calc_seq_similarity(list1, list2):
