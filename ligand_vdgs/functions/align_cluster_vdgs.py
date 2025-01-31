@@ -187,7 +187,7 @@ def kabsch(X, Y, w=None):
     msd = np.sum(XRmY ** 2, axis=(1, 2))
     return R, t, msd
 
-def cluster_structures(vdglib_dir, rmsd_cutoff, idxs, all_AA_permuted_pdbpaths, 
+def cluster_vdg_structures(vdglib_dir, rmsd_cutoff, idxs, all_AA_permuted_pdbpaths, 
                        all_AA_permuted_vdm_scrrs, out_clus_dir, 
                        all_AA_permuted_bbatoms_to_align, symmetry_classes=None):
     """Greedily cluster the structures based on RMSD.
