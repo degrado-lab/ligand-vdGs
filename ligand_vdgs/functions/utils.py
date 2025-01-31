@@ -1,5 +1,13 @@
 import os
+import sys
 import shutil
+
+def handle_existing_files(out_dir):
+   os.makedirs(out_dir, exist_ok=True)
+   if len(os.listdir(out_dir)) > 0:
+      print(f'The output dir {out_dir} is not empty. Remove files or define a new '
+            'output dir name to prevent accidental overwriting.')
+      sys.exit(1)
 
 def set_up_outdir(outdir, overwrite):
     '''Create outdir if it does not exist, and require the overwrite flag if it does,

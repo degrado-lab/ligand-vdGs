@@ -1,570 +1,594 @@
-# NOTE: this script was originally cluster_nodes.py in the `production` branch
-# of vdG-miner. Unable to cleanly import it from ligand-vdGs because it's
-# from the vdG-miner submodule, so it's now copied over to 
-# ligand-vdGs/ligand_vdgs/functions.
-
-import os
-import sys
-from itertools import permutations
+from itertools import permutations, combinations, product
 import numpy as np
+from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.spatial.distance import squareform
 import prody as pr
-from scipy.sparse import csr_matrix
-import shutil
+import os
 
-def is_contained(u, v):
-    """Determine whether there exists a mask such that np.all(u == v[mask])
+def get_vdg_AA_permutations(reordered_AAs, _vdgs):
+   permuted_indices = permute_AA_duplicates(reordered_AAs)
+   all_AA_cg_perm_cg_coords = []
+   all_AA_cg_perm_vdm_bbcoords = []
+   all_AA_cg_perm_flankingseqs = []
+   all_AA_cg_perm_flankingCAs = []
+   all_AA_cg_perm_pdbpaths = []
+   all_AA_cg_perm_vdm_scrr = []
+
+   # Iterate over all AA permutations of each vdg
+   for _vdg in _vdgs:
+      # CG coords and pdbpaths remain unchanged, but vdmbbs, flankingseqs, 
+      # flankingCAs, and scrrs need to be permuted.
+      for permutation in permuted_indices:
+         all_AA_cg_perm_cg_coords.append(_vdg[0])
+         all_AA_cg_perm_pdbpaths.append(_vdg[4])
+         nonpermuted_vdmbb = _vdg[1]
+         nonpermuted_flankingseqs = _vdg[2]
+         nonpermuted_flankingCAs = _vdg[3]
+         nonpermuted_vdm_scrr = _vdg[5]
+         vdmbb_permutation = [nonpermuted_vdmbb[ix] for ix in permutation]
+         flankingseqs_permutation = [nonpermuted_flankingseqs[ix] for ix in 
+                                     permutation]
+         flankingCAs_permutation = [nonpermuted_flankingCAs[ix] for ix in permutation]
+         vdm_scrrs_permutation = [nonpermuted_vdm_scrr[ix] for ix in permutation]
+         all_AA_cg_perm_vdm_bbcoords.append(vdmbb_permutation)
+         all_AA_cg_perm_flankingseqs.append(flankingseqs_permutation)
+         all_AA_cg_perm_flankingCAs.append(flankingCAs_permutation)
+         all_AA_cg_perm_vdm_scrr.append(vdm_scrrs_permutation)
+
+   return all_AA_cg_perm_cg_coords, all_AA_cg_perm_vdm_bbcoords, \
+      all_AA_cg_perm_flankingseqs, all_AA_cg_perm_flankingCAs, \
+         all_AA_cg_perm_pdbpaths, all_AA_cg_perm_vdm_scrr
+
+def permute_AA_duplicates(seq):
+    # Dictionary to store indices for each element in the sequence
+    seen = {}
+    for i, item in enumerate(seq):
+        if item not in seen:
+            seen[item] = []
+        seen[item].append(i)
+
+    permute_groups = [] # list of all index groups that have duplicates
+    for indices in seen.values():
+        if len(indices) > 1:  # only interested in elements with duplicates
+            permute_groups.append(indices)
+
+    if not permute_groups: # no duplicates, so return the original index list
+        return [list(range(len(seq)))]
     
-    Parameters
-    ----------
-    u : np.array [M]
-        The array for which containment in v is to be checked.
-    v : np.array [N]
-        The array for which containment of u is to be checked. Requires N > M.
+    # generate all possible permutations of indices within each group of duplicates
+    permuted_idx_lists = []
+    for perm_combination in product(*[permutations(group) for group in 
+                                      permute_groups]):
+        # start with the list of original indices
+        permuted_idx = list(range(len(seq)))
 
-    Returns
-    -------
-    contained : bool
-        The boolean value of np.all(u == v[mask]); in other words, True is 
-        returned if u is contained in v, and False otherwise.
-    """
-    unique_u, counts_u = np.unique(u, return_counts=True)
-    unique_v, counts_v = np.unique(v, return_counts=True)
+        # flatten the product of permutations and assign them to the corresponding 
+        # positions
+        for group_idx, perm in zip(permute_groups, perm_combination):
+            for orig_idx, new_idx in zip(group_idx, perm):
+                permuted_idx[orig_idx] = new_idx
 
-    # match unique elements in u to those in v
-    match_indices = np.isin(unique_u, unique_v)
-
-    # return False if any element of u is not in v
-    if not np.all(match_indices):
-        return False
+        permuted_idx_lists.append(permuted_idx)
     
-    # get indices where unique_u elements appear in unique_v
-    indices_in_v = np.searchsorted(unique_u, unique_v)
+    return permuted_idx_lists
 
-    # check if counts in v are greater than or equal to those in u
-    return np.all(counts_u <= counts_v[indices_in_v])
+def combine_cg_and_vdmbb_coords(all_AA_cg_perm_cg_coords, 
+                                all_AA_cg_perm_vdm_bbcoords):
+   all_cg_and_vdmbb_coords = []
+   for _cg, _vdmbb_per_res in zip(all_AA_cg_perm_cg_coords, 
+                                  all_AA_cg_perm_vdm_bbcoords):
+      flattened_cg_coords = np.array(flatten_cg_coords(_cg))
+      flattened_vdmbbs =    np.array(flatten_vdg_bbs(_vdmbb_per_res))
+      cg_and_vdmbb = np.vstack([flattened_cg_coords, flattened_vdmbbs])
+      all_cg_and_vdmbb_coords.append(cg_and_vdmbb)
+   return all_cg_and_vdmbb_coords
 
-def permute_with_symmetry(symmetry_classes):
-    """Get all possible permutation arrays that preserve symmetry classes.
+def flatten_cg_coords(_cg):
+   coords = []
+   for atom in _cg:
+      coords.append(atom)
+   return coords
+
+def flatten_vdg_bbs(_vdmbb):
+   # Flatten backbones to a single list where each element is a numpy array of the 
+   # x, y, z coords of each vdm backbone atom
+   bbs = []
+   for res in _vdmbb:
+      for atom in res:
+         bbs.append(atom)
+   return bbs
+
+def get_hierarchical_clusters(data, rmsd_cut, None_in_coords=False, 
+                              seq_sim_thresh=None):
+   # Returns dict where key = cluster number and value = indices of the list elements 
+   # that belong in that cluster. This dict is not ordered by size.
+   # `data` is either a list of coords, or a list of sequences.
+   # None_in_coords is a param that distinguishes whether `data` is coordinates or 
+   # sequences. This distinction is important because rmsd cannot be calculated on 
+   # non-coordinates, so if any residues are "None" for either of the 2 vdgs being 
+   # compared, that whole residue is discounted.
+
+   dist_matrix = create_dist_matrix(data, None_in_coords) # dist is either rmsd or 
+                                                         # % seq sim
+   condensed_dist_matrix = squareform(dist_matrix)
+   Z = linkage(condensed_dist_matrix, method='single')
+   if seq_sim_thresh:
+      seq_dissimilarity_thresh = 1 - seq_sim_thresh
+      clusters = fcluster(Z, seq_dissimilarity_thresh, criterion='distance')
+   else:
+      clusters = fcluster(Z, rmsd_cut, criterion='distance')
+   cluster_assignments = {} # key = clusnum, value = indices of `coords` 
+                            # belonging to that cluster
+   for all_vdgs_index, clusnum in enumerate(clusters):
+      if clusnum not in cluster_assignments.keys():
+         cluster_assignments[clusnum] = []
+      cluster_assignments[clusnum].append(all_vdgs_index)
+   
+   return cluster_assignments  
+
+def create_dist_matrix(data, None_in_coords):
+   n = len(data)
+   distance_matrix = np.zeros((n, n))
+   for i in range(n):
+      for j in range(i + 1, n):
+         # Align and then calc rmsd or seq dissimilarity. If "None" is in the list 
+         # of coords (which is what would happen if rmsd is being calculated on 
+         # stretches of backbone and terminal residues are missing), then select 
+         # only the overlapping residues where a coordinate could be extracted for 
+         # both elements being measured.
+         data_i = data[i]
+         data_j = data[j]
+         if None_in_coords: # calc rmsd 
+            data_i, data_j = get_overlapping_res_coords(data_i, data_j)
+            moved_coords_i, transf = pr.superpose(data_i, data_j)
+            rmsd = pr.calcRMSD(moved_coords_i, data_j)
+            value = rmsd
+         else: # calc seq similarity
+            seq_sim = calc_seq_similarity(data_i, data_j)
+            value = (100 - seq_sim) / 100 # clustering is distance-based, so the 
+                                          # metric is DISsimilarity
+         distance_matrix[i][j] = value 
+         distance_matrix[j][i] = value   # Symmetric matrix
+   return distance_matrix
+
+def get_overlapping_res_coords(list1, list2):
+    list1_overlap = []
+    list2_overlap = []
     
-    Parameters
-    ----------
-    symmetry_classes : list
-        List of integers representing the symmetry classes of the elements.
-        
-    Returns
-    -------
-    valid_permutations : list
-        List of valid permutations that preserve symmetry classes.
-    """
-    elements = list(range(len(symmetry_classes)))
-    # Get all possible permutations
-    all_permutations = permutations(elements)
-    # Filter permutations based on symmetry classes
-    valid_permutations = []
-    for perm in all_permutations:
-        is_valid = True
-        for i, p in enumerate(perm):
-            # Compare the symmetry classes of elements in the original list
-            # and the permuted list at the same positions
-            if symmetry_classes[elements.index(p)] != symmetry_classes[i]:
-                is_valid = False
-                break
-        if is_valid:
-            valid_permutations.append(np.array(perm))
-    return valid_permutations
+    # Loop over both lists and check if both elements at the same index are not None
+    for i in range(len(list1)):
+        if list1[i] is not None and list2[i] is not None:
+            list1_overlap.append(list1[i])
+            list2_overlap.append(list2[i])
+    
+    return np.array(list1_overlap), np.array(list2_overlap)
 
-def greedy(adj_mat, min_cluster_size=1):
-    """Greedy clustering algorithm based on an adjacency matrix.
-        
-        Takes an adjacency matrix as input.
-        All values of adj_mat are 1 or 0:  1 if <= to rmsd_cutoff, 
-        0 if > rmsd_cutoff.
+def calc_seq_similarity(list1, list2):
+    # Count how many residues match
+    list1 = [i for i in list1 if i != 'vdm']
+    list2 = [i for i in list2 if i != 'vdm']
+    assert len(list1) == len(list2)
+    # Exclude residues if at least one of them is an "X"
+    indices_to_exclude = []
+    for ind in range(len(list1)):
+         if list1[ind] == 'X' or list2[ind] == 'X':
+            indices_to_exclude.append(ind)
+    list1 = [item for idx, item in enumerate(list1) if idx not in indices_to_exclude]
+    list2 = [item for idx, item in enumerate(list2) if idx not in indices_to_exclude]
+    matches = sum(1 for a, b in zip(list1, list2) if a == b)
 
-        The diagonal of adj_mat should be 0.
+    # Calculate the percentage of matches
+    if len(list1) == 0:
+        match_percentage = 0
+    else:
+        match_percentage = (matches / len(list1)) * 100
+    return match_percentage
 
-    Parameters
-    ----------
-    adj_mat : scipy.sparse.csr_matrix
-        Adjacency matrix of the graph.
-    min_cluster_size : int, optional
-        Minimum size of a cluster, by default 2.
+def get_vdm_res_features(prody_obj, pdbpath, num_flanking):
+   # Identify the vdM residues (occ == 2). To be safe, select > 1.5 and < 2.5.
+   vdm_residues = prody_obj.select('(occupancy) > 1.5 and (occupancy < 2.5)')
+   vdm_resinds = set(vdm_residues.getResindices())
+   # Record features of the vdm residues (bb coords, flanking residues, pdb paths, 
+   # etc.)
+   vdms_dict = {}
+   for vdm_resind in vdm_resinds:
+      vdm_obj = vdm_residues.select(f'resindex {vdm_resind}')
+      # BB coords
+      bb_coords = get_bb_coords(vdm_obj)
 
-    Returns
-    -------
-    all_mems : list
-        List of arrays of cluster members.
-    cents : list
-        List of cluster centers.
-    """
-    if not isinstance(adj_mat, csr_matrix):
-        try:
-            adj_mat = csr_matrix(adj_mat)
-        except:
-            print('adj_mat distance matrix must be scipy csr_matrix '
-                  '(or able to convert to one)')
-            return
+      # Sequence of (contiguous) flanking residues
+      flanking_seq_dict = {} # key = relative flank num (-1, +1, etc.), 
+                             # value = list(CA coords, AA identity)
+      # Walk up and down the flanking residues and check that they are actually
+      # neighboring the vdM, and not jumped through a chain break. If there's a
+      # chain break, report the AA as "X".
+      # > First, store the CA coords.
+      for flank_num in range(1, num_flanking + 1):
+         negative_flank_num = -1 * flank_num
+         positive_flank_num = flank_num
+         # Adding the flank_num (neg. or pos.) gives you the residue index
+         for f in [negative_flank_num, positive_flank_num]:
+            # Get the AA identity and CA coords of the "current" resindex
+            current_resindex = vdm_resind + f
+            AA, CA_coords = get_AA_and_CA_coords(prody_obj, current_resindex)
+            flanking_seq_dict[f] = [AA, CA_coords]
+      # Get the CA coords of the central vdM as well
+      flanking_seq_dict[0] = ['vdm', bb_coords[1]] # label as 'vdm' for easy exclusion
+                                                   # when calculating seq. similarity
+      # > Then, go through the dict for chain breaks. Start in the fwd direction, and
+      #   then progress backward. 
+      fwd_rel_inds = range(1, num_flanking + 1)
+      back_rel_inds = [-1 * i for i in fwd_rel_inds]
+      central_vdm_CA = flanking_seq_dict[0][1]
+      for list_indices in [fwd_rel_inds, back_rel_inds]:
+         for ind in list_indices:
+            # Get distance between current flanking res (relative to central vdm)
+            # and res prior to it.
+            if ind == 1 or ind == -1:
+               prev_CA = central_vdm_CA
+            curr_CA = flanking_seq_dict[ind][1]
+            if curr_CA is None:
+               flanking_seq_dict = found_chain_break(flanking_seq_dict, ind)
+               break 
+            dist = pr.calcDistance(np.array(prev_CA), np.array(curr_CA))
+            # If the dist is > 4.5A, then it's a chain break.
+            if dist > 4.5:
+               flanking_seq_dict = found_chain_break(flanking_seq_dict, ind)
+               break 
+            # Otherwise, continue walking.
+            prev_CA = curr_CA
+      # Get this vdm resind's PDB identifier (seg, chain, resnum)
+      vdm_seg_chain_resnum_resname = get_res_iden(vdm_obj)
+      # Store all into dict
+      vdm_descript = [vdm_seg_chain_resnum_resname, bb_coords, flanking_seq_dict]
+      vdm_AA = vdm_seg_chain_resnum_resname[-1]
+      assert vdm_resind not in list(vdms_dict.keys())
+      vdms_dict[vdm_resind] = [vdm_AA, vdm_descript]
+   return vdms_dict
 
-    assert adj_mat.shape[0] == adj_mat.shape[1], \
-        'Distance matrix is not square.'
+def get_res_iden(vdm_obj):
+   seg =     list(set(vdm_obj.getSegnames()))
+   chain =   list(set(vdm_obj.getChids()))
+   resnum =  list(set(vdm_obj.getResnums()))
+   resname = list(set(vdm_obj.getResnames()))
+   assert len(seg) == 1
+   assert len(chain) == 1
+   assert len(resnum) == 1
+   assert len(resname) == 1
+   return seg[0], chain[0], resnum[0], resname[0]
 
-    all_mems = []
-    cents = []
-    indices = np.arange(adj_mat.shape[0])
+def found_chain_break(flanking_seq_dict, chain_break_ind):
+   # If a chain break is found, overwrite all the subsequent (or preceding) flanking
+   # residues beyond the chain break as AA "X".
+   flank_indices = list(flanking_seq_dict.keys())
+   if chain_break_ind > 0 :
+      inds_to_overwrite = [n for n in flank_indices if n >= chain_break_ind]
+   elif chain_break_ind < 0:
+      inds_to_overwrite = [n for n in flank_indices if n <= chain_break_ind]
+   
+   for overwrite_ind in inds_to_overwrite:
+      flanking_seq_dict[overwrite_ind] = ['X', None]
+   return flanking_seq_dict
 
-    try:
-        while adj_mat.shape[0] > 0:
+def get_AA_and_CA_coords(prody_obj, current_resindex):
+   if current_resindex < 0: 
+      sel_str = f'resindex `{current_resindex}`'
+   else:
+      sel_str = f'resindex {current_resindex}'
 
-            cent = adj_mat.sum(axis=1).argmax()
-            row = adj_mat.getrow(cent)
-            tf = ~row.toarray().astype(bool)[0]
-            mems = indices[~tf]
+   curr_resindex_obj = prody_obj.select(sel_str)
+   if curr_resindex_obj is None:
+      AA = 'X'
+      CA_coords = None
+   elif curr_resindex_obj.protein is None: # not a residue
+      AA = 'X'
+      CA_coords = None
+   else:
+      curr_res_AA = list(set(curr_resindex_obj.getResnames()))
+      assert len(curr_res_AA) == 1
+      AA = curr_res_AA[0]
+      CA_obj = curr_resindex_obj.select(sel_str + ' and name CA')
+      assert len(CA_obj) == 1
+      CA_coords = CA_obj.getCoords()[0]
+   return AA, CA_coords
 
-            if len(mems) < min_cluster_size:
-                [cents.append(i) for i in indices]
-                [all_mems.append(np.array([i])) for i in indices]
-                break
+def get_cg_coords(prody_obj):
+   # The CG atoms have their occupancies set to >= 3.0, with unique values (e.g., 
+   # 3.0, 3.1, 3.2, etc.) to allow a 1:1 correspondence of equivalent atoms between 
+   # different ligands.
+   cg = prody_obj.select('occupancy >= 3.0')
+   num_atoms = len(cg)
+   cg_coords = []
+   for ind in range(num_atoms):
+      occ = f'3.{ind}'
+      atom = cg.select(f'occupancy == {occ}')
+      assert len(atom) == 1
+      atom_coords = atom.getCoords()[0]
+      cg_coords.append(atom_coords)
 
-            cents.append(indices[cent])
-            all_mems.append(mems)
+   return np.array(cg_coords)
 
-            indices = indices[tf]
-            adj_mat = adj_mat[tf][:, tf]
-    except KeyboardInterrupt:
-        pass
+def get_bb_coords(obj):
+   bb_coords = []
+   for atom in ['N', 'CA', 'C']:
+      atom_obj = obj.select(f'name {atom}')
+      assert len(atom_obj) == 1
+      coord = atom_obj.getCoords()[0]
+      bb_coords.append(coord)
+   return bb_coords
 
-    return all_mems, cents
+def get_vdg_subsets(input_list):
+    # Group by quadruples, triples, pairs, and singles.
+    # Initialize an empty list to store all subsets
+    all_subsets = []
+    # Loop through subset sizes 1 to 4, generate combos, then add to list
+    for r in range(1, 5):
+        subsets = combinations(input_list, r)
+        all_subsets.extend(subsets)
+    return all_subsets
 
-def kabsch(X, Y, w=None):
-    """Rotate and translate X into Y to minimize the MSD between the two.
+
+def add_vdgs_to_dict(vdm_combos, vdg_subset, re_ordered_aas, re_ordered_bbcoords, 
+                     re_ordered_flankingseqs, re_ordered_CAs, re_ordered_scrr, 
+                     cg_coords, pdbpath):
+   # Construct the `vdm_combos` dict by categorizing subset of vdgs based on the 
+   # number of vdms in each subset, as well as the AA compositions of the vdms. 
+   # Store each vdg subset as a list containing [CG coords, backbone N-CA-C coords 
+   # of the vdms, sequences flanking the vdms, CA coordinates flanking the vdms, 
+   # the PDB path, PDB seg/chain/resnum of the vdms]
+   num_vdms_in_subset = len(vdg_subset)
+   if num_vdms_in_subset not in vdm_combos.keys():
+      vdm_combos[num_vdms_in_subset] = {}
+   re_ord_aas_tup = tuple(re_ordered_aas)
+   if re_ord_aas_tup not in vdm_combos[num_vdms_in_subset].keys():
+      vdm_combos[num_vdms_in_subset][re_ord_aas_tup] = []
+   # Add the vdg to `vdm_combos`
+   vdm_combos[num_vdms_in_subset][re_ord_aas_tup].append([cg_coords, 
+      re_ordered_bbcoords, re_ordered_flankingseqs, re_ordered_CAs, pdbpath, 
+      re_ordered_scrr])
+
+   return vdm_combos
+
+def reorder_vdg_subset(vdg_subset, vdms_dict):
+   '''Reorders vdms alphabetically.'''
+   # First, record
+   aas_of_vdms_in_order = []
+   bb_coords_of_vdms_in_order = []
+   flankingseqs_of_vdms_in_order = []
+   flanking_CA_coords_of_vdms_in_order = []
+   seg_ch_res_of_vdms_in_order = []
+   for _vdmresind in vdg_subset:
+      vdmAA, vdm_features = vdms_dict[_vdmresind]
+      aas_of_vdms_in_order.append(vdmAA)
+      vdm_seg_chain_resnum_resname, bb_coords, flanking_seq_dict = vdm_features
+      seg_ch_res_of_vdms_in_order.append(vdm_seg_chain_resnum_resname)
+      bb_coords_of_vdms_in_order.append(bb_coords)
+      flankingseqs = []
+      flankingCAs = []
+      sorted_flank_indices = sorted(list(flanking_seq_dict.keys()))
+      # Decompress the flanking AA and CA info
+      for flank_ind in sorted_flank_indices:
+         flank_resname, flank_ca = flanking_seq_dict[flank_ind]
+         flankingseqs.append(flank_resname)
+         flankingCAs.append(flank_ca)
+      flankingseqs_of_vdms_in_order.append(flankingseqs)
+      flanking_CA_coords_of_vdms_in_order.append(flankingCAs)
+   # Then, re-order based on alphabetical order
+   super_list = [aas_of_vdms_in_order, bb_coords_of_vdms_in_order, 
+      flankingseqs_of_vdms_in_order, flanking_CA_coords_of_vdms_in_order, 
+      seg_ch_res_of_vdms_in_order]
+   return sort_vdGs_by_AA(super_list)
+
+def sort_vdGs_by_AA(super_list):
+    # Check if all sublists have equal length
+    assert all(len(sublist) == len(super_list[0]) for sublist in super_list)
+    # Combine the sublists into a list of tuples, where each tuple corresponds to the 
+    # elements at the same index
+    combined = list(zip(*super_list))
+    # Sort the combined list based on the first element (from the first sublist)
+    sorted_combined = sorted(combined, key=lambda x: x[0])
+    # Unzip the sorted combined list back into sublists
+    sorted_sublists = list(zip(*sorted_combined))
+    return [list(sublist) for sublist in sorted_sublists]
+
+
+def permute_on_indices(symmetry_classes, coords_to_permute):
+    # Given a list of indices to permute on (symmetry_classes), permute a list or 
+    # array of coordinates.
+
+   assert len(symmetry_classes) == len(coords_to_permute)
+
+   # Group coordinates by their indices
+   grouped_coords = {}
+   for idx, coord in zip(symmetry_classes, coords_to_permute):
+       if idx not in grouped_coords:
+           grouped_coords[idx] = []
+       grouped_coords[idx].append(coord)
+
+   # Generate all permutations of coordinates within each group
+   grouped_permutations = {}
+   for key in grouped_coords:
+       grouped_permutations[key] = list(permutations(grouped_coords[key]))
+
+   # Generate all combinations of permutations (one for each group)
+   result = []
+   for perm_combination in product(*grouped_permutations.values()):
+       # Rebuild the permuted list from the permuted groups
+       permuted_list = []
+       # For each original index, we need to pick the corresponding permuted item
+       perm_idx = {key: 0 for key in grouped_permutations}  # Keep track of which 
+                                            # element in each permutation we're at
+       for idx in symmetry_classes:
+           # Find the group corresponding to the current index (grouped_permutations)
+           group_perm = perm_combination[list(
+              grouped_permutations.keys()).index(idx)]
+           permuted_list.append(group_perm[perm_idx[idx]])
+           perm_idx[idx] += 1  # Move to the next item in this group's permutation
        
-       Implements the SVD method by Kabsch et al. (Acta Crystallogr. 1976, 
-       A32, 922).
+       result.append(np.array(permuted_list))
 
-    Parameters
-    ----------
-    X : np.array [M x N x 3]
-        Array of M sets of mobile coordinates (N x 3) to be transformed by a 
-        proper rotation to minimize mean squared displacement (MSD) from Y.
-    Y : np.array [M x N x 3]
-        Array of M sets of stationary coordinates relative to which to 
-        transform X.
-    W : np.array [N], optional
-        Vector of weights for fitting.
+   return result
 
-    Returns
-    -------
-    R : np.array [M x 3 x 3]
-        Proper rotation matrices required to transform each set of coordinates 
-        in X such that its MSD with the corresponding coordinates in Y is 
-        minimized.
-    t : np.array [M x 3]
-        Translation matrix required to transform X such that its MSD with Y 
-        is minimized.
-    msd : np.array [M]
-        Mean squared displacement after alignment for each pair of coordinates.
-    """
-    N = X.shape[1]
-    if w is None:
-        w = np.ones((1, N, 1)) / N
-    else:
-        w = w.reshape((1, -1, 1)) / w.sum()
-    # compute R using the Kabsch algorithm
-    Xbar, Ybar = np.sum(X * w, axis=1, keepdims=True), \
-                 np.sum(Y * w, axis=1, keepdims=True)
-    # subtract Xbar and Ybar, then weight the resulting matrices
-    Xc, Yc = np.sqrt(w) * (X - Xbar), np.sqrt(w) * (Y - Ybar)
-    H = np.matmul(np.transpose(Xc, (0, 2, 1)), Yc)
-    U, S, Vt = np.linalg.svd(H)
-    d = np.sign(np.linalg.det(np.matmul(U, Vt)))
-    D = np.zeros((X.shape[0], 3, 3))
-    D[:, 0, 0] = 1.
-    D[:, 1, 1] = 1.
-    D[:, 2, 2] = d
-    R = np.matmul(U, np.matmul(D, Vt))
-    t = (Ybar - np.matmul(Xbar, R)).reshape((-1, 3))
-    # compute MSD from aligned coordinates XR
-    XRmY = np.matmul(Xc, R) - Yc
-    msd = np.sum(XRmY ** 2, axis=(1, 2))
-    return R, t, msd
+def get_vdg_AA_and_cg_perms(all_AA_perm_cg_coords,    all_AA_perm_vdm_bbcoords, 
+                            all_AA_perm_flankingseqs, all_AA_perm_flankingCAs, 
+                            all_AA_perm_pdbpaths,     all_AA_perm_vdm_scrr, 
+                            symmetry_classes):
+   if symmetry_classes is None:
+      return [all_AA_perm_cg_coords, all_AA_perm_vdm_bbcoords,          
+              all_AA_perm_flankingseqs, all_AA_perm_flankingCAs, 
+              all_AA_perm_pdbpaths, all_AA_perm_vdm_scrr]
 
-def cluster_structures(vdglib_dir, rmsd_cutoff, idxs, all_AA_permuted_pdbpaths, 
-                       all_AA_permuted_vdm_scrrs, out_clus_dir, 
-                       all_AA_permuted_bbatoms_to_align, symmetry_classes=None):
-    """Greedily cluster the structures based on RMSD.
+   # Recompile the vdgs with the permuted symmetric cg indices
+   all_AA_cg_perm_cg_coords = []
+   all_AA_cg_perm_vdm_bbcoords = []
+   all_AA_cg_perm_flankingseqs = []
+   all_AA_cg_perm_flankingCAs = []
+   all_AA_cg_perm_pdbpaths = []
+   all_AA_cg_perm_vdm_scrr_cg_perm = []
+   
+   for cgcoords, vdmcoords, seq, CAs, pdbpath, scrr in zip(all_AA_perm_cg_coords,
+            all_AA_perm_vdm_bbcoords, all_AA_perm_flankingseqs, 
+            all_AA_perm_flankingCAs, all_AA_perm_pdbpaths, all_AA_perm_vdm_scrr):
+      
+      perms = permute_on_indices(symmetry_classes, cgcoords)
+      print('Number of permutations:', len(perms))
 
-    Parameters
-    ----------
-    idxs : list, optional
-        Indices of CG atoms (ordered by smarts pattern) on which to cluster. 
-    symmetry_classes : list, optional
-        Integers representing the symmetry classes of the CG atoms on which clustering is to 
-        be performed. If provided, should have the same length as idxs. If not provided, the 
-        atoms are assumed to be symmetrically inequivalent.
-    all_AA_permuted_bbatoms_to_align : list
-        Either: 
-        - BB atoms of vdms if aligning/clustering on just cg+vdm only. 
-            (Step 1 in header of cluster_and_deduplicate.py)
-        - BB atoms of vdms+flanking residues if aligning/clustering on cg+vdm+flanking residues.
-            (Step 2 in header of cluster_and_deduplicate.py)
-    Returns
-    -------
-    cluster_assignments : dict
-        key = cluster num; value = indices of the list elements belong to that clus.
-    """
+      for perm_ind, perm in enumerate(perms):
+         all_AA_cg_perm_cg_coords.append(perm)
+         all_AA_cg_perm_vdm_bbcoords.append(vdmcoords)
+         all_AA_cg_perm_flankingseqs.append(seq)
+         all_AA_cg_perm_flankingCAs.append(CAs)
+         all_AA_cg_perm_pdbpaths.append(pdbpath)
+         # add permutation index to the scrr label
+         vdm_scrr_perm = [scrr, f'cg_perm_{perm_ind+1}']
+         all_AA_cg_perm_vdm_scrr_cg_perm.append(vdm_scrr_perm)
+   
+   return [all_AA_cg_perm_cg_coords,    all_AA_cg_perm_vdm_bbcoords, 
+           all_AA_cg_perm_flankingseqs, all_AA_cg_perm_flankingCAs, 
+           all_AA_cg_perm_pdbpaths,     all_AA_cg_perm_vdm_scrr_cg_perm]
+   
+def elements_in_clusters(indices_of_elements_in_cluster, cg_coords, vdm_bbcoords, 
+                         flankingseqs, flankingCAs, pdbpaths, vdm_scrrs_cg_perms):
+   assert len(cg_coords) == len(pdbpaths)
+   clus_cg_coords = [cg_coords[index] for index in indices_of_elements_in_cluster]
+   clus_vdmbb_coords = [vdm_bbcoords[index] for index in 
+                        indices_of_elements_in_cluster]
+   clus_flankingseqs = [flankingseqs[index] for index in 
+                        indices_of_elements_in_cluster]
+   clus_flankingCAs = [flankingCAs[index] for index in indices_of_elements_in_cluster]
+   clus_pdbpaths = [pdbpaths[index] for index in indices_of_elements_in_cluster]
+   clus_vdm_scrr_cg_perms = [vdm_scrrs_cg_perms[index] for index in 
+                    indices_of_elements_in_cluster]
+   return clus_cg_coords, clus_vdmbb_coords, clus_flankingseqs, \
+      clus_flankingCAs, clus_pdbpaths, clus_vdm_scrr_cg_perms
 
-    # Process each pdb
-    all_pdbs, all_structs, coords, all_vdg_scrrs = [], [], [], []
-    if symmetry_classes is None:
-        symmetry_classes = list(range(len(idxs)))
-    assert len(symmetry_classes) == len(idxs), \
-        'Length of symmetry_classes must match length of idxs.'
-    perms = permute_with_symmetry(symmetry_classes)
-    print('len perms', len(perms))
-    first_vdm_scrr = all_AA_permuted_vdm_scrrs[0]
-    num_vdms = len(first_vdm_scrr)
-    res_idxs = list(range(num_vdms)) 
-    N = len(idxs) + \
-        len(res_idxs) * 3 # number of atoms in CG plus N, CA, C for each aa
+def write_out_clusters(clusdir, clus_assignments, all_coords, all_pdbpaths, 
+                       all_scrr_cg_perm, symmetry_classes,
+                       all_cg_and_vdmbb_coords):
+   ref = np.array([[0, 0, 0], [-1, 0, 1], [1, -1, 0]]) # it's just to align the 
+        # first 3 atoms of CG. then, all atoms of all subsequent CGs will be 
+        # aligned to that first CG.
+   first_pdb_out = False # update with pdb name of first pdb that's output for ref
+   first_pdb_cg_coords = False
+   first_pdb_cg_vdmbb_coords = False
+   for clusnum, clus_mem_indices in \
+                clus_assignments.items():
+      clusnum_dir = os.path.join(clusdir, f'clus_{clusnum}')
+      os.makedirs(clusnum_dir)
+      for ind in clus_mem_indices:
+         clusmem_cg_coords = all_coords[ind]
+         clusmem_pdbpath = all_pdbpaths[ind]
+         clusmem_scrr_cg_perm = all_scrr_cg_perm[ind]
+         clusmem_cg_vdmbb_coords = all_cg_and_vdmbb_coords[ind]
+         clusmem_pr_obj = pr.parsePDB(clusmem_pdbpath)
+         clusmem_pdb_outpath = get_clus_pdb_outpath(clusnum, clusnum_dir, 
+                                 clusmem_pdbpath, clusmem_scrr_cg_perm)
+         if first_pdb_out == False:
+            first_pdb_out = clusmem_pdb_outpath
+            mobile, target = clusmem_cg_coords[:3], ref
+            moved_cg_coords, moved_cg_vdmbb_coords = write_out_first_pdb(mobile, 
+                     target, clusmem_pr_obj, clusmem_pdb_outpath, 
+                     clusmem_cg_coords, clusmem_cg_vdmbb_coords)
+            first_pdb_cg_coords = moved_cg_coords
+            first_pdb_cg_vdmbb_coords = moved_cg_vdmbb_coords
+         else:
+            # now, align cg+vdmbb on the first pdb that was output
+            write_out_subsequent_clus_pdbs(clusmem_cg_vdmbb_coords, clusmem_pr_obj, 
+                           clusmem_pdb_outpath, first_pdb_cg_vdmbb_coords)
 
-    flat_all_AA_permuted_bb_atoms_to_clus = flatten_AA_permuted_bbatoms(
-        all_AA_permuted_bbatoms_to_align, all_AA_permuted_pdbpaths, all_AA_permuted_vdm_scrrs)
 
-    for _pdb, _vdgscrr, _flat_bb_atoms_to_clus in zip(all_AA_permuted_pdbpaths, 
-                        all_AA_permuted_vdm_scrrs, flat_all_AA_permuted_bb_atoms_to_clus):
-        coords, all_pdbs, all_structs, all_vdg_scrrs = get_struct_data(_pdb, idxs, perms,
-                _flat_bb_atoms_to_clus, coords, all_pdbs, all_structs, all_vdg_scrrs, _vdgscrr)
-    
-    print('CHECK OVER HERE. FOR LEU_LEU MAKE SURE ALL_PDBS, ALL_VDG_SCRRS MAKES SENSE FOR BOTH AA PERMUTATIONS.')
-    coords = np.array(coords).reshape((len(all_pdbs), len(perms), -1, 3))
-    assert len(all_pdbs) == len(all_structs) == len(coords) == len(all_vdg_scrrs)
-    coords = coords.transpose((1, 0, 2, 3))
-    M = coords.shape[1]
-    if M == 1:
-        return
-    #print('len coords', len(coords))
-    #print(np.array(coords).shape)
-    #print('len all pdbs', len(all_pdbs))
-    print('"N" number of atoms being aligned/clustered', N)
-    all_mems, cents, triu_indices, R, t, msd = align_and_cluster(M, idxs, res_idxs, 
-                                                                 N, coords, rmsd_cutoff) 
-    assert len(all_pdbs) == len(all_structs) == len(all_vdg_scrrs)
-    #print('num of samples in cluster', sum([len(i) for i in all_mems]))
-    cluster_dirname = os.path.join(vdglib_dir, out_clus_dir)
-    cluster_num = 1
-    num_supposed_to_be_output = 0
-    
-    # Process and output PDBs of the clusters. Note that they must be output to a 'temp' 
-    # dir because there may be degenerate binding sites that will be deduplicated later.
-    for cluster, cent in zip(all_mems, cents):
-        num_supposed_to_be_output, vdmAA_str = process_AA_redun_cluster(cent, cluster, all_pdbs, 
-                all_structs, all_vdg_scrrs, triu_indices, R, t, msd, first_vdm_scrr, 
-                cluster_dirname, cluster_num, num_supposed_to_be_output)
-        cluster_num += 1
 
-    # Use dict to record which indices (of all_AA_permuted_...) belong to which cluster. 
-    # Note that this dict is called 'temp' because it may contain redundant vdGs based on 
-    # different AA permutations within the same binding site.
-    temp_cluster_assignments = {} # key = clusnum, value = indices 
-    clus_num = 1
-    for cluster_result in all_mems:
-        temp_cluster_assignments[clus_num] = cluster_result
-        clus_num += 1
-    assert num_supposed_to_be_output == sum([len(v) for k, v in temp_cluster_assignments.items()])
-
-    # Now, merge clusters based on duplicate binding sites (diff permutations of AAs).
-    temp_cluster_assignments = remove_redundant_AAperm_clusters(temp_cluster_assignments, 
-                                cluster_dirname, num_vdms, vdmAA_str)
-    
-    # Redefine cluster_assignments, now that duplicates have been merged. basically, just
-    # renumber the cluster numbers
-    redefined_cluster_assignments = renumber_cluster_assignments(temp_cluster_assignments)
-
-    # Output pdbs based on the deduplicated redefined_cluster_assignments.
-    for redefined_clusnum, redefined_clusmems in redefined_cluster_assignments.items():
-        for elem in redefined_clusmems:
-            pdb_name = all_AA_permuted_pdbpaths[elem]
-            vdgscrrs  = all_vdg_scrrs[elem]
-            original_temp_clusnum = get_original_temp_clusnum(temp_cluster_assignments, 
-                                                              elem)
-            is_centroid = elem in cents
-            if is_centroid:
-                pdb_name = pdb_name[:-4] + '_centroid.pdb'
-
-            redun_temp_pdbpath, vdmAA_str = get_output_pdbpath(pdb_name, first_vdm_scrr, 
-                    vdgscrrs, cluster_dirname, original_temp_clusnum, tempdir=True)
+def write_out_subsequent_clus_pdbs(clusmem_cg_vdmbb_coords, clusmem_pr_obj, 
+                                   clusmem_pdb_outpath, first_pdb_cg_vdmbb_coords):
+   moved_cg_vdmbb_coords, cg_vdmbb_transf = pr.superpose(clusmem_cg_vdmbb_coords,
+            first_pdb_cg_vdmbb_coords, weights=np.array([20,20,20,20,20,1,1,1]))
+   pr_obj_copy = clusmem_pr_obj.copy() # b/c of mutability
+   pr.applyTransformation(cg_vdmbb_transf, pr_obj_copy)
+   pr.writePDB(clusmem_pdb_outpath, pr_obj_copy)
             
-            new_redefined_pdbpath, vdmAA_str = get_output_pdbpath(pdb_name, first_vdm_scrr,
-                    vdgscrrs, cluster_dirname, redefined_clusnum, tempdir=False)
-            
-            # rename (move) the old pdbpath to new pdbpath instead of writePDB because
-            # cl_struct is mutable and its reference may have been modified.
-            if os.path.exists(redun_temp_pdbpath):
-                os.rename(redun_temp_pdbpath, new_redefined_pdbpath)
-            else:
-                equiv_temp_pdb = find_equivalent_pdb(redun_temp_pdbpath, new_redefined_pdbpath)
-                os.rename(equiv_temp_pdb, new_redefined_pdbpath)
+         #   first_pdb_cg_coords = moved_cg_coords
+         #   first_pdb_cg_vdmbb_coords = moved_cg_vdmbb_coords
+         #else:
+         #   # align 
+   '''
+            # find best permutation to align on first clusmem cgvdmbb coords b/c 
+            # when the coords were aligned and clustered, the aligned CG coords 
+            # weren't saved. and we want to align on CG only anyway, not cg+vdmbb
+            # as how it was clustered.
+            best_transf, best_rmsd = None, None # still need best perm ind label; 
+               # this isn't necessarily eq. to the perm ind in clusmem_pdb_outpath
+            mobile_coord_perms = permute_on_indices(symmetry_classes, 
+                                                    clusmem_cg_coords)
+            target = first_pdb_cg_coords
+            for mobile_perm in mobile_coord_perms:
 
-    # Delete the 'temp' reordered_AA dir.
-    delete_temp_reordered_dir(redun_temp_pdbpath)
-    return redefined_cluster_assignments
+               moved_coords, transf = align_perm(mobile_perm, target) 
+               # rmsd needs to be calculated b/n cg AND vdm, bc there are multiple
+               # solutions will near-equivalent rmsds that place the vdms 
+               # elsewhere. however, the output pdb should be aligned on CG only.
+               moved_coords_cg_vdmbb, transf_cg_vdmbb = pr.superpose(
+                  clusmem_cg_vdmbb_coords
+               )
+               rmsd = pr.calcRMSD(moved_coords, target)
+               if best_rmsd is None:
+                  best_rmsd = rmsd
+                  best_transf = transf
+               else:
+                  if rmsd < best_rmsd:
+                     best_rmsd = rmsd
+                     best_transf = transf
+            print(best_rmsd)
+            # apply the best transf
+            transform_and_write(clusmem_pr_obj, best_transf, clusmem_pdb_outpath)
+            '''
 
-def find_equivalent_pdb(redun_temp_pdbpath, new_redefined_pdbpath):
-    # Find equivalent binding site where the order of identical AAs are flipped.
-    
-    n_spl = sorted(os.path.basename(new_redefined_pdbpath).split('_'))
-    n_spl = [i for i in n_spl if 'clus' not in i]
-    dirs_upstream_of_clus = os.path.dirname(redun_temp_pdbpath).split(os.sep)[:-1]
-    dirs_upstream_of_clus_path = '/'+os.path.join(*dirs_upstream_of_clus)
-    for _root, _dirs, _files in os.walk(dirs_upstream_of_clus_path):
-        for e in _files:
-            e_spl = sorted(e.split('_'))
-            e_spl = [i for i in e_spl if 'clus' not in i]
-            if e_spl == n_spl:
-                return os.path.abspath(os.path.join(_root, e)) 
+def get_clus_pdb_outpath(clusnum, clusnum_dir, pdbpath, scrr_cg_perm):
+    pdbname = os.path.basename(pdbpath).removesuffix('.pdb')
+    scrrs, perm = scrr_cg_perm
+    perm = perm.removeprefix('cg_perm_')
+    vdg_scrr_str = '_'.join(['_'.join([str(z) for z in v_s]) for v_s in scrrs])
+    pdb_str = f'clus{clusnum}_{pdbname}_{vdg_scrr_str}_CGperm{perm}.pdb'
+    return os.path.join(clusnum_dir, pdb_str)
 
-def merge_equivalent_AAperm_clusters(clusnumA_sorted_biounit_vdmscrrs, clusnumB_sorted_biounit_vdmscrrs,
-                              temp_cluster_assignments, _clusnumA, clusnumA_mems, _clusnumB, 
-                              clusnumB_mems):
-    # Compare two clusters and merge if equivalent
-    for _a in clusnumA_sorted_biounit_vdmscrrs:
-        for _b in clusnumB_sorted_biounit_vdmscrrs:
-            if _a == _b: # then merge clusnumA with clusnumB and delete clusnumB
-                temp_cluster_assignments[_clusnumA] = np.append(clusnumA_mems, clusnumB_mems)
-                del temp_cluster_assignments[_clusnumB]
-                return temp_cluster_assignments
-    return temp_cluster_assignments
+def write_out_first_pdb(mobile, target, pr_obj, outpath, clusmem_cg_coords,
+                        clusmem_cg_vdmbb_coords):
+    mobile, target = np.array(mobile), np.array(target)
+    moved_3atom_coords, transf = pr.superpose(mobile, target)
+    pr_obj_copy = pr_obj.copy() # b/c of mutability
+    pr.applyTransformation(transf, pr_obj_copy)
+    moved_cg_vdmbb_coords = pr.applyTransformation(transf, clusmem_cg_vdmbb_coords)
+    pr.writePDB(outpath, pr_obj_copy)
+    # superposed on 3 reference atoms, but need to return coords of the entire CG.
+    moved_cg_coords = pr.applyTransformation(transf, clusmem_cg_coords)
+    return moved_cg_coords, moved_cg_vdmbb_coords
 
-def get_clus_sorted_biounits_and_vdmscrrs(cluster_dirname, num_vdms, vdmAA_str, _clusnum, tempdir=False):
-
-    if tempdir:
-        _outdir = os.path.join(cluster_dirname, 'temp', str(num_vdms), 
-                                                vdmAA_str, f'cluster_{_clusnum}')
-    else:
-        _outdir = os.path.join(cluster_dirname, str(num_vdms), 
-                                                vdmAA_str, f'cluster_{_clusnum}')
-    clus_pdbnames = os.listdir(_outdir)
-    clus_sorted_biounits_and_vdmscrrs = []
-    for _pdbname in clus_pdbnames:
-        biounit, list_scrrs = derive_list_scrr_from_pdbname(_pdbname)
-        clus_sorted_biounits_and_vdmscrrs.append([biounit, sorted(list_scrrs)])
-    return clus_sorted_biounits_and_vdmscrrs
-
-def derive_list_scrr_from_pdbname(_pdbname):
-    y = _pdbname.removesuffix('.pdb')
-    delimited = y.split('_')
-    delimited = [i for i in delimited if i != 'centroid']
-    biounit = delimited[1:6]
-    scrr_chain = delimited[6:]
-    assert len(scrr_chain) % 4 == 0
-    list_scrrs = [scrr_chain[i:i + 4] for i in range(0, len(scrr_chain), 4)]
-    return [biounit, list_scrrs]
-
-def get_output_pdbpath(pdb_name, first_vdm_scrr, vdgscrrs, cluster_dirname, cluster_num, 
-                       tempdir=False):
-    # tempdir is for temp_cluster_assignments, which will be redefined later when duplicate
-    # clusters are merged.
-    num_vdms = len(first_vdm_scrr)
-    base_pdb = os.path.basename(pdb_name)
-    base_pdbname = base_pdb.removesuffix('.pdb')
-    vdmAA_str = '_'.join([x[3] for x in first_vdm_scrr])
-    sorted_vdg_scrr_str = '_'.join(sorted(['_'.join([str(z) for z in v_s]) for v_s in vdgscrrs]))
-    if tempdir: 
-        cluster_subdirname = os.path.join(cluster_dirname, 'temp', str(num_vdms), vdmAA_str, 
-                                          f'cluster_{cluster_num}')
-    else:
-        cluster_subdirname = os.path.join(cluster_dirname, str(num_vdms), vdmAA_str,
-                                          f'cluster_{cluster_num}')
-    os.makedirs(cluster_subdirname, exist_ok=True)
-    output_pdbpath = os.path.join(cluster_subdirname, 
-                                  f'clus{cluster_num}_{base_pdbname}_{sorted_vdg_scrr_str}.pdb')
-    return output_pdbpath, vdmAA_str
-
-def flatten_AA_permuted_bbatoms(all_AA_permuted_bbatoms_to_align, all_AA_permuted_pdbpaths, 
-                                all_AA_permuted_vdm_scrrs):
-    flat_all_AA_permuted_bb_atoms_to_clus = []
-    for AA_bindingsite_perm in all_AA_permuted_bbatoms_to_align:
-        flattened_AA_perm = []
-        for _vdmres in AA_bindingsite_perm:
-            for _vdmresbbcoord in _vdmres:
-                flattened_AA_perm.append(_vdmresbbcoord)
-        flat_all_AA_permuted_bb_atoms_to_clus.append(flattened_AA_perm)
-    assert len(all_AA_permuted_pdbpaths) == len(flat_all_AA_permuted_bb_atoms_to_clus)
-    return flat_all_AA_permuted_bb_atoms_to_clus
-
-def get_struct_data(_pdb, idxs, perms, _flat_bb_atoms_to_clus, coords, all_pdbs, all_structs, 
-                    all_vdg_scrrs, _vdgscrr):
-    # get data for each pdb/struct
-    struct = pr.parsePDB(_pdb)
-    occs = struct.getOccupancies()
-    all_coords = struct.getCoords()
-    cg_idxs = np.array(
-        [np.argwhere(occs == 3. + 0.1 * idx)[0][0] 
-         for idx in idxs]
-    )
-    coords_to_add = []
-    for perm in perms:
-        perm_coords = np.zeros((len(idxs), 3))
-        perm_coords[:len(perm)] = all_coords[cg_idxs[perm]]
-        # Comment out below, which is for `production` branch of vdG-miner and does not
-        # sample permutations of identical AAs in binding site.
-        '''
-        for j, name in enumerate(['N', 'CA', 'C']):
-            mask = np.logical_and.reduce((occs > 1., names == name))
-            perm_coords[len(perm)+j::3] = \
-                all_coords[mask][np.array(res_idxs)]
-        '''
-        # The below if for ligand-vdGs, which samples perms of identical AAs in binding site.
-        for _bbatom in _flat_bb_atoms_to_clus:
-            perm_coords = np.vstack([perm_coords, _bbatom])
-        coords_to_add.append(perm_coords)
-    coords += coords_to_add
-    all_pdbs.append(_pdb)
-    all_structs.append(struct.copy())
-    all_vdg_scrrs.append(_vdgscrr)
-    return coords, all_pdbs, all_structs, all_vdg_scrrs
-
-def get_weights(idxs, res_idxs, N):
-    # define equal weights for the CG and the mainchain atoms of 
-    # interacting residues to be used in the Kabsch alignments
-    weights = np.zeros(N)
-    weights[:len(idxs)] = 0.5 / len(idxs)
-    weights[len(idxs):] = 0.5 / (len(res_idxs) * 3)
-    assert np.abs(weights.sum() - 1.) < 1e-8
-    return weights
-
-def align_and_cluster(M, idxs, res_idxs, N, coords, rmsd_cutoff):
-    # get weights for the Kabsch alignments
-    #weights = get_weights(idxs, res_idxs, N)
-    weights = np.array([1/N for x in range(N)])
-    
-    # find minimal-RMSD alignments between all pairs of structures
-    triu_indices = np.triu_indices(M, 1)
-    L = len(triu_indices[0])
-    R, t, msd, best_perms = np.zeros((L, 3, 3)), np.zeros((L, 3)), \
-                            10000. * np.ones(L), np.zeros(L, dtype=int)
-    for i in range(coords.shape[0]):
-        # iterate over atom permutations to find the best alignments
-        mobile_rounded = np.round(coords[i][triu_indices[0]], 2)
-        print('mobile', mobile_rounded.shape)
-        print(mobile_rounded)
-        target_rounded = np.round(coords[0][triu_indices[1]], 2)
-        print('target', target_rounded.shape) 
-        print(target_rounded)
-        _R, _t, _msd = kabsch(coords[i][triu_indices[0]], 
-                              coords[0][triu_indices[1]], 
-                              weights)
-        R[_msd < msd] = _R[_msd < msd]
-        t[_msd < msd] = _t[_msd < msd]
-        best_perms[_msd < msd] = i
-        msd[_msd < msd] = _msd[_msd < msd]
-    A = np.eye(M, dtype=int)
-    A[triu_indices] = (msd <= rmsd_cutoff ** 2).astype(int)
-    A = A + A.T
-    all_mems, cents = greedy(A)
-    return all_mems, cents, triu_indices, R, t, msd
-
-def process_AA_redun_cluster(cent, cluster, all_pdbs, all_structs, all_vdg_scrrs,
-        triu_indices, R, t, msd, first_vdm_scrr, cluster_dirname, cluster_num, 
-        num_supposed_to_be_output):
-    # Process and output PDBs of this cluster. Note that they must be output to a 'temp'
-    # dir because there may be degenerate binding sites that will be deduplicated later.
-    assert cent in cluster, f'Centroid {cent} not in cluster {cluster}.'
-    for el in cluster:
-        pdb_name = all_pdbs[el]
-        cl_struct = all_structs[el].copy()
-        vdgscrrs  = all_vdg_scrrs[el]
-        moved_cl_struct = None # refresh `moved_cl_struct` in case cl_struct was 
-                               # accidentally modified in a previous iteration (because
-                               # prody obj changes directly modify the reference obj)
-        # create the environment PDB file
-        if el == cent:
-            pdb_name = pdb_name[:-4] + '_centroid.pdb'
-            moved_cl_struct = cl_struct.copy()
-        else:
-            el_mobile = np.logical_and(triu_indices[0] == el,
-                                       triu_indices[1] == cent)
-            cent_mobile = np.logical_and(triu_indices[0] == cent,
-                                         triu_indices[1] == el)
-            if np.any(el_mobile):
-                # non-centroid was mobile in the Kabsch alignment
-                idx = np.argwhere(el_mobile).flatten()[0]
-                _R = R[idx]
-                _t = t[idx]
-                rmsd = np.sqrt(msd[idx])
-            else:
-                # centroid was mobile in the Kabsch alignment
-                idx = np.argwhere(cent_mobile).flatten()[0]
-                _R = R[idx].T
-                _t = -np.dot(t[idx], _R)
-                rmsd = np.sqrt(msd[idx])
-
-            moved_cl_struct = cl_struct.copy() # deepcopy because of prody obj mutability
-                                               # to reference obj when setCoords is called
-            moved_cl_struct.setCoords(
-                np.dot(cl_struct.getCoords(), _R) + _t)
-            #print('RMSD =', rmsd)
-        
-        # Output to a 'temp' dir because the clusters will be re-defined later, when 
-        # we take care of duplicates (i.e. different AA permutations of vdms in the same, 
-        # or homologous, binding sites will end up in different clusters, therefore 
-        # appearing unique, but in reality, the order of identical AAs are simply flipped.) 
-        # The way to check for this later is to check for equivalent vdm scrrs, e.g. if 
-        # cluster 1 contains xxx_GLY1_GLY3 and cluster2 contains xxx_GLY3_GLY1, then
-        # merge those clusters.
-        output_pdbpath, vdmAA_str = get_output_pdbpath(pdb_name, first_vdm_scrr, vdgscrrs, 
-                                            cluster_dirname, cluster_num, tempdir=True)
-        pr.writePDB(output_pdbpath, moved_cl_struct)
-        num_supposed_to_be_output += 1
-    return num_supposed_to_be_output, vdmAA_str
-
-def remove_redundant_AAperm_clusters(temp_cluster_assignments, cluster_dirname, num_vdms, vdmAA_str):
-    from pprint import pprint
-    already_visited_temp_clusnum_A = []
-    num_of_clusters = list(temp_cluster_assignments.keys())
-    for _clusnumA in num_of_clusters:
-        already_visited_temp_clusnum_A.append(_clusnumA)
-        if _clusnumA not in temp_cluster_assignments.keys(): # bc dict dynamically changing
-            continue
-        clusnumA_mems = temp_cluster_assignments[_clusnumA]
-        for _clusnumB in num_of_clusters:
-            if _clusnumA == _clusnumB:
-                continue
-            elif _clusnumB in already_visited_temp_clusnum_A: # checking that _clusnumB not 
-                                # already seen as_clusnumA ensures that only the upper triangle 
-                                # is calculated in this all x all protocol 
-                continue
-            elif _clusnumB not in temp_cluster_assignments.keys(): # bc dict dynamically changing
-                continue
-            else:
-                clusnumB_mems = temp_cluster_assignments[_clusnumB]
-                clusnumA_sorted_biounit_vdmscrrs = get_clus_sorted_biounits_and_vdmscrrs(
-                                            cluster_dirname, num_vdms, vdmAA_str, _clusnumA, tempdir=True)
-                clusnumB_sorted_biounit_vdmscrrs = get_clus_sorted_biounits_and_vdmscrrs(
-                                            cluster_dirname, num_vdms, vdmAA_str, _clusnumB, tempdir=True)
-                temp_cluster_assignments = merge_equivalent_AAperm_clusters(
-                        clusnumA_sorted_biounit_vdmscrrs, clusnumB_sorted_biounit_vdmscrrs,
-                        temp_cluster_assignments, _clusnumA, clusnumA_mems, _clusnumB, 
-                        clusnumB_mems)
-    return temp_cluster_assignments
-
-def renumber_cluster_assignments(temp_cluster_assignments):
-    redefined_cluster_assignments = {}
-    temp_cluster_assignments_keys = sorted(list(temp_cluster_assignments.keys()))
-    redefined_clusnum = 1
-    for temp_clus_assignment_key in temp_cluster_assignments_keys:
-        redefined_cluster_assignments[redefined_clusnum] = temp_cluster_assignments[
-                                                           temp_clus_assignment_key]
-        redefined_clusnum += 1
-    return redefined_cluster_assignments 
-
-def get_original_temp_clusnum(temp_cluster_assignments, elem):
-    original_temp_clusnum = [_cnum for _cnum, _cmems in temp_cluster_assignments.items() if elem in _cmems]
-    assert len(original_temp_clusnum) == 1
-    return original_temp_clusnum[0]
-
-def delete_temp_reordered_dir(redun_temp_pdbpath):
-    pre, spl = redun_temp_pdbpath.split('temp/')
-    spl = spl.split('/')
-    temp_reordered_dir = os.path.join(pre, 'temp', spl[0], spl[1])
-    assert os.path.exists(temp_reordered_dir)
-    shutil.rmtree(temp_reordered_dir) # will remove the duplicated pdbs
+#def transform_and_write(pr_obj, transf, outpath):
+#   pr_obj_copy = pr_obj.copy() # b/c of mutability
+#   pr.applyTransformation(transf, pr_obj_copy)
+#   pr.writePDB(outpath, pr_obj_copy)
+#
+#def align_perm(mobile, target):
+#    mobile, target = np.array(mobile), np.array(target)
+#    moved_coords, transf = pr.superpose(mobile, target)
+#    return moved_coords, transf
+#
