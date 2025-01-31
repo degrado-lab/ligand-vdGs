@@ -551,7 +551,8 @@ def create_dist_matrix(data, None_in_coords):
             value = rmsd
          else: # calc seq similarity
             seq_sim = calc_seq_similarity(data_i, data_j)
-            value = (100 - seq_sim) / 100 # clustering is distance-based, so the metric is DISsimilarity
+            value = (100 - seq_sim) / 100 # clustering is distance-based, so the 
+                                          # metric is DISsimilarity
          distance_matrix[i][j] = value 
          distance_matrix[j][i] = value   # Symmetric matrix
    return distance_matrix

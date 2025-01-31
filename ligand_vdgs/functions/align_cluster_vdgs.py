@@ -197,15 +197,16 @@ def cluster_vdg_structures(vdglib_dir, rmsd_cutoff, idxs, all_AA_permuted_pdbpat
     idxs : list, optional
         Indices of CG atoms (ordered by smarts pattern) on which to cluster. 
     symmetry_classes : list, optional
-        Integers representing the symmetry classes of the CG atoms on which clustering is to 
-        be performed. If provided, should have the same length as idxs. If not provided, the 
-        atoms are assumed to be symmetrically inequivalent.
+        Integers representing the symmetry classes of the CG atoms on which 
+        clustering is to be performed. If provided, should have the same length as 
+        idxs. If not provided, the atoms are assumed to be symmetrically 
+        inequivalent.
     all_AA_permuted_bbatoms_to_align : list
         Either: 
         - BB atoms of vdms if aligning/clustering on just cg+vdm only. 
             (Step 1 in header of cluster_and_deduplicate.py)
-        - BB atoms of vdms+flanking residues if aligning/clustering on cg+vdm+flanking residues.
-            (Step 2 in header of cluster_and_deduplicate.py)
+        - BB atoms of vdms+flanking residues if aligning/clustering on cg+vdm+
+            flanking residues. (Step 2 in header of clus_and_deduplicate_vdgs.py)
     Returns
     -------
     cluster_assignments : dict
@@ -227,14 +228,18 @@ def cluster_vdg_structures(vdglib_dir, rmsd_cutoff, idxs, all_AA_permuted_pdbpat
         len(res_idxs) * 3 # number of atoms in CG plus N, CA, C for each aa
 
     flat_all_AA_permuted_bb_atoms_to_clus = flatten_AA_permuted_bbatoms(
-        all_AA_permuted_bbatoms_to_align, all_AA_permuted_pdbpaths, all_AA_permuted_vdm_scrrs)
+        all_AA_permuted_bbatoms_to_align, all_AA_permuted_pdbpaths, 
+        all_AA_permuted_vdm_scrrs)
 
     for _pdb, _vdgscrr, _flat_bb_atoms_to_clus in zip(all_AA_permuted_pdbpaths, 
-                        all_AA_permuted_vdm_scrrs, flat_all_AA_permuted_bb_atoms_to_clus):
-        coords, all_pdbs, all_structs, all_vdg_scrrs = get_struct_data(_pdb, idxs, perms,
-                _flat_bb_atoms_to_clus, coords, all_pdbs, all_structs, all_vdg_scrrs, _vdgscrr)
+                    all_AA_permuted_vdm_scrrs, 
+                    flat_all_AA_permuted_bb_atoms_to_clus):
+        coords, all_pdbs, all_structs, all_vdg_scrrs = get_struct_data(_pdb, idxs, 
+            perms, _flat_bb_atoms_to_clus, coords, all_pdbs, all_structs, 
+            all_vdg_scrrs, _vdgscrr)
     
-    print('CHECK OVER HERE. FOR LEU_LEU MAKE SURE ALL_PDBS, ALL_VDG_SCRRS MAKES SENSE FOR BOTH AA PERMUTATIONS.')
+    print('CHECK OVER HERE. FOR LEU_LEU MAKE SURE ALL_PDBS, ALL_VDG_SCRRS MAKES '
+          'SENSE FOR BOTH AA PERMUTATIONS.')
     coords = np.array(coords).reshape((len(all_pdbs), len(perms), -1, 3))
     assert len(all_pdbs) == len(all_structs) == len(coords) == len(all_vdg_scrrs)
     coords = coords.transpose((1, 0, 2, 3))
@@ -245,63 +250,73 @@ def cluster_vdg_structures(vdglib_dir, rmsd_cutoff, idxs, all_AA_permuted_pdbpat
     #print(np.array(coords).shape)
     #print('len all pdbs', len(all_pdbs))
     print('"N" number of atoms being aligned/clustered', N)
-    all_mems, cents, triu_indices, R, t, msd = align_and_cluster(M, idxs, res_idxs, 
-                                                                 N, coords, rmsd_cutoff) 
+    all_mems, cents, triu_indices, R, t, msd = align_and_cluster(M, idxs, res_idxs,
+                    N, coords, rmsd_cutoff) 
     assert len(all_pdbs) == len(all_structs) == len(all_vdg_scrrs)
     #print('num of samples in cluster', sum([len(i) for i in all_mems]))
     cluster_dirname = os.path.join(vdglib_dir, out_clus_dir)
     cluster_num = 1
     num_supposed_to_be_output = 0
     
-    # Process and output PDBs of the clusters. Note that they must be output to a 'temp' 
-    # dir because there may be degenerate binding sites that will be deduplicated later.
+    # Process and output PDBs of the clusters. Note that they must be output to a 
+    # 'temp' dir because there may be degenerate binding sites that will be 
+    # deduplicated later.
     for cluster, cent in zip(all_mems, cents):
-        num_supposed_to_be_output, vdmAA_str = process_AA_redun_cluster(cent, cluster, all_pdbs, 
-                all_structs, all_vdg_scrrs, triu_indices, R, t, msd, first_vdm_scrr, 
-                cluster_dirname, cluster_num, num_supposed_to_be_output)
+        num_supposed_to_be_output, vdmAA_str = process_AA_redun_cluster(cent, 
+                cluster, all_pdbs, all_structs, all_vdg_scrrs, triu_indices, R, t, 
+                msd, first_vdm_scrr, cluster_dirname, cluster_num, 
+                num_supposed_to_be_output)
         cluster_num += 1
 
-    # Use dict to record which indices (of all_AA_permuted_...) belong to which cluster. 
-    # Note that this dict is called 'temp' because it may contain redundant vdGs based on 
-    # different AA permutations within the same binding site.
+    # Use dict to record which indices (of all_AA_permuted_...) belong to which 
+    # cluster. Note that this dict is called 'temp' because it may contain 
+    # redundant vdGs based on different AA permutations within the same binding 
+    # site.
     temp_cluster_assignments = {} # key = clusnum, value = indices 
     clus_num = 1
     for cluster_result in all_mems:
         temp_cluster_assignments[clus_num] = cluster_result
         clus_num += 1
-    assert num_supposed_to_be_output == sum([len(v) for k, v in temp_cluster_assignments.items()])
+    assert num_supposed_to_be_output == sum([len(v) for k, v in 
+                                             temp_cluster_assignments.items()])
 
-    # Now, merge clusters based on duplicate binding sites (diff permutations of AAs).
-    temp_cluster_assignments = remove_redundant_AAperm_clusters(temp_cluster_assignments, 
-                                cluster_dirname, num_vdms, vdmAA_str)
+    # Now, merge clusters based on duplicate binding sites (diff permutations of 
+    # AAs).
+    temp_cluster_assignments = remove_redundant_AAperm_clusters(
+        temp_cluster_assignments, cluster_dirname, num_vdms, vdmAA_str)
     
-    # Redefine cluster_assignments, now that duplicates have been merged. basically, just
-    # renumber the cluster numbers
-    redefined_cluster_assignments = renumber_cluster_assignments(temp_cluster_assignments)
+    # Redefine cluster_assignments, now that duplicates have been merged. basically, 
+    # just renumber the cluster numbers
+    redefined_cluster_assignments = renumber_cluster_assignments(
+        temp_cluster_assignments)
 
     # Output pdbs based on the deduplicated redefined_cluster_assignments.
-    for redefined_clusnum, redefined_clusmems in redefined_cluster_assignments.items():
+    for redefined_clusnum, redefined_clusmems in redefined_cluster_assignments.items(
+    ):
         for elem in redefined_clusmems:
             pdb_name = all_AA_permuted_pdbpaths[elem]
             vdgscrrs  = all_vdg_scrrs[elem]
-            original_temp_clusnum = get_original_temp_clusnum(temp_cluster_assignments, 
-                                                              elem)
+            original_temp_clusnum = get_original_temp_clusnum(
+                temp_cluster_assignments, elem)
             is_centroid = elem in cents
             if is_centroid:
                 pdb_name = pdb_name[:-4] + '_centroid.pdb'
 
-            redun_temp_pdbpath, vdmAA_str = get_output_pdbpath(pdb_name, first_vdm_scrr, 
-                    vdgscrrs, cluster_dirname, original_temp_clusnum, tempdir=True)
+            redun_temp_pdbpath, vdmAA_str = get_output_pdbpath(pdb_name, 
+                    first_vdm_scrr, vdgscrrs, cluster_dirname, 
+                    original_temp_clusnum, tempdir=True)
             
-            new_redefined_pdbpath, vdmAA_str = get_output_pdbpath(pdb_name, first_vdm_scrr,
-                    vdgscrrs, cluster_dirname, redefined_clusnum, tempdir=False)
+            new_redefined_pdbpath, vdmAA_str = get_output_pdbpath(pdb_name, 
+                    first_vdm_scrr, vdgscrrs, cluster_dirname, redefined_clusnum, 
+                    tempdir=False)
             
-            # rename (move) the old pdbpath to new pdbpath instead of writePDB because
-            # cl_struct is mutable and its reference may have been modified.
+            # rename (move) the old pdbpath to new pdbpath instead of writePDB 
+            # because cl_struct is mutable and its reference may have been modified.
             if os.path.exists(redun_temp_pdbpath):
                 os.rename(redun_temp_pdbpath, new_redefined_pdbpath)
             else:
-                equiv_temp_pdb = find_equivalent_pdb(redun_temp_pdbpath, new_redefined_pdbpath)
+                equiv_temp_pdb = find_equivalent_pdb(redun_temp_pdbpath, 
+                                                     new_redefined_pdbpath)
                 os.rename(equiv_temp_pdb, new_redefined_pdbpath)
 
     # Delete the 'temp' reordered_AA dir.
@@ -322,19 +337,21 @@ def find_equivalent_pdb(redun_temp_pdbpath, new_redefined_pdbpath):
             if e_spl == n_spl:
                 return os.path.abspath(os.path.join(_root, e)) 
 
-def merge_equivalent_AAperm_clusters(clusnumA_sorted_biounit_vdmscrrs, clusnumB_sorted_biounit_vdmscrrs,
-                              temp_cluster_assignments, _clusnumA, clusnumA_mems, _clusnumB, 
-                              clusnumB_mems):
+def merge_equivalent_AAperm_clusters(clusnumA_sorted_biounit_vdmscrrs, 
+            clusnumB_sorted_biounit_vdmscrrs, temp_cluster_assignments, _clusnumA, 
+            clusnumA_mems, _clusnumB, clusnumB_mems):
     # Compare two clusters and merge if equivalent
     for _a in clusnumA_sorted_biounit_vdmscrrs:
         for _b in clusnumB_sorted_biounit_vdmscrrs:
             if _a == _b: # then merge clusnumA with clusnumB and delete clusnumB
-                temp_cluster_assignments[_clusnumA] = np.append(clusnumA_mems, clusnumB_mems)
+                temp_cluster_assignments[_clusnumA] = np.append(clusnumA_mems, 
+                                                                clusnumB_mems)
                 del temp_cluster_assignments[_clusnumB]
                 return temp_cluster_assignments
     return temp_cluster_assignments
 
-def get_clus_sorted_biounits_and_vdmscrrs(cluster_dirname, num_vdms, vdmAA_str, _clusnum, tempdir=False):
+def get_clus_sorted_biounits_and_vdmscrrs(cluster_dirname, num_vdms, vdmAA_str, 
+                                          _clusnum, tempdir=False):
 
     if tempdir:
         _outdir = os.path.join(cluster_dirname, 'temp', str(num_vdms), 
@@ -359,27 +376,29 @@ def derive_list_scrr_from_pdbname(_pdbname):
     list_scrrs = [scrr_chain[i:i + 4] for i in range(0, len(scrr_chain), 4)]
     return [biounit, list_scrrs]
 
-def get_output_pdbpath(pdb_name, first_vdm_scrr, vdgscrrs, cluster_dirname, cluster_num, 
-                       tempdir=False):
-    # tempdir is for temp_cluster_assignments, which will be redefined later when duplicate
-    # clusters are merged.
+def get_output_pdbpath(pdb_name, first_vdm_scrr, vdgscrrs, cluster_dirname, 
+                       cluster_num, tempdir=False):
+    # tempdir is for temp_cluster_assignments, which will be redefined later when 
+    # duplicate clusters are merged.
     num_vdms = len(first_vdm_scrr)
     base_pdb = os.path.basename(pdb_name)
     base_pdbname = base_pdb.removesuffix('.pdb')
     vdmAA_str = '_'.join([x[3] for x in first_vdm_scrr])
-    sorted_vdg_scrr_str = '_'.join(sorted(['_'.join([str(z) for z in v_s]) for v_s in vdgscrrs]))
+    sorted_vdg_scrr_str = '_'.join(sorted(['_'.join([str(z) for z in v_s]) for v_s 
+                                           in vdgscrrs]))
     if tempdir: 
-        cluster_subdirname = os.path.join(cluster_dirname, 'temp', str(num_vdms), vdmAA_str, 
-                                          f'cluster_{cluster_num}')
+        cluster_subdirname = os.path.join(cluster_dirname, 'temp', str(num_vdms), 
+                                          vdmAA_str, f'cluster_{cluster_num}')
     else:
         cluster_subdirname = os.path.join(cluster_dirname, str(num_vdms), vdmAA_str,
                                           f'cluster_{cluster_num}')
     os.makedirs(cluster_subdirname, exist_ok=True)
     output_pdbpath = os.path.join(cluster_subdirname, 
-                                  f'clus{cluster_num}_{base_pdbname}_{sorted_vdg_scrr_str}.pdb')
+                    f'clus{cluster_num}_{base_pdbname}_{sorted_vdg_scrr_str}.pdb')
     return output_pdbpath, vdmAA_str
 
-def flatten_AA_permuted_bbatoms(all_AA_permuted_bbatoms_to_align, all_AA_permuted_pdbpaths, 
+def flatten_AA_permuted_bbatoms(all_AA_permuted_bbatoms_to_align, 
+                                all_AA_permuted_pdbpaths, 
                                 all_AA_permuted_vdm_scrrs):
     flat_all_AA_permuted_bb_atoms_to_clus = []
     for AA_bindingsite_perm in all_AA_permuted_bbatoms_to_align:
@@ -388,11 +407,12 @@ def flatten_AA_permuted_bbatoms(all_AA_permuted_bbatoms_to_align, all_AA_permute
             for _vdmresbbcoord in _vdmres:
                 flattened_AA_perm.append(_vdmresbbcoord)
         flat_all_AA_permuted_bb_atoms_to_clus.append(flattened_AA_perm)
-    assert len(all_AA_permuted_pdbpaths) == len(flat_all_AA_permuted_bb_atoms_to_clus)
+    assert len(all_AA_permuted_pdbpaths) == len(
+        flat_all_AA_permuted_bb_atoms_to_clus)
     return flat_all_AA_permuted_bb_atoms_to_clus
 
-def get_struct_data(_pdb, idxs, perms, _flat_bb_atoms_to_clus, coords, all_pdbs, all_structs, 
-                    all_vdg_scrrs, _vdgscrr):
+def get_struct_data(_pdb, idxs, perms, _flat_bb_atoms_to_clus, coords, all_pdbs, 
+                    all_structs, all_vdg_scrrs, _vdgscrr):
     # get data for each pdb/struct
     struct = pr.parsePDB(_pdb)
     occs = struct.getOccupancies()
@@ -405,15 +425,16 @@ def get_struct_data(_pdb, idxs, perms, _flat_bb_atoms_to_clus, coords, all_pdbs,
     for perm in perms:
         perm_coords = np.zeros((len(idxs), 3))
         perm_coords[:len(perm)] = all_coords[cg_idxs[perm]]
-        # Comment out below, which is for `production` branch of vdG-miner and does not
-        # sample permutations of identical AAs in binding site.
+        # Comment out below, which is for `production` branch of vdG-miner and 
+        # does not sample permutations of identical AAs in binding site.
         '''
         for j, name in enumerate(['N', 'CA', 'C']):
             mask = np.logical_and.reduce((occs > 1., names == name))
             perm_coords[len(perm)+j::3] = \
                 all_coords[mask][np.array(res_idxs)]
         '''
-        # The below if for ligand-vdGs, which samples perms of identical AAs in binding site.
+        # The below if for ligand-vdGs, which samples perms of identical AAs in 
+        # binding site.
         for _bbatom in _flat_bb_atoms_to_clus:
             perm_coords = np.vstack([perm_coords, _bbatom])
         coords_to_add.append(perm_coords)
@@ -466,16 +487,18 @@ def align_and_cluster(M, idxs, res_idxs, N, coords, rmsd_cutoff):
 def process_AA_redun_cluster(cent, cluster, all_pdbs, all_structs, all_vdg_scrrs,
         triu_indices, R, t, msd, first_vdm_scrr, cluster_dirname, cluster_num, 
         num_supposed_to_be_output):
-    # Process and output PDBs of this cluster. Note that they must be output to a 'temp'
-    # dir because there may be degenerate binding sites that will be deduplicated later.
+    # Process and output PDBs of this cluster. Note that they must be output to a 
+    # 'temp' dir because there may be degenerate binding sites that will be 
+    # deduplicated later.
     assert cent in cluster, f'Centroid {cent} not in cluster {cluster}.'
     for el in cluster:
         pdb_name = all_pdbs[el]
         cl_struct = all_structs[el].copy()
         vdgscrrs  = all_vdg_scrrs[el]
         moved_cl_struct = None # refresh `moved_cl_struct` in case cl_struct was 
-                               # accidentally modified in a previous iteration (because
-                               # prody obj changes directly modify the reference obj)
+                               # accidentally modified in a previous iteration 
+                               # (because prody obj changes directly modify the 
+                               # reference obj)
         # create the environment PDB file
         if el == cent:
             pdb_name = pdb_name[:-4] + '_centroid.pdb'
@@ -498,53 +521,62 @@ def process_AA_redun_cluster(cent, cluster, all_pdbs, all_structs, all_vdg_scrrs
                 _t = -np.dot(t[idx], _R)
                 rmsd = np.sqrt(msd[idx])
 
-            moved_cl_struct = cl_struct.copy() # deepcopy because of prody obj mutability
-                                               # to reference obj when setCoords is called
+            moved_cl_struct = cl_struct.copy() # deepcopy because of prody obj 
+                                               # mutability to reference obj when 
+                                               # setCoords is called
             moved_cl_struct.setCoords(
                 np.dot(cl_struct.getCoords(), _R) + _t)
             #print('RMSD =', rmsd)
         
-        # Output to a 'temp' dir because the clusters will be re-defined later, when 
-        # we take care of duplicates (i.e. different AA permutations of vdms in the same, 
-        # or homologous, binding sites will end up in different clusters, therefore 
-        # appearing unique, but in reality, the order of identical AAs are simply flipped.) 
-        # The way to check for this later is to check for equivalent vdm scrrs, e.g. if 
-        # cluster 1 contains xxx_GLY1_GLY3 and cluster2 contains xxx_GLY3_GLY1, then
+        # Output to a 'temp' dir because the clusters will be re-defined later, 
+        # when we take care of duplicates (i.e. different AA permutations of vdms 
+        # in the same, or homologous, binding sites will end up in different 
+        # clusters, therefore appearing unique, but in reality, the order of 
+        # identical AAs are simply flipped.) The way to check for this later is 
+        # to check for equivalent vdm scrrs, e.g. if cluster 1 contains 
+        # xxx_GLY1_GLY3 and cluster2 contains xxx_GLY3_GLY1, then
         # merge those clusters.
-        output_pdbpath, vdmAA_str = get_output_pdbpath(pdb_name, first_vdm_scrr, vdgscrrs, 
-                                            cluster_dirname, cluster_num, tempdir=True)
+        output_pdbpath, vdmAA_str = get_output_pdbpath(pdb_name, first_vdm_scrr, 
+                            vdgscrrs, cluster_dirname, cluster_num, tempdir=True)
         pr.writePDB(output_pdbpath, moved_cl_struct)
         num_supposed_to_be_output += 1
     return num_supposed_to_be_output, vdmAA_str
 
-def remove_redundant_AAperm_clusters(temp_cluster_assignments, cluster_dirname, num_vdms, vdmAA_str):
+def remove_redundant_AAperm_clusters(temp_cluster_assignments, cluster_dirname, 
+                                     num_vdms, vdmAA_str):
     from pprint import pprint
     already_visited_temp_clusnum_A = []
     num_of_clusters = list(temp_cluster_assignments.keys())
     for _clusnumA in num_of_clusters:
         already_visited_temp_clusnum_A.append(_clusnumA)
-        if _clusnumA not in temp_cluster_assignments.keys(): # bc dict dynamically changing
+        if _clusnumA not in temp_cluster_assignments.keys(): # bc dict dynamically 
+                                                             # changing
             continue
         clusnumA_mems = temp_cluster_assignments[_clusnumA]
         for _clusnumB in num_of_clusters:
             if _clusnumA == _clusnumB:
                 continue
-            elif _clusnumB in already_visited_temp_clusnum_A: # checking that _clusnumB not 
-                                # already seen as_clusnumA ensures that only the upper triangle 
-                                # is calculated in this all x all protocol 
+            elif _clusnumB in already_visited_temp_clusnum_A: # checking that 
+                                            # _clusnumB not already seen as 
+                                            # _clusnumA ensures that only the 
+                                            # upper triangle is calculated in this 
+                                            # all x all protocol 
                 continue
-            elif _clusnumB not in temp_cluster_assignments.keys(): # bc dict dynamically changing
+            elif _clusnumB not in temp_cluster_assignments.keys(): # bc dict 
+                                                        # dynamically changing
                 continue
             else:
                 clusnumB_mems = temp_cluster_assignments[_clusnumB]
-                clusnumA_sorted_biounit_vdmscrrs = get_clus_sorted_biounits_and_vdmscrrs(
-                                            cluster_dirname, num_vdms, vdmAA_str, _clusnumA, tempdir=True)
-                clusnumB_sorted_biounit_vdmscrrs = get_clus_sorted_biounits_and_vdmscrrs(
-                                            cluster_dirname, num_vdms, vdmAA_str, _clusnumB, tempdir=True)
+                clusnumA_sorted_biounit_vdmscrrs = \
+                    get_clus_sorted_biounits_and_vdmscrrs(
+                    cluster_dirname, num_vdms, vdmAA_str, _clusnumA, tempdir=True)
+                clusnumB_sorted_biounit_vdmscrrs = \
+                    get_clus_sorted_biounits_and_vdmscrrs(
+                    cluster_dirname, num_vdms, vdmAA_str, _clusnumB, tempdir=True)
                 temp_cluster_assignments = merge_equivalent_AAperm_clusters(
-                        clusnumA_sorted_biounit_vdmscrrs, clusnumB_sorted_biounit_vdmscrrs,
-                        temp_cluster_assignments, _clusnumA, clusnumA_mems, _clusnumB, 
-                        clusnumB_mems)
+                    clusnumA_sorted_biounit_vdmscrrs, 
+                    clusnumB_sorted_biounit_vdmscrrs, temp_cluster_assignments, 
+                    _clusnumA, clusnumA_mems, _clusnumB, clusnumB_mems)
     return temp_cluster_assignments
 
 def renumber_cluster_assignments(temp_cluster_assignments):
@@ -558,7 +590,8 @@ def renumber_cluster_assignments(temp_cluster_assignments):
     return redefined_cluster_assignments 
 
 def get_original_temp_clusnum(temp_cluster_assignments, elem):
-    original_temp_clusnum = [_cnum for _cnum, _cmems in temp_cluster_assignments.items() if elem in _cmems]
+    original_temp_clusnum = [_cnum for _cnum, _cmems in 
+                             temp_cluster_assignments.items() if elem in _cmems]
     assert len(original_temp_clusnum) == 1
     return original_temp_clusnum[0]
 
