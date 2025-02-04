@@ -74,11 +74,11 @@ def main():
     to_pdbs_cmd = f'python ligand_vdgs/programs/vdG-miner/vdg_miner/programs/fingerprints_to_pdbs.py -c "{cg}" -m "{match_pkl}" -l "{logfile}" -f "{fingerprints}" -p {pdb_dir} -o "{out_dir}" -s -e'
 
     subprocess.run(to_pdbs_cmd, shell=True, check=True)
-
-    # Run deduplicate_redun_vdgs.py
-    deduplicate_cmd = f'python ligand_vdgs/generate_vdgs/deduplicate_redun_vdgs.py --cg "{cg}" --vdglib-dir {out_dir} -l "{logfile}"'
-
-    subprocess.run(deduplicate_cmd, shell=True, check=True)
+#
+#    # Run deduplicate_redun_vdgs.py
+#    deduplicate_cmd = f'python ligand_vdgs/generate_vdgs/deduplicate_redun_vdgs.py --cg "{cg}" --vdglib-dir {out_dir} -l "{logfile}"'
+#
+#    subprocess.run(deduplicate_cmd, shell=True, check=True)
 
 def set_up_outdir(out_dir):
     # Set up output directory

@@ -451,7 +451,7 @@ def get_vdg_AA_and_cg_perms(all_AA_perm_cg_coords,    all_AA_perm_vdm_bbcoords,
             all_AA_perm_flankingCAs, all_AA_perm_pdbpaths, all_AA_perm_vdm_scrr):
       
       perms = permute_on_indices(symmetry_classes, cgcoords)
-      print('Number of permutations:', len(perms))
+      #print('Number of permutations:', len(perms))
 
       for perm_ind, perm in enumerate(perms):
          all_AA_cg_perm_cg_coords.append(perm)
@@ -484,7 +484,7 @@ def elements_in_clusters(indices_of_elements_in_cluster, cg_coords, vdm_bbcoords
 
 def write_out_clusters(clusdir, clus_assignments, all_coords, all_pdbpaths, 
                        all_scrr_cg_perm, symmetry_classes,
-                       all_cg_and_vdmbb_coords):
+                       all_cg_and_vdmbb_coords, weights):
    ref = np.array([[0, 0, 0], [-1, 0, 1], [1, -1, 0]]) # it's just to align the 
         # first 3 atoms of CG. then, all atoms of all subsequent CGs will be 
         # aligned to that first CG.
@@ -500,7 +500,7 @@ def write_out_clusters(clusdir, clus_assignments, all_coords, all_pdbpaths,
          clusmem_pdbpath = all_pdbpaths[ind]
          clusmem_scrr_cg_perm = all_scrr_cg_perm[ind]
          clusmem_cg_vdmbb_coords = all_cg_and_vdmbb_coords[ind]
-         clusmem_pr_obj = pr.parsePDB(clusmem_pdbpath)
+         clusmem_pr_obj = pr.parsePDB(clusmem_pdbpath).select('occupancy >= 1.5')
          clusmem_pdb_outpath = get_clus_pdb_outpath(clusnum, clusnum_dir, 
                                  clusmem_pdbpath, clusmem_scrr_cg_perm)
          if first_pdb_out == False:
@@ -509,19 +509,19 @@ def write_out_clusters(clusdir, clus_assignments, all_coords, all_pdbpaths,
             moved_cg_coords, moved_cg_vdmbb_coords = write_out_first_pdb(mobile, 
                      target, clusmem_pr_obj, clusmem_pdb_outpath, 
                      clusmem_cg_coords, clusmem_cg_vdmbb_coords)
-            first_pdb_cg_coords = moved_cg_coords
+            _cg_coords = moved_cg_coords
             first_pdb_cg_vdmbb_coords = moved_cg_vdmbb_coords
          else:
             # now, align cg+vdmbb on the first pdb that was output
             write_out_subsequent_clus_pdbs(clusmem_cg_vdmbb_coords, clusmem_pr_obj, 
-                           clusmem_pdb_outpath, first_pdb_cg_vdmbb_coords)
-
-
+                           clusmem_pdb_outpath, first_pdb_cg_vdmbb_coords, weights)
 
 def write_out_subsequent_clus_pdbs(clusmem_cg_vdmbb_coords, clusmem_pr_obj, 
-                                   clusmem_pdb_outpath, first_pdb_cg_vdmbb_coords):
+                                   clusmem_pdb_outpath, first_pdb_cg_vdmbb_coords, weights=None):
+   if weights is None:
+      weights = np.array([1/len(clusmem_cg_vdmbb_coords) for i in clusmem_cg_vdmbb_coords])
    moved_cg_vdmbb_coords, cg_vdmbb_transf = pr.superpose(clusmem_cg_vdmbb_coords,
-            first_pdb_cg_vdmbb_coords, weights=np.array([20,20,20,20,20,1,1,1]))
+            first_pdb_cg_vdmbb_coords, weights=weights)
    pr_obj_copy = clusmem_pr_obj.copy() # b/c of mutability
    pr.applyTransformation(cg_vdmbb_transf, pr_obj_copy)
    pr.writePDB(clusmem_pdb_outpath, pr_obj_copy)
@@ -547,7 +547,7 @@ def write_out_subsequent_clus_pdbs(clusmem_cg_vdmbb_coords, clusmem_pr_obj,
                # solutions will near-equivalent rmsds that place the vdms 
                # elsewhere. however, the output pdb should be aligned on CG only.
                moved_coords_cg_vdmbb, transf_cg_vdmbb = pr.superpose(
-                  clusmem_cg_vdmbb_coords
+                  clusmem_cg_vdmbb_coords WEIGHTS?
                )
                rmsd = pr.calcRMSD(moved_coords, target)
                if best_rmsd is None:
@@ -567,28 +567,138 @@ def get_clus_pdb_outpath(clusnum, clusnum_dir, pdbpath, scrr_cg_perm):
     scrrs, perm = scrr_cg_perm
     perm = perm.removeprefix('cg_perm_')
     vdg_scrr_str = '_'.join(['_'.join([str(z) for z in v_s]) for v_s in scrrs])
-    pdb_str = f'clus{clusnum}_{pdbname}_{vdg_scrr_str}_CGperm{perm}.pdb'
+    pdb_str = f'clus{clusnum}_{pdbname}_{vdg_scrr_str}_CGperm{perm}.pdb.gz'
     return os.path.join(clusnum_dir, pdb_str)
 
 def write_out_first_pdb(mobile, target, pr_obj, outpath, clusmem_cg_coords,
                         clusmem_cg_vdmbb_coords):
-    mobile, target = np.array(mobile), np.array(target)
-    moved_3atom_coords, transf = pr.superpose(mobile, target)
-    pr_obj_copy = pr_obj.copy() # b/c of mutability
-    pr.applyTransformation(transf, pr_obj_copy)
-    moved_cg_vdmbb_coords = pr.applyTransformation(transf, clusmem_cg_vdmbb_coords)
-    pr.writePDB(outpath, pr_obj_copy)
-    # superposed on 3 reference atoms, but need to return coords of the entire CG.
-    moved_cg_coords = pr.applyTransformation(transf, clusmem_cg_coords)
-    return moved_cg_coords, moved_cg_vdmbb_coords
+   # No weights because it's only aligning 3 atoms of CG
+   mobile, target = np.array(mobile), np.array(target)
+   moved_3atom_coords, transf = pr.superpose(mobile, target)
+   pr_obj_copy = pr_obj.copy() # b/c of mutability
+   pr.applyTransformation(transf, pr_obj_copy)
+   moved_cg_vdmbb_coords = pr.applyTransformation(transf, clusmem_cg_vdmbb_coords)
+   pr.writePDB(outpath, pr_obj_copy)
+   # superposed on 3 reference atoms, but need to return coords of the entire CG.
+   moved_cg_coords = pr.applyTransformation(transf, clusmem_cg_coords)
+   return moved_cg_coords, moved_cg_vdmbb_coords
 
-#def transform_and_write(pr_obj, transf, outpath):
-#   pr_obj_copy = pr_obj.copy() # b/c of mutability
-#   pr.applyTransformation(transf, pr_obj_copy)
-#   pr.writePDB(outpath, pr_obj_copy)
-#
-#def align_perm(mobile, target):
-#    mobile, target = np.array(mobile), np.array(target)
-#    moved_coords, transf = pr.superpose(mobile, target)
-#    return moved_coords, transf
-#
+def rewrite_temp_clusters(clusdir):
+   # Clean up the cluster directory by merging degenerate vdGs (based on diff
+   # AA perms and CG perms of the same PDB), deleting degenerate pdbs/clusters, 
+   # reassigning cluster nums (and sort by cluster size, and removing the temp dir
+   # when everything is done (outside this function). 
+   # Must merge before deleting duplicates b/c need the duplicate names to determine 
+   # which clusters are equivalent.
+   
+   temp_clus_assignments = get_temp_clus_assignments(clusdir)
+   temp_clus_assignments = merge_equivalent_clusters(temp_clus_assignments)
+   pruned_clusters = delete_redun_vdgs(temp_clus_assignments)
+   reassigned = reassign_temp_clusters(pruned_clusters)
+
+   # Move the deduplicated and reassigned PDBs to the new clus dir.
+   new_clusdir = [i for i in clusdir.split('/') if i != 'temp']
+   new_clusdir = '/'.join(new_clusdir)
+   os.makedirs(new_clusdir)
+   print(new_clusdir)
+   for new_clusnum, vdgs in reassigned.items():
+      for vdg in vdgs:
+         pdbbase, vdmscrrs, vdgpath = vdg
+         # rename the pdb for clarity
+         scrr_str = '_'.join(['_'.join([str(z) for z in v_s]) for v_s in vdmscrrs])
+         new_pdbname = f'clus{new_clusnum}_{pdbbase}_{scrr_str}.pdb.gz'
+         os.rename(vdgpath, os.path.join(new_clusdir, new_pdbname))
+         
+def determine_redundant_temp_vdg(already_seen_temp_vdgs, 
+                                 candidate_pdbbase, candidate_scrr):
+   # Return True if the candidate vdg has already been seen.
+   for a in already_seen_temp_vdgs:
+      seen_pdbbase = a[0]
+      seen_scrr = a[1]
+      if candidate_pdbbase == seen_pdbbase and candidate_scrr == seen_scrr:
+         return True
+   return False
+
+def determine_cluster_redundancy(clusnumA_vdgs, clusnumB_vdgs): 
+   # Return yes if the vdg in clus A is in clus B
+   for vdgA in clusnumA_vdgs:
+      vdgA_pdbbase, vdgA_sorted_scrrs, vdgA_pdbpath = vdgA
+      for vdgB in clusnumB_vdgs:
+         vdgB_pdbbase, vdgB_sorted_scrrs, vdgB_pdbpath = vdgB
+         if vdgA_pdbbase == vdgB_pdbbase and vdgA_sorted_scrrs == vdgB_sorted_scrrs:
+            return True
+   return False
+
+
+def get_temp_clus_assignments(clusdir):
+   temp_clus_assignments = {} # key = clusnum, val = pdb w/ sorted scrrs
+   for clusnum in os.listdir(clusdir):
+      clusnumdir = os.path.join(clusdir, clusnum)
+      for pdb in os.listdir(clusnumdir):
+         pdb_base = pdb.split('.pdb.gz')[0]
+         pdb_base = '_'.join(pdb_base.split('_')[1:]) # removes "clus{x}_" from name
+         scrrs = pdb.split('.pdb.gz_')[1].removesuffix('.pdb.gz')
+         scrrs = scrrs.split('_CGperm')[0]
+         scrrs = scrrs.split('_')
+         assert len(scrrs) % 4 == 0
+         grouped_scrrs = [scrrs[i:i+4] for i in range(0, len(scrrs), 4)]
+         sorted_scrrs = sorted(grouped_scrrs)
+         vdg = tuple([pdb_base, sorted_scrrs, os.path.join(clusnumdir, pdb)]) # determine 
+            # redundancy just on pdb_base and sorted_scrrs, but record pdb path so that 
+            # one file can be referenced for copying over to a clean cluster dir.
+         if clusnum not in temp_clus_assignments.keys():
+            temp_clus_assignments[clusnum] = []
+         if vdg not in temp_clus_assignments[clusnum]:
+            temp_clus_assignments[clusnum].append(vdg)
+   return temp_clus_assignments
+
+def merge_equivalent_clusters(temp_clus_assignments):
+   # After gathering all the pdb and sorted scrrs, find the degenerate vdGs and merge them.
+   already_seen_temp_clusnum_A = []
+   clusnumbers = list(temp_clus_assignments.keys())
+   for clusnumA in clusnumbers:
+      if clusnumA not in temp_clus_assignments.keys(): # b/c dict dynamically changing
+         continue
+      clusnumA_vdgs = temp_clus_assignments[clusnumA]
+      already_seen_temp_clusnum_A.append(clusnumA)
+      for clusnumB in clusnumbers:
+         if clusnumA == clusnumB:
+            continue
+         if clusnumB not in temp_clus_assignments.keys(): # b/c dict dynamically changing
+            continue
+         if clusnumB in already_seen_temp_clusnum_A:
+            continue # ensures that only the upper triangle is calculated 
+         clusnumB_vdgs = temp_clus_assignments[clusnumB]
+         # Are any of clusnumA vdgs in clusnumB?
+         if determine_cluster_redundancy(clusnumA_vdgs, clusnumB_vdgs): 
+            # If so, merge the clusters
+            temp_clus_assignments[clusnumA] += temp_clus_assignments[clusnumB]
+            del temp_clus_assignments[clusnumB]
+   return temp_clus_assignments
+
+def delete_redun_vdgs(temp_clus_assignments):
+   # Next, delete the redundant vdgs
+   already_seen_temp_vdgs = []
+   pruned_clusters = {}
+   for clusnum, vdgs in temp_clus_assignments.items():
+      for _ind, vdg in enumerate(vdgs):
+         pdbbase, scrr, pdbpath = vdg
+         if determine_redundant_temp_vdg(already_seen_temp_vdgs, pdbbase, scrr):
+            continue
+         else:
+            already_seen_temp_vdgs.append(vdg)
+            # add to pruned_clusters
+            if clusnum not in pruned_clusters.keys():
+               pruned_clusters[clusnum] = []
+            pruned_clusters[clusnum].append(vdg)
+   return pruned_clusters
+
+def reassign_temp_clusters(pruned_clusters):
+   # Reassign cluster numbers, sorting cluster numbers based on size
+   reassigned = {}
+   sorted_clusters = sorted(pruned_clusters.keys(), 
+                                key=lambda k: len(pruned_clusters[k]), reverse=True)
+   for new_clusnum, old_clusnum in enumerate(sorted_clusters, start=1):
+      reassigned[new_clusnum] = pruned_clusters[old_clusnum]
+
+   return reassigned

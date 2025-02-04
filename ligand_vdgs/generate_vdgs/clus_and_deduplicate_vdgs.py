@@ -34,6 +34,12 @@ def parse_args():
                         help="Directory for the vdms of this CG.")
     parser.add_argument('-o', "--output-clus-pdbs", action='store_true', 
                         help="Output clustered PDBs.")
+    parser.add_argument('-w', "--align-cg-weight", type=float, default=0.99, 
+                        help="Fraction of weights to assign to CG atoms (collectively) "
+                        "when superposing output vdGs. Not weights for clustering. "
+                        "Example: 0.5 means 1/2 of weight is assigned to CG atoms and "
+                        "the remaining 1/2 goes to the vdM backbone atoms. This arg "
+                        "is only used when the -o flag is used.")
     parser.add_argument('-q', "--seq", default=0.50,
                         help="Sequence similarity threshold for clustering sequences "
                         "flanking the vdM to determine redundancy. This should be a "
@@ -47,6 +53,9 @@ def parse_args():
                         'atoms on which clustering is to be performed. If provided, '
                         'should have the same length as idxs. If not provided, the '
                         'atoms are assumed to be symmetrically inequivalent.')
+    parser.add_argument('-n', '--size-subset', type=int, 
+                        help='Specify the number of residues in the vdG subset. '
+                        'The purpose of this arg is for parallelization.')
     parser.add_argument('-l', "--logfile", help="Path to log file.")
     
     return parser.parse_args()
@@ -97,14 +106,20 @@ def main():
    seq_sim_thresh = args.seq
    num_flanking = args.flank
    symmetry_classes = args.symmetry_classes
+   size_subset = args.size_subset
+   if size_subset not in [1, 2, 3, 4]:
+      raise ValueError('size_subset must be an integer between 1 and 4.')
    logfile = args.logfile
    output_clus_pdbs = args.output_clus_pdbs
-   print()
-   print('output_clus_pdbs:', output_clus_pdbs)
+   align_cg_weight = args.align_cg_weight
+   if align_cg_weight < 0 or align_cg_weight > 1:
+      raise ValueError('align_cg_weight must be a float between 0 and 1.')
    vdglib_dir = args.vdglib_dir
    vdg_pdbs_dir = os.path.join(vdglib_dir, 'vdg_pdbs')
    out_dir = os.path.join(vdglib_dir, 'nr_vdgs')
+   ''' Comment out to jump to cluster reassignment
    utils.handle_existing_files(out_dir)
+   '''
 
    with open(logfile, 'a') as file:
         file.write(f"{'='*20} Starting deduplicate_reun_vdgs.py run {'='*20} \n")
@@ -139,21 +154,26 @@ def main():
             re_ordered_bbcoords, re_ordered_flankingseqs, re_ordered_CAs, 
             re_ordered_scrr, cg_coords, pdbpath)
    
-   # Evaluate the complete collection of vdGs and determine redundancy 
+   # Evaluate the complete collection of vdGs (of size_subset) and determine redundancy 
    all_nr_vdgs = []
    for num_vdms_in_subset, _subsets in vdm_combos.items():
+      if num_vdms_in_subset != size_subset:
+         continue
       for _reordered_AAs, _vdgs in _subsets.items():
+         print()
+         print(_reordered_AAs)
          # vdG subsets that have identical vdm AA compositions may be redundant.
-         if len(_vdgs) <= 1: # Automatically not reundant b/c no other vdgs have 
-                             # this vdm combo
-            single_vdg = _vdgs[0]
-            all_nr_vdgs.append(single_vdg)
-         else:
-            nr_vdgs = get_nr_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, 
-                  _reordered_AAs, symmetry_classes, output_clus_pdbs, vdglib_dir)
-            for n_v in nr_vdgs:
-               all_nr_vdgs.append(n_v)
+         if len(_vdgs) == 1:
+            print('ONLY ONE VDG OF THIS AA COMPOSITION.', _reordered_AAs)
+            print(_vdgs[0][4])
+            print(_vdgs[0][5])
+         nr_vdgs = get_nr_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, 
+               _reordered_AAs, symmetry_classes, output_clus_pdbs, vdglib_dir,
+               align_cg_weight)
+         for n_v in nr_vdgs:
+            all_nr_vdgs.append(n_v)
    
+   assert False
    # There are many duplicates in `nr_vdgs`, because different AA permutations of 
    # vdms in the same binding site will end up in different clusters, therefore 
    # appearing to be unique. The last step is to account for these duplicates by 
@@ -236,7 +256,8 @@ def write_vdg_subset(pdbcode, vdg_scrr_cg_perm, vdg_scrr_str, pr_obj, out_dir):
    pr.writePDB(outputpath, pr_obj)
 
 def get_nr_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs, 
-                                symmetry_classes, output_clus_pdbs, vdglib_dir):
+                                symmetry_classes, output_clus_pdbs, vdglib_dir,
+                                align_cg_weight):
    # vdG subsets that have identical vdm AA compositions may be redudant.
    # First, get all AA permutations for equivalent AAs. For example, if the vdms are 
    # [Ala1, Ala2, Glu], then we need to sample [Ala1, Ala2, Glu] and [Ala2, Ala1, 
@@ -275,16 +296,41 @@ def get_nr_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
    cgvdmbb_cluster_assignments = clust.get_hierarchical_clusters(
       all_cg_and_vdmbb_coords, rmsd_cut, None_in_coords=True) 
 
-   if output_clus_pdbs:
-      clusdir = os.path.join(
-         vdglib_dir, 'clusters', 'temp', 'cgvdmbb', str(len(reordered_AAs)), 
-         '_'.join(reordered_AAs)) # temp bc need to be reassigned
-                                          # to handle degenerate binding sites
-      utils.handle_existing_files(clusdir)
-      clust.write_out_clusters(clusdir, cgvdmbb_cluster_assignments, 
-         all_AA_cg_perm_cg_coords, all_AA_cg_perm_pdbpaths, 
-         all_AA_cg_perm_vdm_scrr_cg_perm, symmetry_classes, 
-         all_cg_and_vdmbb_coords)
+   clusdir = os.path.join(
+      vdglib_dir, 'clusters', 'temp', 'cgvdmbb', str(len(reordered_AAs)), 
+      '_'.join(reordered_AAs)) # temp bc need to be reassigned
+                                       # to handle degenerate binding sites
+   utils.handle_existing_files(clusdir)
+   num_cg_atoms = len(all_AA_cg_perm_cg_coords[0])
+   cg_weights_arr = np.array([align_cg_weight/num_cg_atoms for i in range(num_cg_atoms)])
+   align_vdmbb_weight = 1-align_cg_weight
+   num_bb_atoms = num_coords - num_cg_atoms
+   vdmbb_weights_arr = np.array([align_vdmbb_weight/num_bb_atoms 
+                                 for i in range(num_bb_atoms)])
+   weights = np.concatenate((cg_weights_arr, vdmbb_weights_arr))
+   weights = weights.reshape((num_coords, 1))
+   if not np.abs(weights.sum() - 1.) < 1e-8:
+      raise ValueError('Weights do not sum to 1.')
+
+   clust.write_out_clusters(clusdir, cgvdmbb_cluster_assignments, 
+      all_AA_cg_perm_cg_coords, all_AA_cg_perm_pdbpaths, 
+      all_AA_cg_perm_vdm_scrr_cg_perm, symmetry_classes, 
+      all_cg_and_vdmbb_coords, weights)
+   
+   # Clean up the cluster directory by merging degenerate vdGs (based on diff
+   # AA perms and CG perms of the same PDB), deleting degenerate pdbs/clusters, 
+   # reassigning cluster nums (and sort by cluster size, and removing the temp dir. 
+   # when everything in clusters/temp is fully reassigned.
+   # Must merge before deleting duplicates b/c need the duplicate names to determine 
+   # which clusters are equivalent.
+   ''' WHEN DONE TESTING COMMENT OUT clusdir = os.path.join(...)
+   '''
+   clusdir = os.path.join(
+      vdglib_dir, 'clusters', 'temp', 'cgvdmbb', str(len(reordered_AAs)), 
+      '_'.join(reordered_AAs)) # temp bc need to be reassigned
+   clust.rewrite_temp_clusters(clusdir)
+   return False
+
 
    nr_vdgs = []
    for cgvdmbb_clusnum, indices_of_elements_in_cg_vdmbb_cluster in \
@@ -311,98 +357,98 @@ def get_nr_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
          nr_vdgs.append(vdg_descript)
          continue
 
-      # Otherwise, if there's >1 element in the cluster, it's possible that the vdgs 
-      # within this cluster are redundant. Next thing to look at is rmsd of those 
-      # flanking bb stretches. Align and cluster.
-      flattened_flankingCAs_for_vdgs_in_cgvdmbb_cluster = []
-      for vdg_flankingCAs in cgvdmbb_clus_flankingCAs:
-         # `vdg_flankingCAs` is a list of vdm residues, so flatten it
-         flat_flanking_CAs = []
-         for res in vdg_flankingCAs:
-            for CA_coord in res:
-               flat_flanking_CAs.append(CA_coord)
-         flattened_flankingCAs_for_vdgs_in_cgvdmbb_cluster.append(flat_flanking_CAs)
-      # Cluster the vdgs in `flattened_flankingCAs_for_vdgs_in_cgvdmbb_cluster`. In 
-      # order to calculate rmsd for clustering, take care of the instances where 
-      # coordinates are represented as "None" because the stretch of +/- 5 AAs was 
-      # missing N-terminal or C-terminal residues. Only select residues that have CA 
-      # coords in both of the vdgs whose rmsd is being calculated.
-      flankingbb_cluster_assignments = clust.get_hierarchical_clusters(
-         flattened_flankingCAs_for_vdgs_in_cgvdmbb_cluster, None_in_coords=True)
-      for flankingCAs_clusnum, indices_of_elements_in_flankingCAs_cluster in \
-         flankingbb_cluster_assignments.items():
-         # For each cluster determined by rmsd between CA coords flanking the vdms, 
-         # gather the vdg features (cg coords, vdmbb coords, etc.) corresponding to 
-         # the vdgs belonging in that cluster. The vdgs are called based on their 
-         # indices within the clusters defined in the first step, when the rmsds of 
-         # cg + vdm bbs were being compared.
-         flankingCAs_clus_cg_coords, flankingCAs_clus_vdmbb_coords, \
-            flankingCAs_clus_flankingseqs, flankingCAs_clus_flankingCAs, \
-            flankingCAs_clus_pdbpaths, flankingCAs_clus_vdm_scrr_cg_perm = \
-            clust.elements_in_clusters(indices_of_elements_in_flankingCAs_cluster, 
-            cgvdmbb_clus_cg_coords, cgvdmbb_clus_vdmbb_coords, 
-            cgvdmbb_clus_flankingseqs, cgvdmbb_clus_flankingCAs,
-            cgvdmbb_clus_pdbpaths, cgvdmbb_clus_vdm_scrr_cg_perm)
-
-         # If there's only 1 element in the cluster, then it's automatically 
-         # nonredundant b/c its binding site backbone doesn't match any other vdG's 
-         # binding site
-         if len(indices_of_elements_in_flankingCAs_cluster) <= 1:
-            vdg_descript = [flankingCAs_clus_cg_coords[0], 
-            flankingCAs_clus_vdmbb_coords[0], flankingCAs_clus_flankingseqs[0], 
-            flankingCAs_clus_flankingCAs[0], flankingCAs_clus_pdbpaths[0], 
-            flankingCAs_clus_vdm_scrr_cg_perm[0]] # these 6 define a vdg
-            nr_vdgs.append(vdg_descript)
-            continue
-
-         # Otherwise, if there's more than 1 element in the cluster, it's possible 
-         # that the vdgs within this cluster are redundant. Next metric to cluster on 
-         # is sequence dissimilarity of the residues +/- of the vdms.
-         flattened_flankingseqs_for_vdgs_in_flankingCA_clus = []
-         
-         for vdg_flankingseq in flankingCAs_clus_flankingseqs:
-            flat_vdg_flankingseq = []
-            for vdm_res in vdg_flankingseq:
-               flat_vdg_flankingseq += vdm_res
-            flattened_flankingseqs_for_vdgs_in_flankingCA_clus.append(
-               flat_vdg_flankingseq)
-         seqsim_clus_assignments = clust.get_hierarchical_clusters(
-            flattened_flankingseqs_for_vdgs_in_flankingCA_clus, 
-            seq_sim_thresh=seq_sim_thresh)
-         # If the vdgs belong in the same cluster based on sequence similarity (and 
-         # therefore backbones and cg+vdmbb binding pose), then the vdgs are 
-         # redundant. Select only one to add to the `nr_vdgs` list.
-         for seqsim_clusnum, indices_of_elements_in_flankingseq_clus in \
-            seqsim_clus_assignments.items():
-            flankingseq_clus_cg_coords, flankingseq_clus_vdmbb_coords, \
-               flankingseq_clus_flankingseqs, flankingseq_clus_flankingCAs, \
-               flankingseq_clus_pdbpaths, flankingseq_clus_vdm_scrr_cg_perm = \
-               clust.elements_in_clusters(indices_of_elements_in_flankingseq_clus, \
-               flankingCAs_clus_cg_coords, flankingCAs_clus_vdmbb_coords, \
-               flankingCAs_clus_flankingseqs, flankingCAs_clus_flankingCAs, \
-               flankingCAs_clus_pdbpaths, flankingCAs_clus_vdm_scrr_cg_perm)
-           
-            if len(indices_of_elements_in_flankingseq_clus) <= 1:
-               vdg_descript = [flankingseq_clus_cg_coords[0], 
-               flankingseq_clus_vdmbb_coords[0], flankingseq_clus_flankingseqs[0],
-               flankingseq_clus_flankingCAs[0], flankingseq_clus_pdbpaths[0], 
-               flankingseq_clus_vdm_scrr_cg_perm[0]]
-               nr_vdgs.append(vdg_descript)
-            
-            else: # select only one, so use index 0 for 
-                  # indices_of_elements_in_flankingseq_clus
-               flankingseq_clus_cg_coords, flankingseq_clus_vdmbb_coords, \
-               flankingseq_clus_flankingseqs, flankingseq_clus_flankingCAs, \
-               flankingseq_clus_pdbpaths, flankingseq_clus_vdm_scrr_cg_perm = \
-               clust.elements_in_clusters([0], \
-               flankingCAs_clus_cg_coords, flankingCAs_clus_vdmbb_coords, \
-               flankingCAs_clus_flankingseqs, flankingCAs_clus_flankingCAs, \
-               flankingCAs_clus_pdbpaths, flankingCAs_clus_vdm_scrr_cg_perm)
-               vdg_descript = [flankingseq_clus_cg_coords[0], 
-                  flankingseq_clus_vdmbb_coords[0], flankingseq_clus_flankingseqs[0],
-                  flankingseq_clus_flankingCAs[0], flankingseq_clus_pdbpaths[0], 
-                  flankingseq_clus_vdm_scrr_cg_perm[0]]
-               nr_vdgs.append(vdg_descript)
+#      # Otherwise, if there's >1 element in the cluster, it's possible that the vdgs 
+#      # within this cluster are redundant. Next thing to look at is rmsd of those 
+#      # flanking bb stretches. Align and cluster.
+#      flattened_flankingCAs_for_vdgs_in_cgvdmbb_cluster = []
+#      for vdg_flankingCAs in cgvdmbb_clus_flankingCAs:
+#         # `vdg_flankingCAs` is a list of vdm residues, so flatten it
+#         flat_flanking_CAs = []
+#         for res in vdg_flankingCAs:
+#            for CA_coord in res:
+#               flat_flanking_CAs.append(CA_coord)
+#         flattened_flankingCAs_for_vdgs_in_cgvdmbb_cluster.append(flat_flanking_CAs)
+#      # Cluster the vdgs in `flattened_flankingCAs_for_vdgs_in_cgvdmbb_cluster`. In 
+#      # order to calculate rmsd for clustering, take care of the instances where 
+#      # coordinates are represented as "None" because the stretch of +/- 5 AAs was 
+#      # missing N-terminal or C-terminal residues. Only select residues that have CA 
+#      # coords in both of the vdgs whose rmsd is being calculated.
+#      flankingbb_cluster_assignments = clust.get_hierarchical_clusters(
+#         flattened_flankingCAs_for_vdgs_in_cgvdmbb_cluster, None_in_coords=True)
+#      for flankingCAs_clusnum, indices_of_elements_in_flankingCAs_cluster in \
+#         flankingbb_cluster_assignments.items():
+#         # For each cluster determined by rmsd between CA coords flanking the vdms, 
+#         # gather the vdg features (cg coords, vdmbb coords, etc.) corresponding to 
+#         # the vdgs belonging in that cluster. The vdgs are called based on their 
+#         # indices within the clusters defined in the first step, when the rmsds of 
+#         # cg + vdm bbs were being compared.
+#         flankingCAs_clus_cg_coords, flankingCAs_clus_vdmbb_coords, \
+#            flankingCAs_clus_flankingseqs, flankingCAs_clus_flankingCAs, \
+#            flankingCAs_clus_pdbpaths, flankingCAs_clus_vdm_scrr_cg_perm = \
+#            clust.elements_in_clusters(indices_of_elements_in_flankingCAs_cluster, 
+#            cgvdmbb_clus_cg_coords, cgvdmbb_clus_vdmbb_coords, 
+#            cgvdmbb_clus_flankingseqs, cgvdmbb_clus_flankingCAs,
+#            cgvdmbb_clus_pdbpaths, cgvdmbb_clus_vdm_scrr_cg_perm)
+#
+#         # If there's only 1 element in the cluster, then it's automatically 
+#         # nonredundant b/c its binding site backbone doesn't match any other vdG's 
+#         # binding site
+#         if len(indices_of_elements_in_flankingCAs_cluster) <= 1:
+#            vdg_descript = [flankingCAs_clus_cg_coords[0], 
+#            flankingCAs_clus_vdmbb_coords[0], flankingCAs_clus_flankingseqs[0], 
+#            flankingCAs_clus_flankingCAs[0], flankingCAs_clus_pdbpaths[0], 
+#            flankingCAs_clus_vdm_scrr_cg_perm[0]] # these 6 define a vdg
+#            nr_vdgs.append(vdg_descript)
+#            continue
+#
+#         # Otherwise, if there's more than 1 element in the cluster, it's possible 
+#         # that the vdgs within this cluster are redundant. Next metric to cluster on 
+#         # is sequence dissimilarity of the residues +/- of the vdms.
+#         flattened_flankingseqs_for_vdgs_in_flankingCA_clus = []
+#         
+#         for vdg_flankingseq in flankingCAs_clus_flankingseqs:
+#            flat_vdg_flankingseq = []
+#            for vdm_res in vdg_flankingseq:
+#               flat_vdg_flankingseq += vdm_res
+#            flattened_flankingseqs_for_vdgs_in_flankingCA_clus.append(
+#               flat_vdg_flankingseq)
+#         seqsim_clus_assignments = clust.get_hierarchical_clusters(
+#            flattened_flankingseqs_for_vdgs_in_flankingCA_clus, 
+#            seq_sim_thresh=seq_sim_thresh)
+#         # If the vdgs belong in the same cluster based on sequence similarity (and 
+#         # therefore backbones and cg+vdmbb binding pose), then the vdgs are 
+#         # redundant. Select only one to add to the `nr_vdgs` list.
+#         for seqsim_clusnum, indices_of_elements_in_flankingseq_clus in \
+#            seqsim_clus_assignments.items():
+#            flankingseq_clus_cg_coords, flankingseq_clus_vdmbb_coords, \
+#               flankingseq_clus_flankingseqs, flankingseq_clus_flankingCAs, \
+#               flankingseq_clus_pdbpaths, flankingseq_clus_vdm_scrr_cg_perm = \
+#               clust.elements_in_clusters(indices_of_elements_in_flankingseq_clus, \
+#               flankingCAs_clus_cg_coords, flankingCAs_clus_vdmbb_coords, \
+#               flankingCAs_clus_flankingseqs, flankingCAs_clus_flankingCAs, \
+#               flankingCAs_clus_pdbpaths, flankingCAs_clus_vdm_scrr_cg_perm)
+#           
+#            if len(indices_of_elements_in_flankingseq_clus) <= 1:
+#               vdg_descript = [flankingseq_clus_cg_coords[0], 
+#               flankingseq_clus_vdmbb_coords[0], flankingseq_clus_flankingseqs[0],
+#               flankingseq_clus_flankingCAs[0], flankingseq_clus_pdbpaths[0], 
+#               flankingseq_clus_vdm_scrr_cg_perm[0]]
+#               nr_vdgs.append(vdg_descript)
+#            
+#            else: # select only one, so use index 0 for 
+#                  # indices_of_elements_in_flankingseq_clus
+#               flankingseq_clus_cg_coords, flankingseq_clus_vdmbb_coords, \
+#               flankingseq_clus_flankingseqs, flankingseq_clus_flankingCAs, \
+#               flankingseq_clus_pdbpaths, flankingseq_clus_vdm_scrr_cg_perm = \
+#               clust.elements_in_clusters([0], \
+#               flankingCAs_clus_cg_coords, flankingCAs_clus_vdmbb_coords, \
+#               flankingCAs_clus_flankingseqs, flankingCAs_clus_flankingCAs, \
+#               flankingCAs_clus_pdbpaths, flankingCAs_clus_vdm_scrr_cg_perm)
+#               vdg_descript = [flankingseq_clus_cg_coords[0], 
+#                  flankingseq_clus_vdmbb_coords[0], flankingseq_clus_flankingseqs[0],
+#                  flankingseq_clus_flankingCAs[0], flankingseq_clus_pdbpaths[0], 
+#                  flankingseq_clus_vdm_scrr_cg_perm[0]]
+#               nr_vdgs.append(vdg_descript)
               
    return nr_vdgs 
 
