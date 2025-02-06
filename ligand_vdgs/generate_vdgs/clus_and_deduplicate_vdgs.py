@@ -164,8 +164,8 @@ def main():
             print('ONLY ONE VDG OF THIS AA COMPOSITION.', _reordered_AAs)
             print(_vdgs[0][4])
             print(_vdgs[0][5])
-         nr_vdgs = get_nr_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, 
-               _reordered_AAs, symmetry_classes, vdglib_dir, align_cg_weight)
+         nr_vdgs = get_nr_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, _reordered_AAs, 
+                           symmetry_classes, vdglib_dir, align_cg_weight, num_flanking)
          for n_v in nr_vdgs:
             all_nr_vdgs.append(n_v)
    
@@ -244,7 +244,7 @@ def isolate_vdg_subset_obj(pdbcode, vdg_scrr_cg_perm, vdg_pdbs_dir):
    return pr_obj
 
 def get_nr_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs, 
-                                symmetry_classes, vdglib_dir, align_cg_weight):
+                  symmetry_classes, vdglib_dir, align_cg_weight, num_flanking):
    # vdG subsets that have identical vdm AA compositions may be redudant.
    # First, get all AA permutations for equivalent AAs. For example, if the vdms are 
    # [Ala1, Ala2, Glu], then we need to sample [Ala1, Ala2, Glu] and [Ala2, Ala1, 
@@ -292,10 +292,15 @@ def get_nr_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
    utils.handle_existing_files(cgvdmbb_clusdir)
    cgvdmbb_weights = clust.get_weights(num_cg_atoms, num_vdmbb_atoms, align_cg_weight)
    
-   clust.write_out_clusters(cgvdmbb_clusdir, cgvdmbb_cluster_assignments, 
-      cgvdmbb_clus_centroids, all_AA_cg_perm_cg_coords, all_AA_cg_perm_pdbpaths, 
-      all_AA_cg_perm_vdm_scrr_cg_perm, symmetry_classes, all_AA_cg_perm_cg_and_vdmbb_coords, 
-      all_AA_cg_perm_flankingCAs, cgvdmbb_weights, cluster_level='cgvdmbb')
+   
+   first_pdb_out = None # update with pdb name of first pdb that's output for ref
+   first_pdb_cg_vdmbb_coords = False 
+   
+   first_pdb_out, first_pdb_cg_vdmbb_coords = clust.write_out_clusters(cgvdmbb_clusdir, 
+      cgvdmbb_cluster_assignments, cgvdmbb_clus_centroids, all_AA_cg_perm_cg_coords, 
+      all_AA_cg_perm_pdbpaths, all_AA_cg_perm_vdm_scrr_cg_perm, symmetry_classes, 
+      all_AA_cg_perm_cg_and_vdmbb_coords, all_AA_cg_perm_flankingCAs, num_flanking, 
+      first_pdb_out, first_pdb_cg_vdmbb_coords, cgvdmbb_weights, cluster_level='cgvdmbb')
    
    # Clean up the cluster directory by merging degenerate vdGs (based on diff
    # AA perms and CG perms of the same PDB), deleting degenerate pdbs/clusters, 
@@ -304,9 +309,8 @@ def get_nr_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
    # Must merge before deleting duplicates b/c need the duplicate names to determine 
    # which clusters are equivalent.
    reassigned_clusvdmbb_clus = clust.rewrite_temp_clusters(cgvdmbb_clusdir)
-   reformatted_reassigned_clusvdmbb_clus = clust.reformat_reassigned_clus(reassigned_clusvdmbb_clus)
-
-
+   reformatted_reassigned_clusvdmbb_clus = clust.reformat_reassigned_clus(
+      reassigned_clusvdmbb_clus)
 
    nr_vdgs = []
    for cgvdmbb_clusnum, indices_of_elements_in_cg_vdmbb_cluster in \
@@ -322,11 +326,6 @@ def get_nr_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
          all_AA_cg_perm_flankingseqs, all_AA_cg_perm_flankingCAs, all_AA_cg_perm_pdbpaths, 
          all_AA_cg_perm_vdm_scrr_cg_perm)
       
-      print('cgvdmbb clusnum', cgvdmbb_clusnum)
-      if len(indices_of_elements_in_cg_vdmbb_cluster) <= 1:
-         print('\t THERE IS ONLY ONE VDG FOR CGVDMBB CLUSNUM', cgvdmbb_clusnum) 
-         print(all_AA_cg_perm_pdbpaths[indices_of_elements_in_cg_vdmbb_cluster[0]]) 
-
       # Next thing to look at is rmsd of those flanking bb stretches. Align and cluster.
       cgvdmbb_clus_flat_flankCAs = []
       for vdg_flankingCAs in cgvdmbb_clus_flankingCAs:
@@ -355,23 +354,17 @@ def get_nr_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
                                                       # degenerate binding sites
       utils.handle_existing_files(flankbb_clusdir_for_this_cgvdmbb_clus)
 
-      clust.write_out_clusters(flankbb_clusdir_for_this_cgvdmbb_clus, 
-         flankingbb_cluster_assignments, flankingbb_clus_centroids, 
-         cgvdmbb_clus_cg_coords, cgvdmbb_clus_pdbpaths, cgvdmbb_clus_vdm_scrr_cg_perm, 
-         symmetry_classes, cgvdmbb_clus_cgvdmbb_coords, cgvdmbb_clus_flat_flankCAs, 
-         weights=None, cluster_level='flankbb')
+      first_pdb_out, first_pdb_cg_vdmbb_coords = clust.write_out_clusters(
+         flankbb_clusdir_for_this_cgvdmbb_clus, flankingbb_cluster_assignments, 
+         flankingbb_clus_centroids, cgvdmbb_clus_cg_coords, cgvdmbb_clus_pdbpaths, 
+         cgvdmbb_clus_vdm_scrr_cg_perm, symmetry_classes, cgvdmbb_clus_cgvdmbb_coords, 
+         cgvdmbb_clus_flat_flankCAs, num_flanking, first_pdb_out, 
+         first_pdb_cg_vdmbb_coords, weights=None, cluster_level='flankbb')
       
 ###      # Merge equivalent clusters, delete redundant pdbs/clusters, and reassign 
 ###      # cluster numbers.
 ###      reasiggned_sdfsd =clust.rewrite_temp_clusters(flankbb_clusdir) 
 ###      
-      
-      
-      
-      
-      
-
-      
       
       
 #      for flankingCAs_clusnum, indices_of_elements_in_flankingCAs_cluster in \
