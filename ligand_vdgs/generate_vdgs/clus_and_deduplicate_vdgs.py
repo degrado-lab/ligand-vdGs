@@ -126,6 +126,9 @@ def main():
       pdbpath = os.path.join(vdg_pdbs_dir, pdbname)
       prody_obj = pr.parsePDB(pdbpath)
       cg_coords = clust.get_cg_coords(prody_obj)
+      # define symmetry class if it's None so it's compatible with pdb output naming
+      if symmetry_classes is None:
+         symmetry_classes = [i for i in range(len(cg_coords))]
       # Characterize the vdM residues (bb coords, flanking residues, pdb paths, etc.)
       vdms_dict = clust.get_vdm_res_features(prody_obj, pdbpath, num_flanking)
       # Determine the vdM combinations, up to 4 residues
@@ -250,7 +253,7 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
    first_pdb_cg_vdmbb_coords = False 
    first_pdb_out, first_pdb_cg_vdmbb_coords = clust.write_out_clusters(cgvdmbb_clusdir, 
       cgvdmbb_cluster_assignments, cgvdmbb_clus_centroids, all_AA_cg_perm_cg_coords, 
-      all_AA_cg_perm_pdbpaths, all_AA_cg_perm_vdm_scrr_cg_perm, symmetry_classes, 
+      all_AA_cg_perm_pdbpaths, all_AA_cg_perm_vdm_scrr_cg_perm, 
       all_AA_cg_perm_cg_and_vdmbb_coords, all_AA_cg_perm_flankingCAs, num_flanking, 
       first_pdb_out, first_pdb_cg_vdmbb_coords, cgvdmbb_weights, cluster_level='cgvdmbb')
    
@@ -290,7 +293,7 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
       first_pdb_out, first_pdb_cg_vdmbb_coords = clust.write_out_clusters(
          flankbb_clusdir_for_this_cgvdmbb_clus, flankingbb_cluster_assignments, 
          flankingbb_clus_centroids, cgvdmbb_clus_cg_coords, cgvdmbb_clus_pdbpaths, 
-         cgvdmbb_clus_vdm_scrr_cg_perm, symmetry_classes, cgvdmbb_clus_cgvdmbb_coords, 
+         cgvdmbb_clus_vdm_scrr_cg_perm, cgvdmbb_clus_cgvdmbb_coords, 
          cgvdmbb_clus_flat_flankCAs, num_flanking, first_pdb_out, 
          first_pdb_cg_vdmbb_coords, weights=None, cluster_level='flankbb')
       
@@ -324,9 +327,9 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
          first_pdb_out, first_pdb_cg_vdmbb_coords = clust.write_out_clusters(
             flankseq_clusdir_for_this_flankingCAs_clus, seqsim_clus_assignments, 
             seqsim_clus_centroids, flankingCAs_clus_cg_coords, flankingCAs_clus_pdbpaths, 
-            flankingCAs_clus_vdm_scrr_cg_perm, symmetry_classes, 
-            flankingCAs_clus_cgvdmbb_coords, flankingCAs_clus_flat_flankCAs, 
-            num_flanking, first_pdb_out, first_pdb_cg_vdmbb_coords, weights=None, 
+            flankingCAs_clus_vdm_scrr_cg_perm, flankingCAs_clus_cgvdmbb_coords, 
+            flankingCAs_clus_flat_flankCAs, num_flanking, first_pdb_out, 
+            first_pdb_cg_vdmbb_coords, weights=None, 
             cluster_level='flankseq')
 
 def normalize_rmsd(num_atoms):

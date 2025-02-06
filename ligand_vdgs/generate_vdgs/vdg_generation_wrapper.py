@@ -26,6 +26,9 @@ def parse_args():
                         help="Number of PDBs to process in a trial run used to "
                         "determine if smarts_to_cgs.py can run to completion "
                         "without errors.")
+    parser.add_argument('--symmetry-classes', nargs='+', type=str,
+                        help='Integers representing the symmetry classes of the CG '
+                        'atoms on which clustering is to be performed.')
     return parser.parse_args()
 
 
@@ -37,6 +40,9 @@ def main():
     probe_dir = args.probe_dir
     out_dir = args.out_dir
     trial_run = args.trial_run
+    symm_classes = args.symmetry_classes
+    if symm_classes is not None:
+        symm_classes = ' '.join(symm_classes)
 
     if not cg: 
         cg = smarts
@@ -74,11 +80,16 @@ def main():
     to_pdbs_cmd = f'python ligand_vdgs/programs/vdG-miner/vdg_miner/programs/fingerprints_to_pdbs.py -c "{cg}" -m "{match_pkl}" -l "{logfile}" -f "{fingerprints}" -p {pdb_dir} -o "{out_dir}" -s -e'
 
     subprocess.run(to_pdbs_cmd, shell=True, check=True)
-#
-#    # Run deduplicate_redun_vdgs.py
-#    deduplicate_cmd = f'python ligand_vdgs/generate_vdgs/deduplicate_redun_vdgs.py --cg "{cg}" --vdglib-dir {out_dir} -l "{logfile}"'
-#
-#    subprocess.run(deduplicate_cmd, shell=True, check=True)
+
+    # Run clus_and_deduplicate_vdgs.py
+    if symm_classes is not None:
+        deduplicate_template = f'python ligand_vdgs/generate_vdgs/clus_and_deduplicate_vdgs.py -c "{cg}" -v "{out_dir}" -s {symm_classes} -l "{logfile}" -n '
+    else:
+        deduplicate_template = f'python ligand_vdgs/generate_vdgs/clus_and_deduplicate_vdgs.py -c "{cg}" -v "{out_dir}" -l "{logfile}" -n '
+
+    for num_vdms in [1,2,3,4]:
+        deduplicate_cmd = deduplicate_template + str(num_vdms)
+        subprocess.run(deduplicate_cmd, shell=True, check=True)
 
 def set_up_outdir(out_dir):
     # Set up output directory

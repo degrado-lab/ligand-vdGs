@@ -500,9 +500,9 @@ def elements_in_clusters(indices_of_elements_in_cluster, cg_coords, vdm_bbcoords
       clus_flankingCAs, clus_pdbpaths, clus_vdm_scrr_cg_perms
 
 def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_coords, 
-                       all_pdbpaths, all_scrr_cg_perm, symmetry_classes,
-                       all_cg_and_vdmbb_coords, all_flankbb_coords, num_flanking, 
-                       first_pdb_out, first_pdb_cg_vdmbb_coords, weights, cluster_level):
+                       all_pdbpaths, all_scrr_cg_perm, all_cg_and_vdmbb_coords, 
+                       all_flankbb_coords, num_flanking, first_pdb_out, 
+                       first_pdb_cg_vdmbb_coords, weights, cluster_level):
    '''
    `cluster_level` must be [`cgvdmbb`, `flankbb`, or `flankseq`].
    When cluster_level is cgvdmbb, the output PDB contains just the CG (occ >=3) and 
