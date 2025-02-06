@@ -897,3 +897,24 @@ def determine_flank_resnums(par, list_resnums, s, c, vdm_ca):
          resnums_to_include.append(r)
          prev_ca = curr_ca
    return resnums_to_include
+
+def flatten_flanking_CAs(cgvdmbb_clus_flankingCAs):
+   cgvdmbb_clus_flat_flankCAs = []
+   for vdg_flankingCAs in cgvdmbb_clus_flankingCAs:
+      # `vdg_flankingCAs` is a list of vdm residues, so flatten it
+      flat_flanking_CAs = []
+      for res in vdg_flankingCAs:
+         for CA_coord in res:
+            flat_flanking_CAs.append(CA_coord)
+      cgvdmbb_clus_flat_flankCAs.append(flat_flanking_CAs)
+   return cgvdmbb_clus_flat_flankCAs
+
+def flatten_flanking_seqs(flankingCAs_clus_flankingseqs):
+   flattened_flankingseqs_for_vdgs_in_flankingCA_clus = []
+   for vdg_flankingseq in flankingCAs_clus_flankingseqs:
+      flat_vdg_flankingseq = []
+      for vdm_res in vdg_flankingseq:
+         flat_vdg_flankingseq += vdm_res
+      flattened_flankingseqs_for_vdgs_in_flankingCA_clus.append(
+         flat_vdg_flankingseq)
+   return flattened_flankingseqs_for_vdgs_in_flankingCA_clus
