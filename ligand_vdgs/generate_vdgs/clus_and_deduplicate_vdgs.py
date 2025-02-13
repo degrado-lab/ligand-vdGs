@@ -51,7 +51,9 @@ def parse_args():
                         'atoms are assumed to be symmetrically inequivalent.')
     parser.add_argument('-n', '--size-subset', type=int, 
                         help='Specify the number of residues in the vdG subset. '
-                        'The purpose of this arg is for parallelization.')
+                        'The purpose of this arg is for parallelization (running '
+                        'this script with different -n values concurrently. 1, 2, '
+                        'and 4 are recommended.')
     parser.add_argument('-l', "--logfile", help="Path to log file.")
     
     return parser.parse_args()
