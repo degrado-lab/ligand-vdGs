@@ -20,8 +20,16 @@ bindingsite_residues:
 # Query ligand ([PDB segment, chain, residue number])
 query_lig: ['B', 'A', 401]
 
-# Atom names of the CG within the query ligand
-query_cg_atoms: ['N2', 'S1', 'C15', 'O3', 'O2']
+# Atom names of the CG within the query ligand. The order of the atoms MUST match the
+# SMARTS-specified order during the vdg lib generation step. TODO: provide file for this.
+query_cg_atoms: ['N2', 'S1', 'C15', 'O2', 'O3']
+
+# Specify symmetry in the CG atoms. 
+# Ex: [['A1', 'A2']] for a symmetric atom pair A1|A2.
+# Ex: [['A1', 'A2'], ['B1', 'B2', 'B3']] for two symmetric groups: A1|A2 and B1|B2|B3.
+# Comment out if no symmetry.
+
+symmetric_query_cg_atoms: [['O2', 'O3']]
 
 # ------------------------------------------------------------------------------------
 #                  Default values set below. Redefine if necessary                    
@@ -31,4 +39,4 @@ query_cg_atoms: ['N2', 'S1', 'C15', 'O3', 'O2']
 rmsd_threshold: 0.5
 
 # Directory to output matches
-out_dir: vdg_matches
+out_dir: ../vdg_matches

@@ -31,12 +31,12 @@ def parse_args():
                         help="Directory for the vdms of this CG.")
     #parser.add_argument('-o', "--output-clus-pdbs", action='store_true', 
     #                    help="Output clustered PDBs.")
-    parser.add_argument('-w', "--align-cg-weight", type=float, default=0.5, 
+    parser.add_argument('-w', "--align-cg-weight", type=float, default=0.8, 
                         help="Fraction of weights to assign to CG atoms (collectively) "
                         "when superposing output vdGs. Not weights for clustering. "
                         "Example: 0.5 means 1/2 of weight is assigned to CG atoms and "
                         "the remaining 1/2 goes to the vdM backbone atoms.")
-    parser.add_argument('-q', "--seq", default=0.50,
+    parser.add_argument('-q', "--seq", default=0.30,
                         help="Sequence similarity threshold for clustering sequences "
                         "flanking the vdM to determine redundancy. This should be a "
                         "value between 0 and 1. Values > seq will be considered "
@@ -126,6 +126,9 @@ def main():
       pdbpath = os.path.join(vdg_pdbs_dir, pdbname)
       prody_obj = pr.parsePDB(pdbpath)
       cg_coords = clust.get_cg_coords(prody_obj)
+      if cg_coords is None:
+         logfile.write(f'\tIncorrect number of occ >= 3 atoms in vdg_pdbs/{pdbname}.\n')
+         continue
       # define symmetry class if it's None so it's compatible with pdb output naming
       if symmetry_classes is None:
          symmetry_classes = [i for i in range(len(cg_coords))]
@@ -151,10 +154,9 @@ def main():
       if num_vdms_in_subset != size_subset:
          continue
       for _reordered_AAs, _vdgs in _subsets.items():
-         print(_reordered_AAs)
          # vdG subsets that have identical vdm AA compositions may be redundant.
          cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, _reordered_AAs, 
-                           symmetry_classes, vdglib_dir, align_cg_weight, num_flanking)
+               symmetry_classes, vdglib_dir, align_cg_weight, num_flanking, logfile)
          '''Final results: vdgs that end up in the same cg+vdmbb, flanking bb, and 
          flanking seq clusters are redundant. Select only the centroid to be output.'''
          copy_nr_to_outdir(vdglib_dir, out_dir, _reordered_AAs)
@@ -171,12 +173,15 @@ def main():
       num_vdg_pdbs = len(vdg_pdbs_in_dir)
       nr_dir_of_size_subset = os.path.join(out_dir, str(size_subset))
       num_vdgs_of_size_subset = 0
-      for aa_subset in os.listdir(nr_dir_of_size_subset):
-         aa_subset_len = len(os.listdir(os.path.join(nr_dir_of_size_subset, aa_subset)))
-         num_vdgs_of_size_subset += aa_subset_len
+      if not os.path.exists(nr_dir_of_size_subset):
+         pass
+      else:
+         for aa_subset in os.listdir(nr_dir_of_size_subset):
+            aa_subset_len = len(os.listdir(os.path.join(nr_dir_of_size_subset, aa_subset)))
+            num_vdgs_of_size_subset += aa_subset_len
       
       file.write(f'\t{num_vdgs_of_size_subset} nonredun. vdgs of subset size '
-                 f'{size_subset} out of {num_vdg_pdbs} vdgs.')
+                 f'{size_subset} out of {num_vdg_pdbs} vdgs.\n')
       file.write(f"Completed deduplicate_redun_vdgs.py in {hours} h, ")
       file.write(f"{minutes} mins, and {seconds} secs \n") 
 
@@ -204,7 +209,7 @@ def copy_nr_to_outdir(vdglib_dir, nr_dir, reordered_AAs):
                shutil.copy(os.path.join(flankseqclusdir, pdb), newpath) 
 
 def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs, 
-                  symmetry_classes, vdglib_dir, align_cg_weight, num_flanking):
+                  symmetry_classes, vdglib_dir, align_cg_weight, num_flanking, logfile):
    # vdG subsets that have identical vdm AA compositions may be redudant.
    # First, get all AA permutations for equivalent AAs. For example, if the vdms are 
    # [Ala1, Ala2, Glu], then we need to sample [Ala1, Ala2, Glu] and [Ala2, Ala1, 
@@ -251,12 +256,16 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
    cgvdmbb_weights = clust.get_weights(num_cg_atoms, num_vdmbb_atoms, align_cg_weight)
    first_pdb_out = None # update with pdb name of first pdb that's output for ref
    first_pdb_cg_vdmbb_coords = False 
-   first_pdb_out, first_pdb_cg_vdmbb_coords = clust.write_out_clusters(cgvdmbb_clusdir, 
-      cgvdmbb_cluster_assignments, cgvdmbb_clus_centroids, all_AA_cg_perm_cg_coords, 
-      all_AA_cg_perm_pdbpaths, all_AA_cg_perm_vdm_scrr_cg_perm, 
+   first_pdb_out, first_pdb_cg_vdmbb_coords, failed_pdbs = clust.write_out_clusters(
+      cgvdmbb_clusdir, cgvdmbb_cluster_assignments, cgvdmbb_clus_centroids, 
+      all_AA_cg_perm_cg_coords, all_AA_cg_perm_pdbpaths, all_AA_cg_perm_vdm_scrr_cg_perm, 
       all_AA_cg_perm_cg_and_vdmbb_coords, all_AA_cg_perm_flankingCAs, num_flanking, 
       first_pdb_out, first_pdb_cg_vdmbb_coords, cgvdmbb_weights, cluster_level='cgvdmbb')
-   
+   if len(failed_pdbs) > 0:
+      with open(logfile, 'a') as file:
+         for fail in failed_pdbs:
+            file.write(f'\tFailed to parse {fail}.\n')
+
    # Clean up the cgvdmbb output dir by merging degenerate vdGs (diff AA and CG perms of 
    # the same PDB), deleting degenerate pdbs/clusters, and reassigning clus nums by size.
    reassigned_clusvdmbb_clus = clust.rewrite_temp_clusters(cgvdmbb_clusdir)
@@ -290,12 +299,16 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
          f'cgvdmbbclus_{cgvdmbb_clusnum}') 
       utils.handle_existing_files(flankbb_clusdir_for_this_cgvdmbb_clus)
 
-      first_pdb_out, first_pdb_cg_vdmbb_coords = clust.write_out_clusters(
+      first_pdb_out, first_pdb_cg_vdmbb_coords, failed_pdbs = clust.write_out_clusters(
          flankbb_clusdir_for_this_cgvdmbb_clus, flankingbb_cluster_assignments, 
          flankingbb_clus_centroids, cgvdmbb_clus_cg_coords, cgvdmbb_clus_pdbpaths, 
          cgvdmbb_clus_vdm_scrr_cg_perm, cgvdmbb_clus_cgvdmbb_coords, 
          cgvdmbb_clus_flat_flankCAs, num_flanking, first_pdb_out, 
          first_pdb_cg_vdmbb_coords, weights=None, cluster_level='flankbb')
+      if len(failed_pdbs) > 0:
+         with open(logfile, 'a') as file:
+            for fail in failed_pdbs:
+               file.write(f'\tFailed to parse {fail}.\n')
       
       'Finally, iterate over all flanking CA clusters and cluster further on flanking seq.'
       for flankingCAs_clusnum, indices_of_elements_in_flankingCAs_cluster in \
@@ -324,13 +337,17 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
             f'cgvdmbbclus_{cgvdmbb_clusnum}', f'flankbbclus_{flankingCAs_clusnum}')
          utils.handle_existing_files(flankseq_clusdir_for_this_flankingCAs_clus)
          
-         first_pdb_out, first_pdb_cg_vdmbb_coords = clust.write_out_clusters(
+         first_pdb_out, first_pdb_cg_vdmbb_coords, failed_pdbs = clust.write_out_clusters(
             flankseq_clusdir_for_this_flankingCAs_clus, seqsim_clus_assignments, 
             seqsim_clus_centroids, flankingCAs_clus_cg_coords, flankingCAs_clus_pdbpaths, 
             flankingCAs_clus_vdm_scrr_cg_perm, flankingCAs_clus_cgvdmbb_coords, 
             flankingCAs_clus_flat_flankCAs, num_flanking, first_pdb_out, 
             first_pdb_cg_vdmbb_coords, weights=None, 
             cluster_level='flankseq')
+         if len(failed_pdbs) > 0:
+            with open(logfile, 'a') as file:
+               for fail in failed_pdbs:
+                  file.write(f'\tFailed to parse {fail}.\n')
 
 def normalize_rmsd(num_atoms):
     # Smoothly scale rmsd threshold by the number of atoms.

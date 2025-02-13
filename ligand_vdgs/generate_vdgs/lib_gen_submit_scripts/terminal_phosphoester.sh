@@ -2,7 +2,7 @@
 
 #$ -S /bin/bash
 #$ -o /wynton/home/degradolab/skt/docking/sge_logs
-#$ -N tert_amide 
+#$ -N term_phosphoester
 #$ -cwd
 #$ -j y               # tells system STDERR and STDOUT should be joined
 #$ -l h_rt=100:00:00  #-- runtime limit - max 2 weeks == 336 hours
@@ -15,6 +15,6 @@ hostname
 
 conda activate smart_vdms_env
 
-python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py -s "[CX3&H0](=O)[NX3&H0]" -c tert_amide -p /wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2/ -b /wynton/group/degradolab/skt/docking/databases/probe_output/ -o /wynton/group/degradolab/skt/docking/databases/vdg_lib
+python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py -s "[OX2&H0]~P(~[OX1])(~[OX1])(~[OX1])" -c term_phosphoester -p /wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2/ -b /wynton/group/degradolab/skt/docking/databases/probe_output/ -o /wynton/group/degradolab/skt/docking/databases/vdg_lib
 
 date

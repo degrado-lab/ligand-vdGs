@@ -211,6 +211,8 @@ def get_vdm_res_features(prody_obj, pdbpath, num_flanking):
       vdm_obj = vdm_residues.select(f'resindex {vdm_resind}')
       # BB coords
       bb_coords = get_bb_coords(vdm_obj)
+      if bb_coords is None:
+         continue
 
       # Sequence of (contiguous) flanking residues
       flanking_seq_dict = {} # key = relative flank num (-1, +1, etc.), 
@@ -318,6 +320,9 @@ def get_cg_coords(prody_obj):
    for ind in range(num_atoms):
       occ = f'3.{ind}'
       atom = cg.select(f'occupancy == {occ}')
+      if len(atom) != 1:
+         print(f'get_cg_coords: {len(atom)} atoms are occupancy {occ}.')
+         return None
       assert len(atom) == 1
       atom_coords = atom.getCoords()[0]
       cg_coords.append(atom_coords)
@@ -328,7 +333,20 @@ def get_bb_coords(obj):
    bb_coords = []
    for atom in ['N', 'CA', 'C']:
       atom_obj = obj.select(f'name {atom}')
-      assert len(atom_obj) == 1
+      if atom_obj is None:
+         print('get_bb_coords: atom_obj is None.')
+         return None
+      if len(atom_obj) > 1: # not sure why, but sometimes each atom is duplicated,
+                            # despite having identical coords.
+         ambiguous_coords = None
+         for atom in atom_obj:
+            if ambiguous_coords is None:
+               ambiguous_coords = atom.getCoords()
+            else:
+               dist = pr.calcDistance(ambiguous_coords, atom.getCoords())
+               if dist > 0.2:
+                  print('get_bb_coords: >1 atom defined in atom_obj.')
+                  return None
       coord = atom_obj.getCoords()[0]
       bb_coords.append(coord)
    return bb_coords
@@ -516,6 +534,7 @@ def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_c
         # first 3 atoms of CG. then, all atoms of all subsequent CGs will be 
         # aligned to that first CG.
    # Iterate over each cluster
+   failed = []
    for clusnum, clus_mem_indices in \
                 clus_assignments.items():
       clusnum_dir = os.path.join(clusdir, f'clus_{clusnum}')
@@ -525,10 +544,14 @@ def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_c
       First, output the centroid before the other cluster members. Align centroids
       on cg+vdmbb, regardless of the cluster "level".
       '''
-      cent_cg_coords, cent_cg_vdmbb_coords, cent_flankbb_coords, cent_pdbpath, \
-         cent_scrr_cg_perm, cent_pr_obj = get_clus_mem_data(centroid_ind, all_cg_coords, 
+      data = get_clus_mem_data(centroid_ind, all_cg_coords, 
          all_cg_and_vdmbb_coords, all_flankbb_coords, all_pdbpaths, all_scrr_cg_perm, 
          cluster_level, num_flanking)
+      if data is None:
+         failed.append(all_pdbpaths[centroid_ind])
+         continue
+      (cent_cg_coords, cent_cg_vdmbb_coords, cent_flankbb_coords, cent_pdbpath, 
+         cent_scrr_cg_perm, cent_pr_obj) = data
       cent_pdb_outpath = get_clus_pdb_outpath(clusnum, clusnum_dir, cent_pdbpath, 
                                        cent_scrr_cg_perm, centroid_ind, is_centroid=True)
       if first_pdb_out is None:
@@ -566,11 +589,15 @@ def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_c
       for ind in clus_mem_indices:
          if ind == centroid_ind:
             continue
-         clusmem_cg_coords, clusmem_cg_vdmbb_coords, clusmem_flankbb_coords, \
-            clusmem_pdbpath, clusmem_scrr_cg_perm, clusmem_pr_obj = get_clus_mem_data(
+         data = get_clus_mem_data(
             ind, all_cg_coords, all_cg_and_vdmbb_coords, all_flankbb_coords, all_pdbpaths, 
             all_scrr_cg_perm, cluster_level, num_flanking)
-         
+         if data is None:
+            failed.append(all_pdbpaths[ind])
+            continue
+         (clusmem_cg_coords, clusmem_cg_vdmbb_coords, clusmem_flankbb_coords, 
+            clusmem_pdbpath, clusmem_scrr_cg_perm, clusmem_pr_obj) = data
+
          # Define atoms to align. 
          if cluster_level == 'cgvdmbb':
             clusmem_coords = clusmem_cg_vdmbb_coords
@@ -582,7 +609,7 @@ def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_c
          write_out_subsequent_clus_pdbs(clusmem_coords, clusmem_pr_obj, 
                            clusmem_pdb_outpath, target_coords, cluster_level, weights)
    
-   return first_pdb_out, first_pdb_cg_vdmbb_coords
+   return first_pdb_out, first_pdb_cg_vdmbb_coords, failed
 
 def write_out_subsequent_clus_pdbs(clusmem_coords, clusmem_pr_obj, clusmem_pdb_outpath, 
                                    target_coords, cluster_level, weights=None):
@@ -764,7 +791,10 @@ def reassign_temp_clusters(pruned_clusters):
 
 def get_pr_obj_from_cluster_level(clusmem_pdbpath, cluster_level, vdg_scrr_cg_perm,
                                   num_flanking):
-   par = pr.parsePDB(clusmem_pdbpath)
+   try:
+      par = pr.parsePDB(clusmem_pdbpath)
+   except:
+      return None
    # Add CG to pr obj
    pr_obj = par.select('occupancy > 2.8') # occ >= 3 is CG
    vdg_scrrs, cg_perm = vdg_scrr_cg_perm
@@ -774,19 +804,24 @@ def get_pr_obj_from_cluster_level(clusmem_pdbpath, cluster_level, vdg_scrr_cg_pe
          res_obj = add_vdm_obj_for_cluslevel_cgvdmbb(par, vdm_scrr)
          pr_obj += res_obj
       elif cluster_level == 'flankbb' or cluster_level == 'flankseq':
-         flank_obj = add_flank_obj_for_cluslevel_flank(par, vdm_scrr, num_flanking)
+         flank_obj = add_flank_obj_for_cluslevel_flank(par, vdm_scrr, num_flanking,
+                                                       clusmem_pdbpath)
          pr_obj += flank_obj
 
    return pr_obj.copy()
 
-def add_flank_obj_for_cluslevel_flank(par, vdm_scrr, num_flanking):
+def add_flank_obj_for_cluslevel_flank(par, vdm_scrr, num_flanking, pdbpath):
    # Check +/- flank num to see whether to include it in the pr obj or not.
    # If it doesn't exist or is a chain break, then don't include it.
    s, c, resnum, resname = vdm_scrr
+   if resnum < 0:
+      res_sel = f'resnum `{resnum}`'
+   else:
+      res_sel = f'resnum {resnum}'
    if s == '':
-      vdm_ca = par.select(f'chain {c} and resnum {resnum} and name CA')
+      vdm_ca = par.select(f'chain {c} and {res_sel} and name CA')
    else: 
-      vdm_ca = par.select(f'segment {s} and chain {c} and resnum {resnum} and name CA')
+      vdm_ca = par.select(f'segment {s} and chain {c} and {res_sel} and name CA')
 
    resnums_to_print = [resnum]
    # Start at vdm. Then, walk up num_flanking residues, breaking if chain break.
@@ -799,16 +834,21 @@ def add_flank_obj_for_cluslevel_flank(par, vdm_scrr, num_flanking):
    walk_down_resnums = [i for i in range(resnum-1, resnum-num_flanking-1, -1)]
    walk_down_consec_res = determine_flank_resnums(par, walk_down_resnums, s, c, vdm_ca)
    resnums_to_print.extend(walk_down_consec_res)
-   resnums_to_print = sorted([str(i) for i in resnums_to_print])
    assert len(resnums_to_print) == len(set(resnums_to_print))
-
+   resnums_to_print = [f'`{i}`' if i < 0 else str(i) for i in resnums_to_print]
+   num_resnums_to_print = len(set(resnums_to_print))
+   resnums_to_print = ' '.join(resnums_to_print)
    if s == '':
-      selstr = f"chain {c} and resnum {' '.join(resnums_to_print)}"
+      selstr = f"chain {c} and resnum {resnums_to_print}"
    else:
-      selstr = f"segment {s} and chain {c} and resnum {' '.join(resnums_to_print)}"
+      selstr = f"segment {s} and chain {c} and resnum {resnums_to_print}"
 
    flank_obj = par.select(selstr)
-   assert len(set(flank_obj.getResindices())) == len(resnums_to_print) 
+   num_flank_obj_resindices = len(set(flank_obj.getResindices()))
+   if num_flank_obj_resindices != num_resnums_to_print:
+      print(f'PDB {pdbpath} flank_obj {resname} has {num_flank_obj_resindices} '
+            f'resindices, but resnums_to_print is {resnums_to_print}: '
+            f'num_resnums_to_print = ({num_resnums_to_print}).')
    return flank_obj
 
 def get_clus_mem_data(ind, all_cg_coords, all_cg_and_vdmbb_coords, all_flankbb_coords,
@@ -823,6 +863,8 @@ def get_clus_mem_data(ind, all_cg_coords, all_cg_and_vdmbb_coords, all_flankbb_c
    clusmem_scrr_cg_perm = all_scrr_cg_perm[ind]
    clusmem_pr_obj = get_pr_obj_from_cluster_level(clusmem_pdbpath, cluster_level, 
                               clusmem_scrr_cg_perm, num_flanking)
+   if clusmem_pr_obj is None:
+      return None
    
    return [clusmem_cg_coords, clusmem_cg_vdmbb_coords, clusmem_flankbb_coords, 
            clusmem_pdbpath, clusmem_scrr_cg_perm, clusmem_pr_obj]
@@ -859,13 +901,19 @@ def reformat_reassigned_clus(reassigned_clusvdmbb_clus):
    return reformatted
 
 def add_vdm_obj_for_cluslevel_cgvdmbb(par, vdm_scrr):
+   r = vdm_scrr[2] 
+   if r < 0:
+      res_sel = f'resnum `{r}`'
+   else:
+      res_sel = f'resnum {r}'
+
    if vdm_scrr[0]: # has a pdb segment defined
       res_obj = par.select(
-         f'segment {vdm_scrr[0]} and chain {vdm_scrr[1]} and resnum {vdm_scrr[2]}'
+         f'segment {vdm_scrr[0]} and chain {vdm_scrr[1]} and {res_sel}'
          )
    else: # no segment
       res_obj = par.select(
-         f'chain {vdm_scrr[1]} and resnum {vdm_scrr[2]}')
+         f'chain {vdm_scrr[1]} and {res_sel}')
    assert len(set(res_obj.getResindices())) == 1
    vdm_res_name = list(set(res_obj.getResnames()))
    assert len(vdm_res_name)  == 1
@@ -880,10 +928,14 @@ def determine_flank_resnums(par, list_resnums, s, c, vdm_ca):
    prev_ca = vdm_ca
    # Iterate over resnums 
    for r in list_resnums:
-      if s == '':
-         sel = par.select(f'chain {c} and resnum {r} and name CA')
+      if r < 0:
+         res_sel = f'resnum `{r}`'
       else:
-         sel = par.select(f'segment {s} and chain {c} and resnum {r} and name CA')
+         res_sel = f'resnum {r}'
+      if s == '':
+         sel = par.select(f'chain {c} and {res_sel} and name CA')
+      else:
+         sel = par.select(f'segment {s} and chain {c} and {res_sel} and name CA')
       # Return if this residue's CA doesn't exist
       if sel is None:
          return resnums_to_include
