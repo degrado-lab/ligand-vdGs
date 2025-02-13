@@ -121,10 +121,13 @@ def main():
    vdm_combos = {}
 
    # Iterate over the PDBs and CGs that were identified as containing the SMARTS group
+   atomgroup_dict = {}
    vdg_pdbs_in_dir = os.listdir(vdg_pdbs_dir)
    for pdbname in vdg_pdbs_in_dir:
       pdbpath = os.path.join(vdg_pdbs_dir, pdbname)
       prody_obj = pr.parsePDB(pdbpath)
+      if len(vdg_pdbs_in_dir) < 10000:
+         atomgroup_dict[os.path.join(vdg_pdbs_dir, pdbname)] = prody_obj
       cg_coords = clust.get_cg_coords(prody_obj)
       if cg_coords is None:
          logfile.write(f'\tIncorrect number of occ >= 3 atoms in vdg_pdbs/{pdbname}.\n')
@@ -156,7 +159,8 @@ def main():
       for _reordered_AAs, _vdgs in _subsets.items():
          # vdG subsets that have identical vdm AA compositions may be redundant.
          cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, _reordered_AAs, 
-               symmetry_classes, vdglib_dir, align_cg_weight, num_flanking, logfile)
+               symmetry_classes, vdglib_dir, align_cg_weight, num_flanking, 
+               atomgroup_dict, logfile)
          '''Final results: vdgs that end up in the same cg+vdmbb, flanking bb, and 
          flanking seq clusters are redundant. Select only the centroid to be output.'''
          copy_nr_to_outdir(vdglib_dir, out_dir, _reordered_AAs)
@@ -209,7 +213,8 @@ def copy_nr_to_outdir(vdglib_dir, nr_dir, reordered_AAs):
                shutil.copy(os.path.join(flankseqclusdir, pdb), newpath) 
 
 def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs, 
-                  symmetry_classes, vdglib_dir, align_cg_weight, num_flanking, logfile):
+                                 symmetry_classes, vdglib_dir, align_cg_weight, 
+                                 num_flanking, atomgroup_dict, logfile):
    # vdG subsets that have identical vdm AA compositions may be redudant.
    # First, get all AA permutations for equivalent AAs. For example, if the vdms are 
    # [Ala1, Ala2, Glu], then we need to sample [Ala1, Ala2, Glu] and [Ala2, Ala1, 
@@ -260,7 +265,8 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
       cgvdmbb_clusdir, cgvdmbb_cluster_assignments, cgvdmbb_clus_centroids, 
       all_AA_cg_perm_cg_coords, all_AA_cg_perm_pdbpaths, all_AA_cg_perm_vdm_scrr_cg_perm, 
       all_AA_cg_perm_cg_and_vdmbb_coords, all_AA_cg_perm_flankingCAs, num_flanking, 
-      first_pdb_out, first_pdb_cg_vdmbb_coords, cgvdmbb_weights, cluster_level='cgvdmbb')
+      first_pdb_out, first_pdb_cg_vdmbb_coords, cgvdmbb_weights, 
+      atomgroup_dict=atomgroup_dict, cluster_level='cgvdmbb')
    if len(failed_pdbs) > 0:
       with open(logfile, 'a') as file:
          for fail in failed_pdbs:
@@ -304,7 +310,8 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
          flankingbb_clus_centroids, cgvdmbb_clus_cg_coords, cgvdmbb_clus_pdbpaths, 
          cgvdmbb_clus_vdm_scrr_cg_perm, cgvdmbb_clus_cgvdmbb_coords, 
          cgvdmbb_clus_flat_flankCAs, num_flanking, first_pdb_out, 
-         first_pdb_cg_vdmbb_coords, weights=None, cluster_level='flankbb')
+         first_pdb_cg_vdmbb_coords, weights=None, atomgroup_dict=atomgroup_dict, 
+         cluster_level='flankbb')
       if len(failed_pdbs) > 0:
          with open(logfile, 'a') as file:
             for fail in failed_pdbs:
@@ -342,7 +349,7 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
             seqsim_clus_centroids, flankingCAs_clus_cg_coords, flankingCAs_clus_pdbpaths, 
             flankingCAs_clus_vdm_scrr_cg_perm, flankingCAs_clus_cgvdmbb_coords, 
             flankingCAs_clus_flat_flankCAs, num_flanking, first_pdb_out, 
-            first_pdb_cg_vdmbb_coords, weights=None, 
+            first_pdb_cg_vdmbb_coords, weights=None, atomgroup_dict=atomgroup_dict, 
             cluster_level='flankseq')
          if len(failed_pdbs) > 0:
             with open(logfile, 'a') as file:
