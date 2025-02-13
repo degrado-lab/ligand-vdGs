@@ -520,7 +520,8 @@ def elements_in_clusters(indices_of_elements_in_cluster, cg_coords, vdm_bbcoords
 def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_coords, 
                        all_pdbpaths, all_scrr_cg_perm, all_cg_and_vdmbb_coords, 
                        all_flankbb_coords, num_flanking, first_pdb_out, 
-                       first_pdb_cg_vdmbb_coords, weights, cluster_level):
+                       first_pdb_cg_vdmbb_coords, weights, atomgroup_dict, 
+                       cluster_level):
    '''
    `cluster_level` must be [`cgvdmbb`, `flankbb`, or `flankseq`].
    When cluster_level is cgvdmbb, the output PDB contains just the CG (occ >=3) and 
@@ -546,7 +547,7 @@ def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_c
       '''
       data = get_clus_mem_data(centroid_ind, all_cg_coords, 
          all_cg_and_vdmbb_coords, all_flankbb_coords, all_pdbpaths, all_scrr_cg_perm, 
-         cluster_level, num_flanking)
+         cluster_level, num_flanking, atomgroup_dict)
       if data is None:
          failed.append(all_pdbpaths[centroid_ind])
          continue
@@ -591,7 +592,7 @@ def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_c
             continue
          data = get_clus_mem_data(
             ind, all_cg_coords, all_cg_and_vdmbb_coords, all_flankbb_coords, all_pdbpaths, 
-            all_scrr_cg_perm, cluster_level, num_flanking)
+            all_scrr_cg_perm, cluster_level, num_flanking, atomgroup_dict)
          if data is None:
             failed.append(all_pdbpaths[ind])
             continue
@@ -790,9 +791,12 @@ def reassign_temp_clusters(pruned_clusters):
    return reassigned
 
 def get_pr_obj_from_cluster_level(clusmem_pdbpath, cluster_level, vdg_scrr_cg_perm,
-                                  num_flanking):
+                                  num_flanking, atomgroup_dict):
    try:
-      par = pr.parsePDB(clusmem_pdbpath)
+      if clusmem_pdbpath in atomgroup_dict.keys():
+         par = atomgroup_dict[clusmem_pdbpath]
+      else:
+         par = pr.parsePDB(clusmem_pdbpath)
    except:
       return None
    # Add CG to pr obj
@@ -852,7 +856,8 @@ def add_flank_obj_for_cluslevel_flank(par, vdm_scrr, num_flanking, pdbpath):
    return flank_obj
 
 def get_clus_mem_data(ind, all_cg_coords, all_cg_and_vdmbb_coords, all_flankbb_coords,
-                      all_pdbpaths, all_scrr_cg_perm, cluster_level, num_flanking):
+                      all_pdbpaths, all_scrr_cg_perm, cluster_level, num_flanking, 
+                      atomgroup_dict):
    # Given the index of a cluster member, return the cg coords, cg+vdmbb coords, 
    # pdbpath, scrr_cg_perm, pr_obj, and output pdb name.
       
@@ -862,7 +867,7 @@ def get_clus_mem_data(ind, all_cg_coords, all_cg_and_vdmbb_coords, all_flankbb_c
    clusmem_pdbpath = all_pdbpaths[ind]
    clusmem_scrr_cg_perm = all_scrr_cg_perm[ind]
    clusmem_pr_obj = get_pr_obj_from_cluster_level(clusmem_pdbpath, cluster_level, 
-                              clusmem_scrr_cg_perm, num_flanking)
+                              clusmem_scrr_cg_perm, num_flanking, atomgroup_dict)
    if clusmem_pr_obj is None:
       return None
    
