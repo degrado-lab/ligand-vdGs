@@ -2,7 +2,7 @@
 
 #$ -S /bin/bash
 #$ -o /wynton/home/degradolab/skt/docking/sge_logs/
-#$ -N carbamate_nh2
+#$ -N carbamate_NH2
 #$ -cwd
 #$ -j y         # tells system STDERR and STDOUT should be joined
 #$ -l h_rt=24:00:00     #-- runtime limit - max 2 weeks == 336 hours

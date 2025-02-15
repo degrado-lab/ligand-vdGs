@@ -59,7 +59,8 @@ def main():
     logfile = os.path.join(logdir, f'{cg}_log')
     if os.path.exists(logfile):
         logfile = logfile + '_' + str(time.time())
-    write_out_commandline_params(logfile, smarts, cg, pdb_dir, probe_dir, out_dir, logdir)
+    write_out_commandline_params(logfile, smarts, cg, pdb_dir, probe_dir, out_dir, 
+                                 symm_classes, logdir)
 
     # Run smarts_to_cg.py
     if trial_run:
@@ -106,12 +107,15 @@ def set_up_outdir(out_dir):
             raise ValueError(dir_exists_msg)
     return out_dir
 
-def write_out_commandline_params(logfile, smarts, cg, pdb_dir, probe_dir, out_dir, logdir):
+def write_out_commandline_params(logfile, smarts, cg, pdb_dir, probe_dir, out_dir, 
+                                 symm_classes, logdir):
     if not os.path.exists(logdir):
         os.mkdir(logdir)
+    print(f'\nLogdir: {logdir}\n')
     with open(logfile, 'w') as _log:
         _log.write(f'SMARTS: {smarts} \n')
         _log.write(f'CG: {cg} \n')
+        _log.write(f'Symmetry classes: {symm_classes} \n')
         _log.write(f'Parent PDB dir: {pdb_dir} \n')
         _log.write(f'Probe dir: {probe_dir} \n')
         _log.write(f'Output dir: {out_dir} \n')

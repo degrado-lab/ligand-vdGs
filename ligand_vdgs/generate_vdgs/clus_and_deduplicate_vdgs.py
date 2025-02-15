@@ -169,7 +169,7 @@ def main():
 
    # Print out time elapsed
    seconds = time.time() - start_time
-   hours = seconds // 3600
+   hours = round(seconds // 3600)
    minutes = (seconds % 3600) // 60
    seconds = seconds % 60
    seconds = round(seconds, 2)
@@ -188,7 +188,7 @@ def main():
       
       file.write(f'\t{num_vdgs_of_size_subset} nonredun. vdgs of subset size '
                  f'{size_subset} out of {num_vdg_pdbs} vdgs.\n')
-      file.write(f"Completed deduplicate_redun_vdgs.py in {hours} h, ")
+      file.write(f"Completed clus_and_deduplicate_vdgs.py in {hours} h, ")
       file.write(f"{minutes} mins, and {seconds} secs \n") 
 
 def copy_nr_to_outdir(vdglib_dir, nr_dir, reordered_AAs):
