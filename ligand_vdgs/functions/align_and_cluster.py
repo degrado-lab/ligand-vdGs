@@ -115,7 +115,7 @@ def get_hierarchical_clusters(data, rmsd_cut,  calc_seq=False, calc_rmsd=False,
    if len(condensed_dist_matrix) == 0:
        return {1: [0]}, {1: 0} 
    
-   Z = linkage(condensed_dist_matrix, method='single')
+   Z = linkage(condensed_dist_matrix, method='complete')
    if seq_sim_thresh:
       seq_dissimilarity_thresh = 1 - seq_sim_thresh
       clusters = fcluster(Z, seq_dissimilarity_thresh, criterion='distance')

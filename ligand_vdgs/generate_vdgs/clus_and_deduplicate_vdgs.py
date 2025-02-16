@@ -46,7 +46,7 @@ def parse_args():
                         "flanking the vdM to determine redundancy. This should be a "
                         "value between 0 and 1. Values > seq will be considered "
                         "redundant.")
-    parser.add_argument('-f', "--flank", default=5,
+    parser.add_argument('-f', "--flank", default=3,
                         help="Number of residues +/- the vdms for which to "
                         "calculate sequence similarity and backbone similarity.")
     parser.add_argument('-s', '--symmetry-classes', nargs='+', type=int,

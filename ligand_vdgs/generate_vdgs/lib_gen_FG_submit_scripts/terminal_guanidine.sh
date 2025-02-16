@@ -1,5 +1,4 @@
 #!/bin/bash
-
 #$ -S /bin/bash
 #$ -o /wynton/home/degradolab/skt/docking/sge_logs
 #$ -N terminal_guanidine 
@@ -15,6 +14,6 @@ hostname
 
 conda activate smart_vdms_env
 
-python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py -s "[CX3](~[NH2])(~[N;H1,H2])~[NX2,NX3&H1]" -c terminal_guanidine -p /wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2/ -b /wynton/group/degradolab/skt/docking/databases/probe_output/ -o /wynton/group/degradolab/skt/docking/databases/vdg_lib --symmetry-classes 0 1 2 2
+python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py -s "[CX3](~[NX2H1,NH2])(~[NX2H1,NH2])~N" -c terminal_guanidine -p /wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2/ -b /wynton/group/degradolab/skt/docking/databases/probe_output/ -o /wynton/group/degradolab/skt/docking/databases/vdg_lib --symmetry-classes 0 1 1 2
 
 date
