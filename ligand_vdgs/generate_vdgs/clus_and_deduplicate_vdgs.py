@@ -1,15 +1,20 @@
 '''
 Removes redundant vdGs from the vdG library. vdGs are redundant if they meet all 
 criteria: 
-    1. CG and vdM AA identities and binding pose (backbones within a specified RMSD 
-       threshold)
-    2. similar positions of the flanking residues (CAs within a specified RMSD 
-       threshold)
-    3. sequence similarity of residues flanking the vdMs (specified by seq. 
-       similarity ithreshold). however, when the clustering is done, it's based on 
-       dissimilarity (because the clustering is distance-based)
-    4. lastly, deduplicate vdgs that are identical but are featurized differently 
-       solely because of different AA permutations of the same binding site
+   1. Sequence similarity of residues flanking the vdMs. 
+         Note that the clustering criterion is actually dissimilarity, because the 
+         "distances" between cluster members must be *below* the threshold.  
+   2. vdM AA identities and binding pose (CG + vdM backbone atoms within a 
+      specified RMSD threshold). 
+         Each AA permutation (for multiple vdMs of the same AA) is listed as a 
+         distinct vdG. Each CG permutation (for symmetrically equivalent CG atoms) 
+         is also listed as a distinct vdG. E.g., carboxylates CGs have 2 permutations 
+         because of 2 identical oxygens. After clustering, duplicate vdGs (different 
+         AA and CG permutations of the same vdG) are removed.
+   3. Similar positions of the residues flanking the vdMs (rmsd of their CAs within 
+      a specified threshold).
+         The span of contiguous residues flanking the vdMs is defined by the 
+         --flank argument; see --help.
 '''
 
 import os
@@ -42,7 +47,7 @@ def parse_args():
                         "value between 0 and 1. Values > seq will be considered "
                         "redundant.")
     parser.add_argument('-f', "--flank", default=5,
-                        help="Number of residues flanking the vdms for which to "
+                        help="Number of residues +/- the vdms for which to "
                         "calculate sequence similarity and backbone similarity.")
     parser.add_argument('-s', '--symmetry-classes', nargs='+', type=int,
                         help='Integers representing the symmetry classes of the CG '
@@ -108,7 +113,6 @@ def main():
    if size_subset not in [1, 2, 3, 4]:
       raise ValueError('size_subset must be an integer between 1 and 4.')
    logfile = args.logfile
-   #output_clus_pdbs = args.output_clus_pdbs
    align_cg_weight = args.align_cg_weight
    if align_cg_weight < 0 or align_cg_weight > 1:
       raise ValueError('align_cg_weight must be a float between 0 and 1.')
@@ -192,38 +196,41 @@ def main():
       file.write(f"{minutes} mins, and {seconds} secs \n") 
 
 def copy_nr_to_outdir(vdglib_dir, nr_dir, reordered_AAs):
-   clustersdir = os.path.join(vdglib_dir, 'clusters', 'flankseq', 
+   clustersdir = os.path.join(vdglib_dir, 'clusters', 'cgvdmbb', 
                               str(len(reordered_AAs)), '_'.join(reordered_AAs))
    nr_dir = os.path.join(nr_dir, str(len(reordered_AAs)), '_'.join(reordered_AAs))
    utils.handle_existing_files(nr_dir)
    os.makedirs(nr_dir, exist_ok=True)
-   for cgvdmbbclus in os.listdir(clustersdir):
-      cgvdmbbclusdir = os.path.join(clustersdir, cgvdmbbclus)
-      for flankbbclus in os.listdir(cgvdmbbclusdir):
-         flankbbclusdir = os.path.join(cgvdmbbclusdir, flankbbclus)
-         for flankseqclus in os.listdir(flankbbclusdir):
-            flankseqclusdir = os.path.join(flankbbclusdir, flankseqclus)
-            for pdb in os.listdir(flankseqclusdir):
+   for flankseqclus in os.listdir(clustersdir):
+      flankseqclusdir = os.path.join(clustersdir, flankseqclus)
+      for flankbbclus in os.listdir(flankseqclusdir):
+         flankbbclusdir = os.path.join(flankseqclusdir, flankbbclus)
+         for cgvdmbbclus in os.listdir(flankbbclusdir):
+            cgvdmbbclusdir = os.path.join(flankbbclusdir, cgvdmbbclus)
+            for pdb in os.listdir(cgvdmbbclusdir):
                if 'centroid' not in pdb: 
                   continue
-               # copy the centroid to the output dir
-               biounit = '_'.join(pdb.split('.pdb.gz')[0].split('_')[1:])
-               vdmscrr_str = pdb.split('.pdb.gz_')[1].split('_CGperm')[0]
-               newname = f'{biounit}_{vdmscrr_str}.pdb.gz'
-               newpath = os.path.join(nr_dir, newname)
-               assert not os.path.exists(newpath)
-               shutil.copy(os.path.join(flankseqclusdir, pdb), newpath) 
+               else:
+                  # copy the centroid to the output dir
+                  biounit = '_'.join(pdb.split('_')[:5])
+                  vdmscrr_str = '_'.join(pdb.split('_')[5:-2])
+                  newname = f'{biounit}_{vdmscrr_str}.pdb.gz'
+                  newpath = os.path.join(nr_dir, newname)
+                  
+                  assert not os.path.exists(newpath)
+                  shutil.copy(os.path.join(cgvdmbbclusdir, pdb), newpath) 
+                  break 
 
 def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs, 
                                  symmetry_classes, vdglib_dir, align_cg_weight, 
                                  num_flanking, atomgroup_dict, logfile):
    # vdG subsets that have identical vdm AA compositions may be redudant.
-   # First, get all AA permutations for equivalent AAs. For example, if the vdms are 
+   # First, get all AA permutations for identical AAs. For example, if the vdms are 
    # [Ala1, Ala2, Glu], then we need to sample [Ala1, Ala2, Glu] and [Ala2, Ala1, 
-   # Glu]. The easiest way to get the permutations is to label by the index of the 
+   # Glu]. The easiest way to get the permutations is to label the index of the 
    # ordered AAs
    
-   # Analyze all AA permutations of the vdgs.
+   # Include all AA permutations (for identical AAs) of the vdgs.
    all_AA_perm_cg_coords, all_AA_perm_vdm_bbcoords, \
       all_AA_perm_flankingseqs, all_AA_perm_flankingCAs, \
       all_AA_perm_pdbpaths, all_AA_perm_vdm_scrr = \
@@ -234,129 +241,142 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
       all_AA_cg_perm_flankingseqs, all_AA_cg_perm_flankingCAs, \
       all_AA_cg_perm_pdbpaths, all_AA_cg_perm_vdm_scrr_cg_perm = \
       clust.get_vdg_AA_and_cg_perms(all_AA_perm_cg_coords, all_AA_perm_vdm_bbcoords, 
-                              all_AA_perm_flankingseqs, all_AA_perm_flankingCAs, 
-                              all_AA_perm_pdbpaths, all_AA_perm_vdm_scrr, 
-                              symmetry_classes)
+         all_AA_perm_flankingseqs, all_AA_perm_flankingCAs, all_AA_perm_pdbpaths, 
+         all_AA_perm_vdm_scrr, symmetry_classes)
    
-   # First, calc rmsd between all AA permutations
    all_AA_cg_perm_cg_and_vdmbb_coords = clust.combine_cg_and_vdmbb_coords(
       all_AA_cg_perm_cg_coords, all_AA_cg_perm_vdm_bbcoords)
+   all_AA_cg_perm_flat_flankingseqs = clust.flatten_flanking_seqs(
+      all_AA_cg_perm_flankingseqs)
+   all_AA_cg_perm_flat_flankCAs = clust.flatten_flanking_CAs(
+      all_AA_cg_perm_flankingCAs)
+   
+   # First, cluster on sequence dissimilarity of the vdM residue names and their 
+   # flanking residues. We start with clustering on sequence because it is a faster 
+   # computation than clustering on rmsd.
 
-   # Cluster these potentially redundant AA and cg permuted vdGs by calculating rmsd on
-   # CG + vdm bb. `cluster_assignments` dict: each key is a clus number, and each value
+   # `cluster_assignments` dict: each key is a clus number, and each value
    # is a list of the indices belong to that cluster. Indexing is the relative position
    # in all_AA_cg_perm_cg_coords, all_AA_cg_perm_vdm_bbcoords, etc.).
-   num_cg_atoms = len(all_AA_cg_perm_cg_coords[0])
-   num_vdmbb_res = len(all_AA_cg_perm_vdm_bbcoords[0]) 
-   num_vdmbb_atoms = num_vdmbb_res * 3 
-   num_cgvdmbb_atoms = num_cg_atoms + num_vdmbb_atoms
-   cgvdmbb_rmsd_cut = normalize_rmsd(num_cgvdmbb_atoms)
-   # `cgvdmbb_cluster_assignments` dict not yet ordered by cluster size
-   cgvdmbb_cluster_assignments, cgvdmbb_clus_centroids = clust.get_hierarchical_clusters(
-      all_AA_cg_perm_cg_and_vdmbb_coords, cgvdmbb_rmsd_cut, None_in_coords=True) 
-
-   cgvdmbb_clusdir = os.path.join(vdglib_dir, 'clusters', 'temp', 'cgvdmbb', 
-      str(len(reordered_AAs)), '_'.join(reordered_AAs)) # temp bc need to be reassigned
-                                                   # to handle degenerate binding sites
-   # Output the cgvdmbb clusters
-   utils.handle_existing_files(cgvdmbb_clusdir)
-   cgvdmbb_weights = clust.get_weights(num_cg_atoms, num_vdmbb_atoms, align_cg_weight)
+   seqsim_clus_assignments, seqsim_clus_centroids = clust.get_hierarchical_clusters(
+      all_AA_cg_perm_flat_flankingseqs, rmsd_cut=None, calc_seq=True, 
+      seq_sim_thresh=seq_sim_thresh)
+   
+   # Output the flankseq clusters
+   flankseq_clusdir = os.path.join(vdglib_dir, 'clusters',
+      'flankseq', str(len(reordered_AAs)), '_'.join(reordered_AAs)) 
+   utils.handle_existing_files(flankseq_clusdir)
+   
    first_pdb_out = None # update with pdb name of first pdb that's output for ref
    first_pdb_cg_vdmbb_coords = False 
+
    first_pdb_out, first_pdb_cg_vdmbb_coords, failed_pdbs = clust.write_out_clusters(
-      cgvdmbb_clusdir, cgvdmbb_cluster_assignments, cgvdmbb_clus_centroids, 
-      all_AA_cg_perm_cg_coords, all_AA_cg_perm_pdbpaths, all_AA_cg_perm_vdm_scrr_cg_perm, 
-      all_AA_cg_perm_cg_and_vdmbb_coords, all_AA_cg_perm_flankingCAs, num_flanking, 
-      first_pdb_out, first_pdb_cg_vdmbb_coords, cgvdmbb_weights, 
-      atomgroup_dict=atomgroup_dict, cluster_level='cgvdmbb')
+      flankseq_clusdir, seqsim_clus_assignments, seqsim_clus_centroids,
+      all_AA_cg_perm_cg_coords, all_AA_cg_perm_pdbpaths, 
+      all_AA_cg_perm_vdm_scrr_cg_perm, all_AA_cg_perm_cg_and_vdmbb_coords, 
+      all_AA_cg_perm_flat_flankCAs, num_flanking, first_pdb_out, 
+      first_pdb_cg_vdmbb_coords, weights=None, atomgroup_dict=atomgroup_dict)
+
    if len(failed_pdbs) > 0:
       with open(logfile, 'a') as file:
          for fail in failed_pdbs:
             file.write(f'\tFailed to parse {fail}.\n')
-
-   # Clean up the cgvdmbb output dir by merging degenerate vdGs (diff AA and CG perms of 
-   # the same PDB), deleting degenerate pdbs/clusters, and reassigning clus nums by size.
-   reassigned_clusvdmbb_clus = clust.rewrite_temp_clusters(cgvdmbb_clusdir)
-   reformatted_reassigned_clusvdmbb_clus = clust.reformat_reassigned_clus(
-      reassigned_clusvdmbb_clus)
-
-   'Iterate over all cgvdmbb cluster and cluster further on CAs flanking the vdms.'
-   for cgvdmbb_clusnum, indices_of_elements_in_cg_vdmbb_cluster in \
-      reformatted_reassigned_clusvdmbb_clus.items():
+   
+   # Next, further subdivide each flanking seq cluster on rmsd of the bb stretches 
+   # flanking the vdms. 
+   for seqsim_clusnum, indices_of_elements_in_seqsim_cluster in \
+      seqsim_clus_assignments.items():
       # Select the data belonging to this cgvdmbb cluster.
-      (cgvdmbb_clus_cg_coords, cgvdmbb_clus_vdmbb_coords, cgvdmbb_clus_cgvdmbb_coords, 
-         cgvdmbb_clus_flankingseqs, cgvdmbb_clus_flankingCAs, cgvdmbb_clus_pdbpaths, 
-         cgvdmbb_clus_vdm_scrr_cg_perm) = clust.elements_in_clusters(
-         indices_of_elements_in_cg_vdmbb_cluster, all_AA_cg_perm_cg_coords, 
+      (flankseq_clus_cg_coords, flankseq_clus_vdmbb_coords, 
+         flankseq_clus_cgvdmbb_coords, flankseq_clus_flat_flankingseqs, 
+         flankseq_clus_flat_flankingCAs, flankseq_clus_pdbpaths, 
+         flankseq_clus_vdm_scrr_cg_perm) = clust.elements_in_clusters(
+         indices_of_elements_in_seqsim_cluster, all_AA_cg_perm_cg_coords, 
          all_AA_cg_perm_vdm_bbcoords, all_AA_cg_perm_cg_and_vdmbb_coords,
-         all_AA_cg_perm_flankingseqs, all_AA_cg_perm_flankingCAs, all_AA_cg_perm_pdbpaths, 
-         all_AA_cg_perm_vdm_scrr_cg_perm)
+         all_AA_cg_perm_flat_flankingseqs, all_AA_cg_perm_flat_flankCAs, 
+         all_AA_cg_perm_pdbpaths, 
+         all_AA_cg_perm_vdm_scrr_cg_perm)   
 
-      # Cluster on rmsd of the bb stretches flanking the vdms. Flatten the bb coords.
-      cgvdmbb_clus_flat_flankCAs = clust.flatten_flanking_CAs(cgvdmbb_clus_flankingCAs)
-      num_flank_bb_coords = len(cgvdmbb_clus_flat_flankCAs[0])
+      num_flank_bb_coords = len(flankseq_clus_flat_flankingCAs[0])
       flankbb_rmsd_cut = normalize_rmsd(num_flank_bb_coords)
-      
       flankingbb_cluster_assignments, flankingbb_clus_centroids \
-         = clust.get_hierarchical_clusters(cgvdmbb_clus_flat_flankCAs, flankbb_rmsd_cut, 
-                                           None_in_coords=True)
+         = clust.get_hierarchical_clusters(flankseq_clus_flat_flankingCAs, 
+                                          flankbb_rmsd_cut, calc_rmsd=True)
 
       # Output the flankbb clusters
-      flankbb_clusdir_for_this_cgvdmbb_clus = os.path.join(vdglib_dir, 'clusters', 
+      flankbb_clusdir_for_this_flankseq_clus = os.path.join(vdglib_dir, 'clusters', 
          'flankbb', str(len(reordered_AAs)), '_'.join(reordered_AAs), 
-         f'cgvdmbbclus_{cgvdmbb_clusnum}') 
-      utils.handle_existing_files(flankbb_clusdir_for_this_cgvdmbb_clus)
+         f'flankseqclus_{seqsim_clusnum}') 
+      utils.handle_existing_files(flankbb_clusdir_for_this_flankseq_clus) 
 
       first_pdb_out, first_pdb_cg_vdmbb_coords, failed_pdbs = clust.write_out_clusters(
-         flankbb_clusdir_for_this_cgvdmbb_clus, flankingbb_cluster_assignments, 
-         flankingbb_clus_centroids, cgvdmbb_clus_cg_coords, cgvdmbb_clus_pdbpaths, 
-         cgvdmbb_clus_vdm_scrr_cg_perm, cgvdmbb_clus_cgvdmbb_coords, 
-         cgvdmbb_clus_flat_flankCAs, num_flanking, first_pdb_out, 
-         first_pdb_cg_vdmbb_coords, weights=None, atomgroup_dict=atomgroup_dict, 
-         cluster_level='flankbb')
+         flankbb_clusdir_for_this_flankseq_clus, flankingbb_cluster_assignments, 
+         flankingbb_clus_centroids, flankseq_clus_cg_coords, flankseq_clus_pdbpaths, 
+         flankseq_clus_vdm_scrr_cg_perm, flankseq_clus_cgvdmbb_coords, 
+         flankseq_clus_flat_flankingCAs, num_flanking, first_pdb_out, 
+         first_pdb_cg_vdmbb_coords, weights=None, atomgroup_dict=atomgroup_dict)
       if len(failed_pdbs) > 0:
          with open(logfile, 'a') as file:
             for fail in failed_pdbs:
                file.write(f'\tFailed to parse {fail}.\n')
-      
-      'Finally, iterate over all flanking CA clusters and cluster further on flanking seq.'
+
+      '''Finally, iterate over all flanking CA clusters and cluster further on 
+      coordinates of the CG + vdm bbs.'''
+      num_cg_atoms = len(all_AA_cg_perm_cg_coords[0])
+      num_vdmbb_res = len(all_AA_cg_perm_vdm_bbcoords[0]) 
+      num_vdmbb_atoms = num_vdmbb_res * 3 
+      num_cgvdmbb_atoms = num_cg_atoms + num_vdmbb_atoms
+      cgvdmbb_rmsd_cut = normalize_rmsd(num_cgvdmbb_atoms)      
+
+
       for flankingCAs_clusnum, indices_of_elements_in_flankingCAs_cluster in \
          flankingbb_cluster_assignments.items():
          # Select the data belonging to this flankingCAs cluster.
          (flankingCAs_clus_cg_coords, flankingCAs_clus_vdmbb_coords, 
-            flankingCAs_clus_cgvdmbb_coords, flankingCAs_clus_flankingseqs,
+            flankingCAs_clus_cgvdmbb_coords, flankingCAs_clus_flat_flankingseqs,
             flankingCAs_clus_flat_flankCAs, flankingCAs_clus_pdbpaths,
             flankingCAs_clus_vdm_scrr_cg_perm) = clust.elements_in_clusters(
-            indices_of_elements_in_flankingCAs_cluster, cgvdmbb_clus_cg_coords, 
-            cgvdmbb_clus_vdmbb_coords, cgvdmbb_clus_cgvdmbb_coords, 
-            cgvdmbb_clus_flankingseqs, cgvdmbb_clus_flat_flankCAs,
-            cgvdmbb_clus_pdbpaths, cgvdmbb_clus_vdm_scrr_cg_perm)
-
-         # Cluster on sequence dissimilarity of the residues +/- of the vdms.
-         flattened_flankingseqs_for_vdgs_in_flankingCA_clus = clust.flatten_flanking_seqs(
-            flankingCAs_clus_flankingseqs)
+            indices_of_elements_in_flankingCAs_cluster, flankseq_clus_cg_coords, 
+            flankseq_clus_vdmbb_coords, flankseq_clus_cgvdmbb_coords, 
+            flankseq_clus_flat_flankingseqs, flankseq_clus_flat_flankingCAs,
+            flankseq_clus_pdbpaths, flankseq_clus_vdm_scrr_cg_perm) 
+   
+         cgvdmbb_clus_assignments, cgvdmbb_centroids = clust.get_hierarchical_clusters(
+            flankingCAs_clus_cgvdmbb_coords, calc_rmsd=True, rmsd_cut=cgvdmbb_rmsd_cut) 
          
-         seqsim_clus_assignments, seqsim_clus_centroids = clust.get_hierarchical_clusters(
-            flattened_flankingseqs_for_vdgs_in_flankingCA_clus, rmsd_cut=None,  
-            seq_sim_thresh=seq_sim_thresh)
+         # Output the cgvdmbb clusters.
          
-         # Output the flankseq clusters
-         flankseq_clusdir_for_this_flankingCAs_clus = os.path.join(vdglib_dir, 'clusters',
-            'flankseq', str(len(reordered_AAs)), '_'.join(reordered_AAs), 
-            f'cgvdmbbclus_{cgvdmbb_clusnum}', f'flankbbclus_{flankingCAs_clusnum}')
-         utils.handle_existing_files(flankseq_clusdir_for_this_flankingCAs_clus)
-         
-         first_pdb_out, first_pdb_cg_vdmbb_coords, failed_pdbs = clust.write_out_clusters(
-            flankseq_clusdir_for_this_flankingCAs_clus, seqsim_clus_assignments, 
-            seqsim_clus_centroids, flankingCAs_clus_cg_coords, flankingCAs_clus_pdbpaths, 
+         # Define dir to output "temp" files (temp bc clusters need to be reassigned
+         # later to handle degenerate binding sites for different AA and CG 
+         # permutations of the same PDB).
+         temp_cgvdmbb_clusdir = os.path.join(vdglib_dir, 'clusters', 'temp', 'cgvdmbb', 
+            str(len(reordered_AAs)), '_'.join(reordered_AAs), 
+            f'flankseq_{seqsim_clusnum}', f'flankbbclus_{flankingCAs_clusnum}')
+         utils.handle_existing_files(temp_cgvdmbb_clusdir)
+         cgvdmbb_weights = clust.get_weights(num_cg_atoms, num_vdmbb_atoms, 
+                                             align_cg_weight)
+                  
+         (first_pdb_out, first_pdb_cg_vdmbb_coords, 
+            failed_pdbs) = clust.write_out_clusters(
+            temp_cgvdmbb_clusdir, cgvdmbb_clus_assignments, cgvdmbb_centroids, 
+            flankingCAs_clus_cg_coords, flankingCAs_clus_pdbpaths, 
             flankingCAs_clus_vdm_scrr_cg_perm, flankingCAs_clus_cgvdmbb_coords, 
-            flankingCAs_clus_flat_flankCAs, num_flanking, first_pdb_out, 
-            first_pdb_cg_vdmbb_coords, weights=None, atomgroup_dict=atomgroup_dict, 
-            cluster_level='flankseq')
+            flankingCAs_clus_flat_flankCAs, num_flanking, 
+            first_pdb_out, first_pdb_cg_vdmbb_coords, cgvdmbb_weights, 
+            atomgroup_dict=atomgroup_dict)
+
          if len(failed_pdbs) > 0:
             with open(logfile, 'a') as file:
                for fail in failed_pdbs:
                   file.write(f'\tFailed to parse {fail}.\n')
+
+   # Clean up the cgvdmbb output dir by merging degenerate vdGs (diff AA and 
+   # CG perms of the same PDB), deleting degenerate pdbs/clusters, and 
+   # reassigning clus nums by size.
+   tempdir = os.path.join(vdglib_dir, 'clusters', 'temp', 'cgvdmbb')
+   cleandir = os.path.join(vdglib_dir, 'clusters', 'cgvdmbb')
+   reassigned_cgvdmbb_clus = clust.rewrite_temp_clusters(tempdir, cleandir, 
+                                    len(reordered_AAs), '_'.join(reordered_AAs))
 
 def normalize_rmsd(num_atoms):
     # Smoothly scale rmsd threshold by the number of atoms.

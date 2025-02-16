@@ -98,18 +98,15 @@ def flatten_vdg_bbs(_vdmbb):
          bbs.append(atom)
    return bbs
 
-def get_hierarchical_clusters(data, rmsd_cut, None_in_coords=False, 
+def get_hierarchical_clusters(data, rmsd_cut,  calc_seq=False, calc_rmsd=False, 
                               seq_sim_thresh=None):
    # Returns dict where key = cluster number and value = indices of the list elements 
    # that belong in that cluster. This dict is not ordered by size.
    # `data` is either a list of coords, or a list of sequences.
-   # None_in_coords is a param that distinguishes whether `data` is coordinates or 
-   # sequences. This distinction is important because rmsd cannot be calculated on 
-   # non-coordinates, so if any residues are "None" for either of the 2 vdgs being 
-   # compared, that whole residue is discounted.
-
-   dist_matrix = create_dist_matrix(data, None_in_coords) # dist is either rmsd or 
-                                                         # % seq sim
+   if sum([calc_seq, calc_rmsd]) != 1:
+      raise ValueError('Either calc_seq or calc_rmsd, but not both, must be True.')
+   
+   dist_matrix = create_dist_matrix(data, calc_seq, calc_rmsd) 
    condensed_dist_matrix = squareform(dist_matrix)
    
    # If the distancee matrix is empty (because there's only one sample in `data`), then
@@ -142,7 +139,7 @@ def get_hierarchical_clusters(data, rmsd_cut, None_in_coords=False,
    
    return cluster_assignments, centroids
 
-def create_dist_matrix(data, None_in_coords):
+def create_dist_matrix(data, calc_seq=False, calc_rmsd=True):
    n = len(data)
    distance_matrix = np.zeros((n, n))
    for i in range(n):
@@ -154,12 +151,12 @@ def create_dist_matrix(data, None_in_coords):
          # both elements being measured.
          data_i = data[i]
          data_j = data[j]
-         if None_in_coords: # calc rmsd 
+         if calc_rmsd:  
             data_i, data_j = get_overlapping_res_coords(data_i, data_j)
             moved_coords_i, transf = pr.superpose(data_i, data_j)
             rmsd = pr.calcRMSD(moved_coords_i, data_j)
             value = rmsd
-         else: # calc seq similarity
+         elif calc_seq: # calc seq similarity
             seq_sim = calc_seq_similarity(data_i, data_j)
             value = (100 - seq_sim) / 100 # clustering is distance-based, so the 
                                           # metric is DISsimilarity
@@ -483,7 +480,6 @@ def get_vdg_AA_and_cg_perms(all_AA_perm_cg_coords,    all_AA_perm_vdm_bbcoords,
             all_AA_perm_flankingCAs, all_AA_perm_pdbpaths, all_AA_perm_vdm_scrr):
       
       perms = permute_on_indices(symmetry_classes, cgcoords)
-      #print('Number of permutations:', len(perms))
 
       for perm_ind, perm in enumerate(perms):
          all_AA_cg_perm_cg_coords.append(perm)
@@ -520,16 +516,8 @@ def elements_in_clusters(indices_of_elements_in_cluster, cg_coords, vdm_bbcoords
 def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_coords, 
                        all_pdbpaths, all_scrr_cg_perm, all_cg_and_vdmbb_coords, 
                        all_flankbb_coords, num_flanking, first_pdb_out, 
-                       first_pdb_cg_vdmbb_coords, weights, atomgroup_dict, 
-                       cluster_level):
-   '''
-   `cluster_level` must be [`cgvdmbb`, `flankbb`, or `flankseq`].
-   When cluster_level is cgvdmbb, the output PDB contains just the CG (occ >=3) and 
-      directly interacting vdm(s). 
-   When cluster_level is flankbb or flankseq, the output PDB contains the CG (occ >=3), 
-      vdm(s), and the residue(s) flanking the vdm(s).
-   '''
-   assert cluster_level in ['cgvdmbb', 'flankbb', 'flankseq']
+                       first_pdb_cg_vdmbb_coords, weights, atomgroup_dict): 
+
    assert len(all_pdbpaths) == len(all_cg_and_vdmbb_coords)
    ref = np.array([[0, 0, 0], [-1, 0, 1], [1, -1, 0]]) # it's just to align the 
         # first 3 atoms of CG. then, all atoms of all subsequent CGs will be 
@@ -541,13 +529,11 @@ def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_c
       clusnum_dir = os.path.join(clusdir, f'clus_{clusnum}')
       os.makedirs(clusnum_dir)
       centroid_ind = centroid_assignments[clusnum]
-      '''
-      First, output the centroid before the other cluster members. Align centroids
-      on cg+vdmbb, regardless of the cluster "level".
-      '''
+      # First, output the centroid before the other cluster members. Align centroids
+      # on cg+vdmbb.
       data = get_clus_mem_data(centroid_ind, all_cg_coords, 
          all_cg_and_vdmbb_coords, all_flankbb_coords, all_pdbpaths, all_scrr_cg_perm, 
-         cluster_level, num_flanking, atomgroup_dict)
+         num_flanking, atomgroup_dict)
       if data is None:
          failed.append(all_pdbpaths[centroid_ind])
          continue
@@ -567,32 +553,24 @@ def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_c
          # will be the "target" for all the other members of the cluster.
          target_coords = first_pdb_cg_vdmbb_coords
          centroid_transf = write_out_subsequent_clus_pdbs(cent_cg_vdmbb_coords, 
-            cent_pr_obj, cent_pdb_outpath, target_coords, cluster_level, weights)
-      '''
-      After writing out the centroid, write out the remaining members of the cluster.
-      Unlike the centroids, respect the cluster "level".
-      '''
-      if cluster_level == 'cgvdmbb':
-         cent_cg_vdmbb_coords_copy = cent_cg_vdmbb_coords.copy()
-         target_coords = pr.applyTransformation(centroid_transf, cent_cg_vdmbb_coords_copy)
-      elif cluster_level == 'flankbb' or cluster_level == 'flankseq':
-         target_coords = [] # transform the bb atoms individually bc some have None
-         for b_ in cent_flankbb_coords:
-            if b_ is None:
-               target_coords.append(None)
-            else:
-               transformed_b = pr.applyTransformation(centroid_transf, b_)
-               assert len(transformed_b) == 1
-               # b_ is shape (3,) and transformed_b is shape (1, 3) but they need to match
-               transformed_b = transformed_b[0] 
-               target_coords.append(transformed_b)
+            cent_pr_obj, cent_pdb_outpath, target_coords, weights)
+      target_coords = [] # transform the bb atoms individually bc some have None
+      for b_ in cent_flankbb_coords:
+         if b_ is None:
+            target_coords.append(None)
+         else:
+            transformed_b = pr.applyTransformation(centroid_transf, b_)
+            assert len(transformed_b) == 1
+            # b_ is shape (3,) and transformed_b is shape (1, 3) but they need to match
+            transformed_b = transformed_b[0] 
+            target_coords.append(transformed_b)
 
       for ind in clus_mem_indices:
          if ind == centroid_ind:
             continue
          data = get_clus_mem_data(
             ind, all_cg_coords, all_cg_and_vdmbb_coords, all_flankbb_coords, all_pdbpaths, 
-            all_scrr_cg_perm, cluster_level, num_flanking, atomgroup_dict)
+            all_scrr_cg_perm, num_flanking, atomgroup_dict)
          if data is None:
             failed.append(all_pdbpaths[ind])
             continue
@@ -600,27 +578,21 @@ def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_c
             clusmem_pdbpath, clusmem_scrr_cg_perm, clusmem_pr_obj) = data
 
          # Define atoms to align. 
-         if cluster_level == 'cgvdmbb':
-            clusmem_coords = clusmem_cg_vdmbb_coords
-         elif cluster_level == 'flankbb' or cluster_level == 'flankseq':
-            clusmem_coords = clusmem_flankbb_coords
+         clusmem_coords = clusmem_flankbb_coords
 
          clusmem_pdb_outpath = get_clus_pdb_outpath(clusnum, clusnum_dir, 
                         clusmem_pdbpath, clusmem_scrr_cg_perm, ind, is_centroid=False)
          write_out_subsequent_clus_pdbs(clusmem_coords, clusmem_pr_obj, 
-                           clusmem_pdb_outpath, target_coords, cluster_level, weights)
+                           clusmem_pdb_outpath, target_coords, weights)
    
    return first_pdb_out, first_pdb_cg_vdmbb_coords, failed
 
 def write_out_subsequent_clus_pdbs(clusmem_coords, clusmem_pr_obj, clusmem_pdb_outpath, 
-                                   target_coords, cluster_level, weights=None):
+                                   target_coords, weights=None):
    if weights is None:
       weights = np.array([1/len(clusmem_coords) for i in clusmem_coords])
 
-   if cluster_level == 'cgvdmbb':
-      moved_coords, transf = pr.superpose(clusmem_coords, target_coords, weights=weights)
-   elif cluster_level == 'flankbb' or cluster_level == 'flankseq':
-      transf = get_transformation_for_flankbb(clusmem_coords, target_coords)
+   transf = get_transformation_for_flankbb(clusmem_coords, target_coords)
    pr_obj_copy = clusmem_pr_obj.copy() # b/c of mutability
    pr.applyTransformation(transf, pr_obj_copy)
    pr.writePDB(clusmem_pdb_outpath, pr_obj_copy)
@@ -659,7 +631,7 @@ def write_out_first_pdb(mobile, target, pr_obj, outpath, clusmem_cg_coords,
    moved_cg_coords = pr.applyTransformation(transf, clusmem_cg_coords)
    return moved_cg_coords, moved_cg_vdmbb_coords, transf
 
-def rewrite_temp_clusters(clusdir):
+def rewrite_temp_clusters(clusdir, clean_dir, size_subset, subset_AAs):
    # Clean up the cluster directory by merging degenerate vdGs (based on diff
    # AA perms and CG perms of the same PDB), deleting degenerate pdbs/clusters, 
    # reassigning cluster nums (and sort by cluster size, and removing the temp dir
@@ -667,28 +639,49 @@ def rewrite_temp_clusters(clusdir):
    # Must merge before deleting duplicates b/c need the duplicate names to determine 
    # which clusters are equivalent.
    
-   temp_clus_assignments = get_temp_clus_assignments(clusdir)
+   temp_clus_assignments = {}
+   ''' Structure:
+   temp_clus_assignments[tuple([flankseq clusnum, flankbb clusnum, 
+      cgvdmbb clusnum])] = ALL vdgs w/ sorted scrrs. Don't remove identical vdgs yet.
+   '''
+   clean_dir = os.path.join(clean_dir, str(size_subset), subset_AAs)
+   clusdir = os.path.join(clusdir, str(size_subset), subset_AAs)
+   for flankseq_clus in os.listdir(clusdir):
+      flankseq_clus_dir = os.path.join(clusdir, flankseq_clus)
+      for flankbb_clus in os.listdir(flankseq_clus_dir):
+         flankbb_clus_dir = os.path.join(flankseq_clus_dir, flankbb_clus)
+         for cgvdmbb_clus in os.listdir(flankbb_clus_dir):
+            cgvdmbb_clus_dir = os.path.join(flankbb_clus_dir, cgvdmbb_clus)
+            for pdb in os.listdir(cgvdmbb_clus_dir):
+               pdbpath = os.path.join(cgvdmbb_clus_dir, pdb)
+               temp_clus_assignments = get_temp_clus_assignments(flankseq_clus,
+                  flankbb_clus, cgvdmbb_clus, pdb, pdbpath, temp_clus_assignments)
+
    temp_clus_assignments = merge_equivalent_clusters(temp_clus_assignments)
    pruned_clusters = delete_redun_vdgs(temp_clus_assignments)
    reassigned = reassign_temp_clusters(pruned_clusters)
 
    # Move the deduplicated and reassigned PDBs to the new clus dir.
-   new_clusdir = [i for i in clusdir.split('/') if i != 'temp']
-   new_clusdir = '/'.join(new_clusdir)
-   os.makedirs(new_clusdir)
-   for new_clusnum, vdgs in reassigned.items():
-      new_clusnumdir = os.path.join(new_clusdir, f'clus_{new_clusnum}')
-      os.mkdir(new_clusnumdir)
-      for vdg in vdgs:
-         pdbbase, vdmscrrs, ix, vdgpath = vdg
-         # rename the pdb for clarity
-         scrr_str = '_'.join(['_'.join([str(z) for z in v_s]) for v_s in vdmscrrs])
-         if 'centroid' in vdgpath:
-            new_pdbname = f'clus{new_clusnum}_{pdbbase}_{scrr_str}_ix{ix}_centroid.pdb.gz'
-         else:
-            new_pdbname = f'clus{new_clusnum}_{pdbbase}_{scrr_str}_ix{ix}.pdb.gz'
-         os.rename(vdgpath, os.path.join(new_clusnumdir, new_pdbname))
-
+   for new_seq_clusnum, new_bb_clusters in reassigned.items():
+      for new_bb_clusnum, new_cgvdmbb_clusters in new_bb_clusters.items():
+         for new_cgvdmbb_clusnum, vdgs in new_cgvdmbb_clusters.items():
+            reassigned_clusdir = os.path.join(clean_dir, 
+               f'flankseqclus_{new_seq_clusnum}', f'flankbbclus_{new_bb_clusnum}', 
+               f'cgvdmbbclus_{new_cgvdmbb_clusnum}')
+            os.makedirs(reassigned_clusdir)
+            
+            # Copy over the vdgs
+            for vdg in vdgs:
+               pdbbase, vdmscrrs, ix, vdgpath = vdg
+               # rename the pdb for clarity
+               scrr_str = '_'.join(['_'.join([str(z) for z in v_s]) for v_s in vdmscrrs])
+               if 'centroid' in vdgpath:
+                  new_pdbname = f'{pdbbase}_{scrr_str}_centroid.pdb.gz'
+               else:
+                  new_pdbname = f'{pdbbase}_{scrr_str}.pdb.gz'
+               assert not os.path.exists(new_pdbname)
+               os.rename(vdgpath, os.path.join(reassigned_clusdir, new_pdbname))
+   
    return reassigned
          
 def determine_redundant_temp_vdg(already_seen_temp_vdgs, 
@@ -711,60 +704,58 @@ def determine_cluster_redundancy(clusnumA_vdgs, clusnumB_vdgs):
             return True
    return False
 
-def get_temp_clus_assignments(clusdir):
-   temp_clus_assignments = {} # key = clusnum, val = pdb w/ sorted scrrs
-   for clusnum in os.listdir(clusdir):
-      clusnumdir = os.path.join(clusdir, clusnum)
-      for pdb in os.listdir(clusnumdir):
-         pdb_base = pdb.split('.pdb.gz')[0]
-         pdb_base = '_'.join(pdb_base.split('_')[1:]) # removes "clus{x}_" from name
-         scrrs = pdb.split('.pdb.gz_')[1].removesuffix('.pdb.gz')
-         scrrs = scrrs.split('_CGperm')[0]
-         scrrs = scrrs.split('_')
-         assert len(scrrs) % 4 == 0
-         grouped_scrrs = [scrrs[i:i+4] for i in range(0, len(scrrs), 4)]
-         sorted_scrrs = sorted(grouped_scrrs)
-         clus_mem_index = pdb.split('_ix')[1].split('_')[0].removesuffix('.pdb.gz') # index for this specific 
-               # pdb of specific AA perm and cg perm for mapping it back to the original
-               # "all_AA_cg_perm...etc..." lists. 
-         vdg = tuple([pdb_base, sorted_scrrs, clus_mem_index, 
-            os.path.join(clusnumdir, pdb)]) # determine redundancy just on pdb_base and 
-            # sorted_scrrs, but record pdb path so that one file can be referenced for 
-            # copying over to a clean cluster dir.
-         if clusnum not in temp_clus_assignments.keys():
-            temp_clus_assignments[clusnum] = []
-         # check for redundancy
-         existing_in_clus = [i[:2] for i in temp_clus_assignments[clusnum]]
-         if vdg[:2] not in existing_in_clus:
-            temp_clus_assignments[clusnum].append(vdg)
+def get_temp_clus_assignments(flankseq_clus, flankbb_clus, cgvdmbb_clus, pdb, 
+                              pdbpath, temp_clus_assignments):
+   pdb_base = pdb.split('.pdb.gz')[0]
+   pdb_base = '_'.join(pdb_base.split('_')[1:]) # removes "clus{x}_" from name
+   scrrs = pdb.split('.pdb.gz_')[1].removesuffix('.pdb.gz')
+   scrrs = scrrs.split('_CGperm')[0]
+   scrrs = scrrs.split('_')
+   assert len(scrrs) % 4 == 0
+   grouped_scrrs = [scrrs[i:i+4] for i in range(0, len(scrrs), 4)]
+   sorted_scrrs = sorted(grouped_scrrs)
+
+   clus_mem_index = pdb.split('_ix')[1].split('_')[0].removesuffix(
+      '.pdb.gz') # index for this specific pdb of specific AA perm and cg perm for 
+                 # mapping it back to the original "all_AA_cg_perm...etc..." lists. 
+   vdg = tuple([pdb_base, sorted_scrrs, clus_mem_index, pdbpath]) # determine 
+      # redundancy just on pdb_base and sorted_scrrs, but record pdb path so that 
+      # one file can be referenced for copying over to a clean cluster dir.
+   # Check for redundancy (does this vdG already exist in temp_clus_assignments?)
+   clus_tuple = tuple([flankseq_clus, flankbb_clus, cgvdmbb_clus])
+   if clus_tuple not in temp_clus_assignments.keys():
+      temp_clus_assignments[clus_tuple] = []
+   existing_in_clus = [i[:2] for i in temp_clus_assignments[clus_tuple]]
+   assert vdg[:2] not in existing_in_clus
+   temp_clus_assignments[clus_tuple].append(vdg)
    return temp_clus_assignments
 
 def merge_equivalent_clusters(temp_clus_assignments):
    # After gathering all the pdb and sorted scrrs, find the degenerate vdGs and merge them.
-   already_seen_temp_clusnum_A = []
+   already_seen_temp_clustup_A = []
    clusnumbers = list(temp_clus_assignments.keys())
-   for clusnumA in clusnumbers:
-      if clusnumA not in temp_clus_assignments.keys(): # b/c dict dynamically changing
+   for clustupA in clusnumbers:
+      if clustupA not in temp_clus_assignments.keys(): # b/c dict dynamically changing
          continue
-      clusnumA_vdgs = temp_clus_assignments[clusnumA]
-      already_seen_temp_clusnum_A.append(clusnumA)
-      for clusnumB in clusnumbers:
-         if clusnumA == clusnumB:
+      clusnumA_vdgs = temp_clus_assignments[clustupA]
+      already_seen_temp_clustup_A.append(clustupA)
+      for clustupB in clusnumbers:
+         if clustupA == clustupB:
             continue
-         if clusnumB not in temp_clus_assignments.keys(): # b/c dict dynamically changing
+         if clustupB not in temp_clus_assignments.keys(): # b/c dict dynamically changing
             continue
-         if clusnumB in already_seen_temp_clusnum_A:
+         if clustupB in already_seen_temp_clustup_A:
             continue # ensures that only the upper triangle is calculated 
-         clusnumB_vdgs = temp_clus_assignments[clusnumB]
+         clusnumB_vdgs = temp_clus_assignments[clustupB]
          # Are any of clusnumA vdgs in clusnumB?
          if determine_cluster_redundancy(clusnumA_vdgs, clusnumB_vdgs): 
             # If so, merge the clusters
-            temp_clus_assignments[clusnumA] += temp_clus_assignments[clusnumB]
-            del temp_clus_assignments[clusnumB]
+            temp_clus_assignments[clustupA] += temp_clus_assignments[clustupB]
+            del temp_clus_assignments[clustupB]
    return temp_clus_assignments
 
 def delete_redun_vdgs(temp_clus_assignments):
-   # Next, delete the redundant vdgs
+   # Next, delete the redundant vdgs within the merged clusters
    already_seen_temp_vdgs = []
    pruned_clusters = {}
    for clusnum, vdgs in temp_clus_assignments.items():
@@ -781,16 +772,56 @@ def delete_redun_vdgs(temp_clus_assignments):
    return pruned_clusters
 
 def reassign_temp_clusters(pruned_clusters):
-   # Reassign cluster numbers, sorting cluster numbers based on size
-   reassigned = {}
-   sorted_clusters = sorted(pruned_clusters.keys(), 
-                                key=lambda k: len(pruned_clusters[k]), reverse=True)
-   for new_clusnum, old_clusnum in enumerate(sorted_clusters, start=1):
-      reassigned[new_clusnum] = pruned_clusters[old_clusnum]
+   '''
+   Reassign cluster numbers, sorting cluster numbers based on size.
+   Each subdict is re-ordered on the "clustering" level (meaning flank seq clusters
+   are reordered first, followed by flank bb clusters, followed by cgvdmbb clusters).
+   '''
+   clus_tuples = list(pruned_clusters.keys())
+   original_clus_labels = {}
+   for tup in clus_tuples:
+      seq_clus, bb_clus, cgvdmbb_clus = tup
+      if seq_clus not in original_clus_labels.keys():
+         original_clus_labels[seq_clus] = {}
+      if bb_clus not in original_clus_labels[seq_clus].keys():
+         original_clus_labels[seq_clus][bb_clus] = {}
+      assert cgvdmbb_clus not in original_clus_labels[seq_clus][bb_clus].keys()
+      original_clus_labels[seq_clus][bb_clus][cgvdmbb_clus] = pruned_clusters[tup]
+   
+   sorted_seq_clusters = sorted(original_clus_labels.items(), 
+                                key=lambda x: len(x[1]), reverse=True)
+   
+   # Re-order/renumber seq clus nums based on # of flank bb clus nums
+   reassigned_seq_clusters = {}
+   for new_seq_clus_num, (seq_clusters, bb_clusters) in enumerate(
+                        sorted_seq_clusters, start=1):
+      reassigned_seq_clusters[new_seq_clus_num] = bb_clusters
 
-   return reassigned
+   # Re-order/renumber flank bb clus nums based on # of cgvdmbb clus nums 
+   reassigned_bb_clusters = {}
+   for new_seq_clus_num, orig_bb_clusters in reassigned_seq_clusters.items():
+      sorted_bb_clusters = sorted(orig_bb_clusters.items(), 
+                                   key=lambda x: len(x[1]), reverse=True)
+      reassigned_bb_clusters[new_seq_clus_num] = {}
+      for new_bb_clus_num, (bb_clus_, cgvdmbb_clusters) in enumerate(
+                           sorted_bb_clusters, start=1):
+         reassigned_bb_clusters[new_seq_clus_num][new_bb_clus_num] = cgvdmbb_clusters
+   
+   # Re-order/renumber cgvdmbb clus nums based on # of vdgs
+   reassigned_cgvdmbb_clusters = {}
+   for new_seq_clus_num, orig_bb_clusters in reassigned_bb_clusters.items():
+      reassigned_cgvdmbb_clusters[new_seq_clus_num] = {}
+      for new_bb_clus_num, orig_cgvdmbb_clusters in orig_bb_clusters.items():
+         sorted_cgvdmbb_clusters = sorted(orig_cgvdmbb_clusters.values(), 
+                                          key=lambda x: len(x), reverse=True)
+         reassigned_cgvdmbb_clusters[new_seq_clus_num][new_bb_clus_num] = {}
+         for new_cgvdmbb_clus_num, vdgs in enumerate(sorted_cgvdmbb_clusters, start=1):
+            reassigned_cgvdmbb_clusters[new_seq_clus_num][new_bb_clus_num][
+                                                          new_cgvdmbb_clus_num] = vdgs
 
-def get_pr_obj_from_cluster_level(clusmem_pdbpath, cluster_level, vdg_scrr_cg_perm,
+   return reassigned_cgvdmbb_clusters
+
+def get_pr_obj_to_print(clusmem_pdbpath, vdg_scrr_cg_perm,
                                   num_flanking, atomgroup_dict):
    try:
       if clusmem_pdbpath in atomgroup_dict.keys():
@@ -798,19 +829,16 @@ def get_pr_obj_from_cluster_level(clusmem_pdbpath, cluster_level, vdg_scrr_cg_pe
       else:
          par = pr.parsePDB(clusmem_pdbpath)
    except:
+      raise ValueError(f'Could not parse {clusmem_pdbpath}.')
       return None
    # Add CG to pr obj
    pr_obj = par.select('occupancy > 2.8') # occ >= 3 is CG
    vdg_scrrs, cg_perm = vdg_scrr_cg_perm
    # Iterate over vdms
    for vdm_scrr in vdg_scrrs:
-      if cluster_level == 'cgvdmbb':
-         res_obj = add_vdm_obj_for_cluslevel_cgvdmbb(par, vdm_scrr)
-         pr_obj += res_obj
-      elif cluster_level == 'flankbb' or cluster_level == 'flankseq':
-         flank_obj = add_flank_obj_for_cluslevel_flank(par, vdm_scrr, num_flanking,
-                                                       clusmem_pdbpath)
-         pr_obj += flank_obj
+      flank_obj = add_flank_obj_for_cluslevel_flank(par, vdm_scrr, num_flanking,
+                                                    clusmem_pdbpath)
+      pr_obj += flank_obj
 
    return pr_obj.copy()
 
@@ -856,8 +884,7 @@ def add_flank_obj_for_cluslevel_flank(par, vdm_scrr, num_flanking, pdbpath):
    return flank_obj
 
 def get_clus_mem_data(ind, all_cg_coords, all_cg_and_vdmbb_coords, all_flankbb_coords,
-                      all_pdbpaths, all_scrr_cg_perm, cluster_level, num_flanking, 
-                      atomgroup_dict):
+                      all_pdbpaths, all_scrr_cg_perm, num_flanking, atomgroup_dict):
    # Given the index of a cluster member, return the cg coords, cg+vdmbb coords, 
    # pdbpath, scrr_cg_perm, pr_obj, and output pdb name.
       
@@ -866,8 +893,8 @@ def get_clus_mem_data(ind, all_cg_coords, all_cg_and_vdmbb_coords, all_flankbb_c
    clusmem_flankbb_coords = all_flankbb_coords[ind]
    clusmem_pdbpath = all_pdbpaths[ind]
    clusmem_scrr_cg_perm = all_scrr_cg_perm[ind]
-   clusmem_pr_obj = get_pr_obj_from_cluster_level(clusmem_pdbpath, cluster_level, 
-                              clusmem_scrr_cg_perm, num_flanking, atomgroup_dict)
+   clusmem_pr_obj = get_pr_obj_to_print(clusmem_pdbpath, clusmem_scrr_cg_perm, 
+                                        num_flanking, atomgroup_dict)
    if clusmem_pr_obj is None:
       return None
    
@@ -896,14 +923,6 @@ def get_weights(num_cg_atoms, num_bb_atoms, align_cg_weight):
    if not np.abs(weights.sum() - 1.) < 1e-8:
       raise ValueError('Weights do not sum to 1.')
    return weights
-
-def reformat_reassigned_clus(reassigned_clusvdmbb_clus):
-   # Reformat clus dict so that it matches `cgvdmbb_cluster_assignments`.
-   # Key = clusnum, val = list of indices of vdgs in that cluster
-   reformatted = {}
-   for ke_, va_ in reassigned_clusvdmbb_clus.items():
-      reformatted[ke_] = [int(v[2]) for v in va_]
-   return reformatted
 
 def add_vdm_obj_for_cluslevel_cgvdmbb(par, vdm_scrr):
    r = vdm_scrr[2] 
