@@ -545,7 +545,8 @@ def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_c
          # If no pdb has been written out yet, align the first 3 CG atoms to the
          # reference 3 atoms and output the pdb.
          first_pdb_out, first_pdb_cg_vdmbb_coords, centroid_transf = print_out_first_pdb_of_clus(
-            cent_pdb_outpath, cent_cg_coords, cent_cg_vdmbb_coords, cent_pr_obj, ref)
+            cent_pdb_outpath, cent_cg_coords, cent_cg_vdmbb_coords, cent_pr_obj, ref,
+            cent_scrr_cg_perm)
       else:
          # If a pdb has already been written out, align this vdg's cg+vdmbb onto that 
          # first pdb. "target_coords" to align to is cg+vdmbb of the first PDB (which 
@@ -553,7 +554,7 @@ def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_c
          # will be the "target" for all the other members of the cluster.
          target_coords = first_pdb_cg_vdmbb_coords
          centroid_transf = write_out_subsequent_clus_pdbs(cent_cg_vdmbb_coords, 
-            cent_pr_obj, cent_pdb_outpath, target_coords, weights)
+            cent_pr_obj, cent_pdb_outpath, target_coords, cent_scrr_cg_perm, weights)
       target_coords = [] # transform the bb atoms individually bc some have None
       for b_ in cent_flankbb_coords:
          if b_ is None:
@@ -565,6 +566,7 @@ def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_c
             transformed_b = transformed_b[0] 
             target_coords.append(transformed_b)
 
+      # After centroid, output the rest of the cluster members
       for ind in clus_mem_indices:
          if ind == centroid_ind:
             continue
@@ -583,18 +585,21 @@ def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_c
          clusmem_pdb_outpath = get_clus_pdb_outpath(clusnum, clusnum_dir, 
                         clusmem_pdbpath, clusmem_scrr_cg_perm, ind, is_centroid=False)
          write_out_subsequent_clus_pdbs(clusmem_coords, clusmem_pr_obj, 
-                           clusmem_pdb_outpath, target_coords, weights)
+                        clusmem_pdb_outpath, target_coords, clusmem_scrr_cg_perm, weights)
    
    return first_pdb_out, first_pdb_cg_vdmbb_coords, failed
 
 def write_out_subsequent_clus_pdbs(clusmem_coords, clusmem_pr_obj, clusmem_pdb_outpath, 
-                                   target_coords, weights=None):
+                                   target_coords, scrrs, weights=None):
    if weights is None:
       weights = np.array([1/len(clusmem_coords) for i in clusmem_coords])
-
+   # Superpose
    transf = get_transformation_for_flankbb(clusmem_coords, target_coords)
    pr_obj_copy = clusmem_pr_obj.copy() # b/c of mutability
    pr.applyTransformation(transf, pr_obj_copy)
+   # Set occupancies so that only the vdMs being clustered are 2.0
+   pr_obj_copy = reset_occs(pr_obj_copy, scrrs)
+   # Write out PDB
    pr.writePDB(clusmem_pdb_outpath, pr_obj_copy)
    return transf
 
@@ -619,15 +624,20 @@ def get_clus_pdb_outpath(clusnum, clusnum_dir, pdbpath, scrr_cg_perm, clusmem_in
    return os.path.join(clusnum_dir, pdb_str)
 
 def write_out_first_pdb(mobile, target, pr_obj, outpath, clusmem_cg_coords,
-                        clusmem_cg_vdmbb_coords):
+                        clusmem_cg_vdmbb_coords, scrrs):
    # No weights because it's only aligning 3 atoms of CG
    mobile, target = np.array(mobile), np.array(target)
    moved_3atom_coords, transf = pr.superpose(mobile, target)
    pr_obj_copy = pr_obj.copy() # b/c of mutability
    pr.applyTransformation(transf, pr_obj_copy)
    moved_cg_vdmbb_coords = pr.applyTransformation(transf, clusmem_cg_vdmbb_coords)
+   # Set occupancies so that only the vdMs being clustered are 2.0
+   pr_obj_copy = reset_occs(pr_obj_copy, scrrs)
+   # Write out PDB
    pr.writePDB(outpath, pr_obj_copy)
-   # superposed on 3 reference atoms, but need to return coords of the entire CG.
+   # Return the moved coords so that the next PDB can be aligned onto this. 
+   # This was superposed on 3 reference atoms, but need to return coords of the entire CG 
+   # so that following vdgs will be aligned on the entire CG and not the ref.
    moved_cg_coords = pr.applyTransformation(transf, clusmem_cg_coords)
    return moved_cg_coords, moved_cg_vdmbb_coords, transf
 
@@ -901,13 +911,14 @@ def get_clus_mem_data(ind, all_cg_coords, all_cg_and_vdmbb_coords, all_flankbb_c
    return [clusmem_cg_coords, clusmem_cg_vdmbb_coords, clusmem_flankbb_coords, 
            clusmem_pdbpath, clusmem_scrr_cg_perm, clusmem_pr_obj]
 
-def print_out_first_pdb_of_clus(pdb_outpath, cg_coords, cg_vdmbb_coords, pr_obj, ref):
+def print_out_first_pdb_of_clus(pdb_outpath, cg_coords, cg_vdmbb_coords, pr_obj, ref, 
+                                scrrs):
    # Align this first pdb being output to the 3-atom reference.
    # Return the name of this cluster member, b/c it's the first one being output
    first_pdb_out = pdb_outpath
    mobile, target = cg_coords[:3], ref
    moved_cg_coords, moved_cg_vdmbb_coords, centroid_transf = write_out_first_pdb(
-            mobile, target, pr_obj, pdb_outpath, cg_coords, cg_vdmbb_coords)
+            mobile, target, pr_obj, pdb_outpath, cg_coords, cg_vdmbb_coords, scrrs)
    _cg_coords = moved_cg_coords
    first_pdb_cg_vdmbb_coords = moved_cg_vdmbb_coords
    return first_pdb_out, first_pdb_cg_vdmbb_coords, centroid_transf
@@ -994,3 +1005,16 @@ def flatten_flanking_seqs(flankingCAs_clus_flankingseqs):
       flattened_flankingseqs_for_vdgs_in_flankingCA_clus.append(
          flat_vdg_flankingseq)
    return flattened_flankingseqs_for_vdgs_in_flankingCA_clus
+
+def reset_occs(pr_obj_copy, scrrs):
+   # Set occupancies so that only the vdMs being clustered are 2.0
+   pr_obj_copy.protein.setOccupancies(1.0) # reset protein only; don't touch ligand
+   scrr_list, perm = scrrs
+   for scrr in scrr_list: 
+      seg, chain, resnum, resname = scrr
+      if seg == '':
+         sel = f'chain {chain} and resnum {resnum} and resname {resname}'
+      else:
+         sel = f'segname {seg} and chain {chain} and resnum {resnum} and resname {resname}'
+      pr_obj_copy.select(sel).setOccupancies(2.0)
+   return pr_obj_copy

@@ -91,6 +91,9 @@ def main():
     for num_vdms in [1,2,3,4]:
         deduplicate_cmd = deduplicate_template + str(num_vdms)
         subprocess.run(deduplicate_cmd, shell=True, check=True)
+    
+    with open(logfile, 'w') as _log:
+        _log.write(f'Job completed.\n')
 
 def set_up_outdir(out_dir):
     # Set up output directory
