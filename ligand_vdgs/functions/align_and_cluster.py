@@ -736,8 +736,8 @@ def get_temp_clus_assignments(flankseq_clus, flankbb_clus, cgvdmbb_clus, pdb,
    if clus_tuple not in temp_clus_assignments.keys():
       temp_clus_assignments[clus_tuple] = []
    existing_in_clus = [i[:2] for i in temp_clus_assignments[clus_tuple]]
-   assert vdg[:2] not in existing_in_clus
-   temp_clus_assignments[clus_tuple].append(vdg)
+   if not vdg[:2] in existing_in_clus:
+      temp_clus_assignments[clus_tuple].append(vdg)
    return temp_clus_assignments
 
 def merge_equivalent_clusters(temp_clus_assignments):

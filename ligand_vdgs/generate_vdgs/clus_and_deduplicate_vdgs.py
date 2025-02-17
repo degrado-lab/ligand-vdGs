@@ -41,12 +41,12 @@ def parse_args():
                         "when superposing output vdGs. Not weights for clustering. "
                         "Example: 0.5 means 1/2 of weight is assigned to CG atoms and "
                         "the remaining 1/2 goes to the vdM backbone atoms.")
-    parser.add_argument('-q', "--seq", default=0.30,
+    parser.add_argument('-q', "--seq", default=0.40,
                         help="Sequence similarity threshold for clustering sequences "
                         "flanking the vdM to determine redundancy. This should be a "
                         "value between 0 and 1. Values > seq will be considered "
                         "redundant.")
-    parser.add_argument('-f', "--flank", default=3,
+    parser.add_argument('-f', "--flank", default=2,
                         help="Number of residues +/- the vdms for which to "
                         "calculate sequence similarity and backbone similarity.")
     parser.add_argument('-s', '--symmetry-classes', nargs='+', type=int,
@@ -58,7 +58,7 @@ def parse_args():
                         help='Specify the number of residues in the vdG subset. '
                         'The purpose of this arg is for parallelization (running '
                         'this script with different -n values concurrently. 1, 2, '
-                        'and 4 are recommended.')
+                        '3, and 4 are recommended.')
     parser.add_argument('-l', "--logfile", help="Path to log file.")
     
     return parser.parse_args()
