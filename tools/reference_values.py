@@ -1,3 +1,5 @@
+import numpy as np
+
 AA_size = {'ALA': 5,
            'ARG': 11,
            'ASN': 8,
@@ -40,3 +42,17 @@ AA_background_freq = \
            'TRP': 0.013705138015159568,
            'TYR': 0.03489372480131626,
            'VAL': 0.07244700673477375}
+
+def avg_size_aa():
+    return np.mean(list(AA_size.values()))
+
+def avg_size_of_aa_pair():
+    size_aa_pairs = {}
+    for aa1 in set(AA_size):
+        for aa2 in set(AA_size):
+            sorted_aa_pair = tuple(sorted([aa1, aa2])) # ensure only upper triangle
+            pair_size = AA_size[aa1] + AA_size[aa2]
+            if sorted_aa_pair not in size_aa_pairs.keys():
+                size_aa_pairs[sorted_aa_pair] = pair_size
+    avg_size_of_aa_pair = np.mean(list(size_aa_pairs.values()))
+    return avg_size_of_aa_pair

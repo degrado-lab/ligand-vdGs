@@ -416,9 +416,9 @@ def delete_clusterdirs(vdglib_dir, logfile, size_subset):
 def normalize_rmsd(num_atoms):
     # Smoothly scale rmsd threshold by the number of atoms.
     min_atoms = 8
-    min_threshold = 0.3
-    max_atoms = 20
-    max_threshold = 1.3 
+    min_threshold = 0.5
+    max_atoms = 15
+    max_threshold = 1.25
     
     if num_atoms < min_atoms:
         return min_threshold  # below 5 atoms, use the minimum threshold (1.5 Å)
