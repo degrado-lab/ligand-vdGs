@@ -3,6 +3,7 @@ import sys
 import time
 import subprocess
 import argparse 
+import shutil
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -91,10 +92,33 @@ def main():
     for num_vdms in [1,2,3,4]:
         deduplicate_cmd = deduplicate_template + str(num_vdms)
         subprocess.run(deduplicate_cmd, shell=True, check=True)
+        
+    # Clean up the final state of clusters dir. Each subset's tempdir, flankseq, and 
+    # flankbb dirs were cleaned up along the way, but the highest level of these dirs 
+    # need to be deleted too.
+    clean_up_dirs(out_dir, 'temp', logfile) 
+    clean_up_dirs(out_dir, 'flankseq', logfile) 
+    clean_up_dirs(out_dir, 'flankbb', logfile) 
     
     with open(logfile, 'a') as _log:
         _log.write(f'='*79 + '\n')
         _log.write(f'Job completed.\n')
+
+def clean_up_dirs(out_dir, clus_level, logfile):
+    direc = os.path.join(out_dir, 'clusters', clus_level)
+    with open(logfile, 'a') as _log:
+        if not os.path.exists(direc):
+            _log.write(f"\t{direc} does not exist.\n")
+        else:
+            # Check if there are files. 
+            # They should have been deleted in the last set of clus_and_deduplicate_vdgs.py
+            for root, dirs, files in os.walk(direc):
+                if files:
+                    _log.write(f"\t{direc} contains these files and will be deleted: \n")
+                    for file in files:
+                        _log.write(f"\t\t{file}\n")
+                    return
+            shutil.rmtree(direc)
 
 def set_up_outdir(out_dir):
     # Set up output directory

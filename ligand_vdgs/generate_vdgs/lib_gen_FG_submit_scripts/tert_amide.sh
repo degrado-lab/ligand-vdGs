@@ -9,6 +9,7 @@
 #$ -l mem_free=50G
 #$ -l scratch=50G
 #$ -R yes             #-- SGE host reservation
+#$ -l h=!qb3-as4
 
 date
 hostname

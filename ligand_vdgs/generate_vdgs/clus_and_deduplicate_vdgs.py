@@ -171,6 +171,19 @@ def main():
          flanking seq clusters are redundant. Select only the centroid to be output.'''
          copy_nr_to_outdir(vdglib_dir, out_dir, _reordered_AAs)
 
+   '''
+   Clean up the entire output from clus_and_deduplicate_vdgs.py.
+   At each clustering stage (flankseq, flankbb, then cgvdmbb), the clustered PDBs are 
+   output so that they can be loaded in for the next step. (The libraries 
+   are usually way too large to store in memory.) At the end of clustering (at the cgvdmbb
+   level), the clustered output for cgvdmbb is organized by: 
+   CG/clusters/cgvdmbb/cgvdmbb_clusnum/AAs/flankseq_clusnum/flankbb_clusnum/cgvdmbb_clusnum.
+   Therefore, it's easy to trace the flankseq, flankbb, and cgvdmbb cluster numbers, and
+   earlier output (clusters/flankseq/ and clusters/flankbb) can be deleted, as well as
+   the temp dir used for the different permutations of cgvdmbb.
+   '''
+   delete_clusterdirs(vdglib_dir, logfile, size_subset)
+
    # Print out time elapsed
    seconds = time.time() - start_time
    hours = round(seconds // 3600)
@@ -377,6 +390,28 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
    cleandir = os.path.join(vdglib_dir, 'clusters', 'cgvdmbb')
    reassigned_cgvdmbb_clus = clust.rewrite_temp_clusters(tempdir, cleandir, 
                                     len(reordered_AAs), '_'.join(reordered_AAs))
+   
+def delete_clusterdirs(vdglib_dir, logfile, size_subset):
+   with open(logfile, 'a') as file:
+      all_clusters = os.path.join(vdglib_dir, 'clusters')
+      # delete temp folder
+      tempdir = os.path.join(all_clusters, 'temp', 'cgvdmbb', str(size_subset))
+      if not os.path.exists(tempdir):
+         file.write(f"\t{tempdir} does not exist.\n")
+      else:
+         shutil.rmtree(tempdir)
+      # delete flankseq
+      flankseqdir = os.path.join(all_clusters, 'flankseq', str(size_subset))
+      if not os.path.exists(flankseqdir):
+         file.write(f"\t{flankseqdir} does not exist.\n")
+      else:
+         shutil.rmtree(flankseqdir)
+      # delete flankbb
+      flankbbdir = os.path.join(all_clusters, 'flankbb', str(size_subset))
+      if not os.path.exists(flankbbdir):
+         file.write(f"\t{flankbbdir} does not exist.\n")
+      else:
+         shutil.rmtree(flankbbdir)
 
 def normalize_rmsd(num_atoms):
     # Smoothly scale rmsd threshold by the number of atoms.

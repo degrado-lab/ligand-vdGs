@@ -1012,9 +1012,13 @@ def reset_occs(pr_obj_copy, scrrs):
    scrr_list, perm = scrrs
    for scrr in scrr_list: 
       seg, chain, resnum, resname = scrr
-      if seg == '':
-         sel = f'chain {chain} and resnum {resnum} and resname {resname}'
+      if resnum < 0:
+         res_sel = f'resnum `{resnum}`'
       else:
-         sel = f'segname {seg} and chain {chain} and resnum {resnum} and resname {resname}'
+         res_sel = f'resnum {resnum}'
+      if seg == '':
+         sel = f'chain {chain} and {res_sel} and resname {resname}'
+      else:
+         sel = f'segname {seg} and chain {chain} and {res_sel} and resname {resname}'
       pr_obj_copy.select(sel).setOccupancies(2.0)
    return pr_obj_copy
