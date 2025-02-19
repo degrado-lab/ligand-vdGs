@@ -65,21 +65,21 @@ def main():
 
     # Run smarts_to_cg.py
     if trial_run:
-        smarts_to_cg_cmd = f'python ligand_vdgs/programs/vdG-miner/vdg_miner/programs/smarts_to_cgs.py -s {smarts} -c "{cg}" -p {pdb_dir} -o "{out_dir}" -l "{logfile}" -t {trial_run}'
+        smarts_to_cg_cmd = f'python external/vdG-miner/vdg_miner/programs/smarts_to_cgs.py -s {smarts} -c "{cg}" -p {pdb_dir} -o "{out_dir}" -l "{logfile}" -t {trial_run}'
     else:
-        smarts_to_cg_cmd = f'python ligand_vdgs/programs/vdG-miner/vdg_miner/programs/smarts_to_cgs.py -s {smarts} -c "{cg}" -p {pdb_dir} -o "{out_dir}" -l "{logfile}"'
+        smarts_to_cg_cmd = f'python external/vdG-miner/vdg_miner/programs/smarts_to_cgs.py -s {smarts} -c "{cg}" -p {pdb_dir} -o "{out_dir}" -l "{logfile}"'
     
     subprocess.run(smarts_to_cg_cmd, shell=True, check=True)
 
     # Run generate_fingerprints.py
     match_pkl = os.path.join(out_dir, f'{cg}_matches.pkl') # output from smarts_to_cg.py
-    fingerprints_cmd = f'python ligand_vdgs/programs/vdG-miner/vdg_miner/programs/generate_fingerprints.py -c "{cg}" -l "{logfile}" -m "{match_pkl}" -p {pdb_dir} -b {probe_dir} -o "{out_dir}"'
+    fingerprints_cmd = f'python external/vdG-miner/vdg_miner/programs/generate_fingerprints.py -c "{cg}" -l "{logfile}" -m "{match_pkl}" -p {pdb_dir} -b {probe_dir} -o "{out_dir}"'
 
     subprocess.run(fingerprints_cmd, shell=True, check=True)
 
     # Run fingerprints_to_pdbs.py
     fingerprints = os.path.join(out_dir, 'fingerprints') # output from generate_fingerprints.py
-    to_pdbs_cmd = f'python ligand_vdgs/programs/vdG-miner/vdg_miner/programs/fingerprints_to_pdbs.py -c "{cg}" -m "{match_pkl}" -l "{logfile}" -f "{fingerprints}" -p {pdb_dir} -o "{out_dir}" -s -e'
+    to_pdbs_cmd = f'python external/vdG-miner/vdg_miner/programs/fingerprints_to_pdbs.py -c "{cg}" -m "{match_pkl}" -l "{logfile}" -f "{fingerprints}" -p {pdb_dir} -o "{out_dir}" -s -e'
 
     subprocess.run(to_pdbs_cmd, shell=True, check=True)
 
