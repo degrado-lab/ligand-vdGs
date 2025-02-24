@@ -97,12 +97,18 @@ def main():
     # flankbb dirs were cleaned up along the way, but the highest level of these dirs 
     # need to be deleted too.
     clean_up_dirs(out_dir, 'temp', logfile) 
-    clean_up_dirs(out_dir, 'flankseq', logfile) 
-    clean_up_dirs(out_dir, 'flankbb', logfile) 
+    clean_up_dirs(out_dir, 'cgvdmbb', logfile) 
+    delete_empty_nr_vdgs_dirs(out_dir)
     
     with open(logfile, 'a') as _log:
         _log.write(f'='*79 + '\n')
         _log.write(f'Job completed.\n')
+
+def delete_empty_nr_vdgs_dirs(out_dir):
+    nr_vdgs_dir = os.path.join(out_dir, 'nr_vdgs')
+    for root, dirs, files in os.walk(nr_vdgs_dir):
+        if not dirs and not files:
+            os.system(f'rmdir {root}')
 
 def clean_up_dirs(out_dir, clus_level, logfile):
     direc = os.path.join(out_dir, 'clusters', clus_level)
