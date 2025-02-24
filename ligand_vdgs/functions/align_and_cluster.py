@@ -576,25 +576,18 @@ def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_c
          first_pdb_out, first_pdb_cg_vdmbb_coords, centroid_transf = print_out_first_pdb_of_clus(
             cent_pdb_outpath, cent_cg_coords, cent_cg_vdmbb_coords, cent_pr_obj, ref,
             cent_scrr_cg_perm, print_flankbb)
+         target_coords = first_pdb_cg_vdmbb_coords
+         
       else:
          # If a pdb has already been written out, align this vdg's cg+vdmbb onto that 
          # first pdb. "target_coords" to align to is cg+vdmbb of the first PDB (which 
          # itself is a centroid). Return the transformation b/c this moved centroid 
          # will be the "target" for all the other members of the cluster.
          target_coords = first_pdb_cg_vdmbb_coords
-         centroid_transf = write_out_subsequent_clus_pdbs(cent_cg_vdmbb_coords, 
+         moved_centroid_cgvdmbb = write_out_subsequent_clus_pdbs(cent_cg_vdmbb_coords, 
             cent_pr_obj, cent_pdb_outpath, target_coords, cent_scrr_cg_perm, 
             print_flankbb, weights)
-      target_coords = [] # transform the bb atoms individually bc some have None
-      for b_ in cent_flankbb_coords:
-         if b_ is None:
-            target_coords.append(None)
-         else:
-            transformed_b = pr.applyTransformation(centroid_transf, b_)
-            assert len(transformed_b) == 1
-            # b_ is shape (3,) and transformed_b is shape (1, 3) but they need to match
-            transformed_b = transformed_b[0] 
-            target_coords.append(transformed_b)
+         target_coords = moved_centroid_cgvdmbb
 
       # After centroid, output the rest of the cluster members
       for ind in clus_mem_indices:
@@ -610,7 +603,7 @@ def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_c
             clusmem_pdbpath, clusmem_scrr_cg_perm, clusmem_pr_obj) = data
 
          # Define atoms to align. 
-         clusmem_coords = clusmem_flankbb_coords
+         clusmem_coords = clusmem_cg_vdmbb_coords
 
          clusmem_pdb_outpath = get_clus_pdb_outpath(clusnum, clusnum_dir, 
             clusmem_pdbpath, clusmem_scrr_cg_perm, ind, is_centroid=False)
@@ -624,7 +617,7 @@ def write_out_subsequent_clus_pdbs(clusmem_coords, clusmem_pr_obj, clusmem_pdb_o
    if weights is None:
       weights = np.array([1/len(clusmem_coords) for i in clusmem_coords])
    # Superpose
-   transf = get_transformation_for_flankbb(clusmem_coords, target_coords)
+   moved_clusmem_coords, transf = pr.superpose(clusmem_coords, target_coords, weights)
    pr_obj_copy = clusmem_pr_obj.copy() # b/c of mutability
    pr.applyTransformation(transf, pr_obj_copy)
    # Set occupancies so that only the vdMs being clustered are 2.0
@@ -634,14 +627,7 @@ def write_out_subsequent_clus_pdbs(clusmem_coords, clusmem_pr_obj, clusmem_pdb_o
       pr.writePDB(clusmem_pdb_outpath, pr_obj_copy.select('occupancy > 1.5')) # selects occ=2.0
    else:
       pr.writePDB(clusmem_pdb_outpath, pr_obj_copy)
-   return transf
-
-def get_transformation_for_flankbb(flankbb_mob, flankbb_tar):
-   # Treat differently from cg+vdmbb because this is a list of coords that 
-   # occassionally contains Nones.
-   data_i, data_j = get_overlapping_res_coords(flankbb_mob, flankbb_tar)
-   moved_coords_i, transf = pr.superpose(data_i, data_j)
-   return transf
+   return pr.applyTransformation(transf, clusmem_coords)
 
 def get_clus_pdb_outpath(clusnum, clusnum_dir, pdbpath, scrr_cg_perm, clusmem_ind, 
                          is_centroid):

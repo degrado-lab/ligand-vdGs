@@ -39,7 +39,7 @@ def parse_args():
                         help="Directory for the vdms of this CG.")
     #parser.add_argument('-o', "--output-clus-pdbs", action='store_true', 
     #                    help="Output clustered PDBs.")
-    parser.add_argument('-w', "--align-cg-weight", type=float, default=0.90, 
+    parser.add_argument('-w', "--align-cg-weight", type=float, default=0.95, 
                         help="Fraction of weights to assign to CG atoms (collectively) "
                         "when superposing output vdGs. Not weights for clustering. "
                         "Example: 0.5 means 1/2 of weight is assigned to CG atoms and "
@@ -356,7 +356,8 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
          flankingseq_and_bb_cluster_assignments, flankingseq_and_bb_clus_centroids,
          cgvdmbb_clus_cg_coords, cgvdmbb_clus_pdbpaths, cgvdmbb_clus_vdm_scrr_cg_perm, 
          cgvdmbb_clus_cgvdmbb_coords, cgvdmbb_clus_flat_flankingCAs, num_flanking, 
-         first_pdb_out, first_pdb_cg_vdmbb_coords, None, atomgroup_dict, print_flankbb)
+         first_pdb_out, first_pdb_cg_vdmbb_coords, cgvdmbb_weights, atomgroup_dict, 
+         print_flankbb)
 
       if len(failed_pdbs) > 0:
          with open(logfile, 'a') as file:
