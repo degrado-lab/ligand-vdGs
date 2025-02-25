@@ -237,6 +237,7 @@ def kabsch(X, Y):
     ssd = np.sum(XRmY ** 2, axis=(1, 2))
     return R, t, ssd
 
+'''
 def get_overlapping_res_coords(list1, list2):
     list1_overlap = []
     list2_overlap = []
@@ -248,6 +249,7 @@ def get_overlapping_res_coords(list1, list2):
             list2_overlap.append(list2[i])
      
     return np.array(list1_overlap), np.array(list2_overlap)
+'''
 
 def calc_seq_similarity(list1, list2):
     # Count how many residues match
@@ -315,7 +317,7 @@ def get_vdm_res_features(prody_obj, pdbpath, num_flanking):
             if ind == 1 or ind == -1:
                prev_CA = central_vdm_CA
             curr_CA = flanking_seq_dict[ind][1]
-            if curr_CA is None:
+            if np.any(np.isnan(curr_CA)): # curr_CA is None:
                flanking_seq_dict = found_chain_break(flanking_seq_dict, ind)
                break 
             dist = pr.calcDistance(np.array(prev_CA), np.array(curr_CA))
