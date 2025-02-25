@@ -14,6 +14,6 @@ hostname
 
 conda activate smart_vdms_env
 
-python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py -s "[NX3H1]~c~1~c~c~c~c~c1" -c aniline_NH1 -p /wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2/ -b /wynton/group/degradolab/skt/docking/databases/probe_output/ -o /wynton/group/degradolab/skt/docking/databases/vdg_lib --symmetry-classes 0 1 2 3 4 3 2
+python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py -s "[NX3]([H])~c~1~c~c~c~c~c1" -c aniline_NH1 -p /wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2/ -b /wynton/group/degradolab/skt/docking/databases/probe_output/ -o /wynton/group/degradolab/skt/docking/databases/vdg_lib --symmetry-classes 0 1 2 3 4 5 4 3
 
 date

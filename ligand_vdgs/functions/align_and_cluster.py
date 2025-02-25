@@ -901,7 +901,11 @@ def print_out_first_pdb_of_clus(pdb_outpath, cg_coords, cg_vdmbb_coords, pr_obj,
    # Align this first pdb being output to the 3-atom reference.
    # Return the name of this cluster member, b/c it's the first one being output
    first_pdb_out = pdb_outpath
-   mobile, target = cg_coords[:3], ref
+   if len(cg_coords) >= 3:
+      mobile, target = cg_coords[:3], ref
+   # Sometimes the CG only has 2 atoms
+   elif len(cg_coords)  == 2:
+      mobile, target = cg_coords[:2], ref[:2]
    moved_cg_coords, moved_cg_vdmbb_coords, centroid_transf = write_out_first_pdb(
       mobile, target, pr_obj, pdb_outpath, cg_coords, cg_vdmbb_coords, scrrs, print_flankbb)
    _cg_coords = moved_cg_coords
