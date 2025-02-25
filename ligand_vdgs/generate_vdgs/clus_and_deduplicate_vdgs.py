@@ -39,7 +39,7 @@ def parse_args():
                         help="Directory for the vdms of this CG.")
     #parser.add_argument('-o', "--output-clus-pdbs", action='store_true', 
     #                    help="Output clustered PDBs.")
-    parser.add_argument('-w', "--align-cg-weight", type=float, default=0.95, 
+    parser.add_argument('-w', "--align-cg-weight", type=float, default=0.98, 
                         help="Fraction of weights to assign to CG atoms (collectively) "
                         "when superposing output vdGs. Not weights for clustering. "
                         "Example: 0.5 means 1/2 of weight is assigned to CG atoms and "
