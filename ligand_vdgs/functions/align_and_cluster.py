@@ -4,6 +4,7 @@ from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
 import prody as pr
 import os
+import sys
 
 def get_vdg_AA_permutations(reordered_AAs, _vdgs):
    permuted_indices = permute_AA_duplicates(reordered_AAs)
@@ -162,36 +163,79 @@ def get_hierarchical_clusters(data_to_clus, threshold, rmsd_max):
    return cluster_assignments, centroids
 
 def create_dist_matrix(data, dist_metric):
-   if dist_metric == 'flankseq':
-      calc_seq = True
-      calc_rmsd = False
-   elif dist_metric == 'cgvdmbb' or dist_metric == 'flankbb':
-      calc_seq = False
-      calc_rmsd = True
-   
    n = len(data)
    distance_matrix = np.zeros((n, n))
-   for i in range(n):
-      for j in range(i + 1, n):
-         # Align and then calc rmsd or seq dissimilarity. If "None" is in the list 
-         # of coords (which is what would happen if rmsd is being calculated on 
-         # stretches of backbone and terminal residues are missing), then select 
-         # only the overlapping residues where a coordinate could be extracted for 
-         # both elements being measured.
-         data_i = data[i]
-         data_j = data[j]
-         if calc_rmsd:  
-            data_i, data_j = get_overlapping_res_coords(data_i, data_j)
-            moved_coords_i, transf = pr.superpose(data_i, data_j)
-            rmsd = pr.calcRMSD(moved_coords_i, data_j)
-            value = rmsd
-         elif calc_seq: # calc seq similarity
-            seq_sim = calc_seq_similarity(data_i, data_j)
+   if dist_metric == 'flankseq':
+      for i in range(n):
+         for j in range(i + 1, n):
+            # calc seq similarity
+            seq_sim = calc_seq_similarity(data[i], data[j])
             value = (100 - seq_sim) / 100 # clustering is distance-based, so the 
                                           # metric is DISsimilarity
-         distance_matrix[i][j] = value 
-         distance_matrix[j][i] = value   # Symmetric matrix
+            distance_matrix[i][j] = value 
+            distance_matrix[j][i] = value   # Symmetric matrix
+   elif dist_metric == 'cgvdmbb' or dist_metric == 'flankbb':
+      n_atoms = len(data[0])
+      mobile, target = np.zeros((n * (n - 1) // 2, n_atoms, 3)), \
+                       np.zeros((n * (n - 1) // 2, n_atoms, 3))
+      triu_idxs = np.triu_indices(n, 1)
+      for k, (i, j) in enumerate(np.vstack(triu_idxs).T):
+         mobile[k] = data[i]
+         target[k] = data[j]
+      # calc rmsd
+      _, _, ssd = kabsch(mobile, target)
+      rmsd = np.sqrt(ssd / n_atoms)
+      distance_matrix[np.triu_indices(n, 1)] = rmsd
+      distance_matrix += distance_matrix.T
    return distance_matrix
+
+def kabsch(X, Y):
+    """Rotate and translate X into Y to minimize the SSD between the two, 
+       and find the derivatives of the SSD with respect to the entries of Y. 
+       
+       Implements the SVD method by Kabsch et al. (Acta Crystallogr. 1976, 
+       A32, 922).
+
+    Parameters
+    ----------
+    X : np.array [M x N x 3]
+        Array of M sets of mobile coordinates (N x 3) to be transformed by a 
+        proper rotation to minimize sum squared displacement (SSD) from Y.
+    Y : np.array [M x N x 3]
+        Array of M sets of stationary coordinates relative to which to 
+        transform X.
+
+    Returns
+    -------
+    R : np.array [M x 3 x 3]
+        Proper rotation matrices required to transform each set of coordinates 
+        in X such that its SSD with the corresponding coordinates in Y is 
+        minimized.
+    t : np.array [M x 3]
+        Translation matrix required to transform X such that its SSD with Y 
+        is minimized.
+    ssd : np.array [M]
+        Sum squared displacement after alignment for each pair of coordinates.
+    """
+    # compute R using the Kabsch algorithm
+    Xbar = np.nanmean(X, axis=1, keepdims=True)
+    Ybar = np.nanmean(Y, axis=1, keepdims=True)
+    mask = np.logical_or(np.isnan(X), np.isnan(Y))
+    Xc, Yc = X - Xbar, Y - Ybar
+    Xc[mask], Yc[mask] = 0., 0.
+    H = np.matmul(np.transpose(Xc, (0, 2, 1)), Yc)
+    U, S, Vt = np.linalg.svd(H)
+    d = np.sign(np.linalg.det(np.matmul(U, Vt)))
+    D = np.zeros((X.shape[0], 3, 3))
+    D[:, 0, 0] = 1.
+    D[:, 1, 1] = 1.
+    D[:, 2, 2] = d
+    R = np.matmul(U, np.matmul(D, Vt))
+    t = (Ybar - np.matmul(Xbar, R)).reshape((-1, 3))
+    # compute SSD from aligned coordinates XR
+    XRmY = np.matmul(Xc, R) - Yc
+    ssd = np.sum(XRmY ** 2, axis=(1, 2))
+    return R, t, ssd
 
 def get_overlapping_res_coords(list1, list2):
     list1_overlap = []
@@ -311,7 +355,8 @@ def found_chain_break(flanking_seq_dict, chain_break_ind):
       inds_to_overwrite = [n for n in flank_indices if n <= chain_break_ind]
    
    for overwrite_ind in inds_to_overwrite:
-      flanking_seq_dict[overwrite_ind] = ['X', None]
+      flanking_seq_dict[overwrite_ind] = \
+         ['X', np.array([np.nan, np.nan, np.nan])] # ['X', None]
    return flanking_seq_dict
 
 def get_AA_and_CA_coords(prody_obj, current_resindex):
@@ -323,10 +368,10 @@ def get_AA_and_CA_coords(prody_obj, current_resindex):
    curr_resindex_obj = prody_obj.select(sel_str)
    if curr_resindex_obj is None:
       AA = 'X'
-      CA_coords = None
+      CA_coords = np.array([np.nan, np.nan, np.nan]) # None
    elif curr_resindex_obj.protein is None: # not a residue
       AA = 'X'
-      CA_coords = None
+      CA_coords = np.array([np.nan, np.nan, np.nan]) # None
    else:
       curr_res_AA = list(set(curr_resindex_obj.getResnames()))
       assert len(curr_res_AA) == 1
@@ -825,7 +870,6 @@ def get_pr_obj_to_print(clusmem_pdbpath, vdg_scrr_cg_perm,
          par = pr.parsePDB(clusmem_pdbpath)
    except:
       raise ValueError(f'Could not parse {clusmem_pdbpath}.')
-      return None
    # Add CG to pr obj
    pr_obj = par.select('occupancy > 2.8') # occ >= 3 is CG
    vdg_scrrs, cg_perm = vdg_scrr_cg_perm
