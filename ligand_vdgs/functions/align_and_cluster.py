@@ -189,53 +189,64 @@ def create_dist_matrix(data, dist_metric):
       distance_matrix += distance_matrix.T
    return distance_matrix
 
-def kabsch(X, Y):
-    """Rotate and translate X into Y to minimize the SSD between the two, 
-       and find the derivatives of the SSD with respect to the entries of Y. 
-       
-       Implements the SVD method by Kabsch et al. (Acta Crystallogr. 1976, 
-       A32, 922).
+def kabsch(X, Y, chunk_size=10000):
+   """Rotate and translate X into Y to minimize the SSD between the two, 
+      and find the derivatives of the SSD with respect to the entries of Y. 
+      
+      Implements the SVD method by Kabsch et al. (Acta Crystallogr. 1976, 
+      A32, 922).
 
-    Parameters
-    ----------
-    X : np.array [M x N x 3]
-        Array of M sets of mobile coordinates (N x 3) to be transformed by a 
-        proper rotation to minimize sum squared displacement (SSD) from Y.
-    Y : np.array [M x N x 3]
-        Array of M sets of stationary coordinates relative to which to 
-        transform X.
+   Parameters
+   ----------
+   X : np.array [M x N x 3]
+      Array of M sets of mobile coordinates (N x 3) to be transformed by a 
+      proper rotation to minimize sum squared displacement (SSD) from Y.
+   Y : np.array [M x N x 3]
+      Array of M sets of stationary coordinates relative to which to 
+      transform X.
 
-    Returns
-    -------
-    R : np.array [M x 3 x 3]
-        Proper rotation matrices required to transform each set of coordinates 
-        in X such that its SSD with the corresponding coordinates in Y is 
-        minimized.
-    t : np.array [M x 3]
-        Translation matrix required to transform X such that its SSD with Y 
-        is minimized.
-    ssd : np.array [M]
-        Sum squared displacement after alignment for each pair of coordinates.
-    """
-    # compute R using the Kabsch algorithm
-    Xbar = np.nanmean(X, axis=1, keepdims=True)
-    Ybar = np.nanmean(Y, axis=1, keepdims=True)
-    mask = np.logical_or(np.isnan(X), np.isnan(Y))
-    Xc, Yc = X - Xbar, Y - Ybar
-    Xc[mask], Yc[mask] = 0., 0.
-    H = np.matmul(np.transpose(Xc, (0, 2, 1)), Yc)
-    U, S, Vt = np.linalg.svd(H)
-    d = np.sign(np.linalg.det(np.matmul(U, Vt)))
-    D = np.zeros((X.shape[0], 3, 3))
-    D[:, 0, 0] = 1.
-    D[:, 1, 1] = 1.
-    D[:, 2, 2] = d
-    R = np.matmul(U, np.matmul(D, Vt))
-    t = (Ybar - np.matmul(Xbar, R)).reshape((-1, 3))
-    # compute SSD from aligned coordinates XR
-    XRmY = np.matmul(Xc, R) - Yc
-    ssd = np.sum(XRmY ** 2, axis=(1, 2))
-    return R, t, ssd
+   Returns
+   -------
+   R : np.array [M x 3 x 3]
+      Proper rotation matrices required to transform each set of coordinates 
+      in X such that its SSD with the corresponding coordinates in Y is 
+      minimized.
+   t : np.array [M x 3]
+      Translation matrix required to transform X such that its SSD with Y 
+      is minimized.
+   ssd : np.array [M]
+      Sum squared displacement after alignment for each pair of coordinates.
+   """
+   n_chunks = len(X) // chunk_size + 1
+   R_chunks, t_chunks, ssd_chunks = [], [], []
+   for i in range(n_chunks):
+      # compute R using the Kabsch algorithm
+      Xbar = np.nanmean(X[i*chunk_size:(i+1)*chunk_size], 
+                        axis=1, keepdims=True)
+      Ybar = np.nanmean(Y[i*chunk_size:(i+1)*chunk_size], 
+                        axis=1, keepdims=True)
+      mask = np.logical_or(np.isnan(X[i*chunk_size:(i+1)*chunk_size]), 
+                           np.isnan(Y[i*chunk_size:(i+1)*chunk_size]))
+      Xc, Yc = X[i*chunk_size:(i+1)*chunk_size] - Xbar, \
+               Y[i*chunk_size:(i+1)*chunk_size] - Ybar
+      Xc[mask], Yc[mask] = 0., 0.
+      H = np.matmul(np.transpose(Xc, (0, 2, 1)), Yc)
+      U, S, Vt = np.linalg.svd(H)
+      d = np.sign(np.linalg.det(np.matmul(U, Vt)))
+      D = np.zeros((X.shape[0], 3, 3))
+      D[:, 0, 0] = 1.
+      D[:, 1, 1] = 1.
+      D[:, 2, 2] = d
+      R = np.matmul(U, np.matmul(D, Vt))
+      t = (Ybar - np.matmul(Xbar, R)).reshape((-1, 3))
+      # compute SSD from aligned coordinates XR
+      XRmY = np.matmul(Xc, R) - Yc
+      ssd = np.sum(XRmY ** 2, axis=(1, 2))
+      R_chunks.append(R), t_chunks.append(t), ssd_chunks.append(ssd)
+   R, t, ssd = np.concatenate(R_chunks), \
+               np.concatenate(t_chunks), \
+               np.concatenate(ssd_chunks)
+   return R, t, ssd
 
 '''
 def get_overlapping_res_coords(list1, list2):
