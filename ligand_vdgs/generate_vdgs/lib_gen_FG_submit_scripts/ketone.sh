@@ -14,6 +14,6 @@ hostname
 
 conda activate smart_vdms_env
 
-python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py -s "[C][CX3](=[OX1])[C]" -c ketone -p /wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2/ -b /wynton/group/degradolab/skt/docking/databases/probe_output/ -o /wynton/group/degradolab/skt/docking/databases/vdg_lib --symmetry-classes 0 1 2 0
+python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py -s "[C,c][CX3](=[OX1])[C,c]" -c ketone -p /wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2/ -b /wynton/group/degradolab/skt/docking/databases/probe_output/ -o /wynton/group/degradolab/skt/docking/databases/vdg_lib --symmetry-classes 0 1 2 0
 
 date

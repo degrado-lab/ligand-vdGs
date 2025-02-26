@@ -142,7 +142,8 @@ def main():
          atomgroup_dict[os.path.join(vdg_pdbs_dir, pdbname)] = prody_obj
       cg_coords = clust.get_cg_coords(prody_obj)
       if cg_coords is None:
-         logfile.write(f'\tIncorrect number of occ >= 3 atoms in vdg_pdbs/{pdbname}.\n')
+         with open(logfile, 'a') as file:
+            file.write(f'\tIncorrect number of occ >= 3 atoms in vdg_pdbs/{pdbname}.\n')
          continue
       # define symmetry class if it's None so it's compatible with pdb output naming
       if symmetry_classes is None:

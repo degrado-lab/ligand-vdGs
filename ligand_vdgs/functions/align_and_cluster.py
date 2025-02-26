@@ -189,7 +189,7 @@ def create_dist_matrix(data, dist_metric):
       distance_matrix += distance_matrix.T
    return distance_matrix
 
-def kabsch(X, Y, chunk_size=10000):
+def kabsch(X, Y, chunk_size=50000):
    """Rotate and translate X into Y to minimize the SSD between the two, 
       and find the derivatives of the SSD with respect to the entries of Y. 
       
