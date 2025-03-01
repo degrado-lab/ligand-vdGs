@@ -189,7 +189,7 @@ def create_dist_matrix(data, dist_metric):
       distance_matrix += distance_matrix.T
    return distance_matrix
 
-def kabsch(X, Y, chunk_size=50000):
+def kabsch(X, Y, chunk_size=20000):
    """Rotate and translate X into Y to minimize the SSD between the two, 
       and find the derivatives of the SSD with respect to the entries of Y. 
       
@@ -418,7 +418,6 @@ def get_bb_coords(obj):
    for atom in ['N', 'CA', 'C']:
       atom_obj = obj.select(f'name {atom}')
       if atom_obj is None:
-         print('get_bb_coords: atom_obj is None.')
          return None
       if len(atom_obj) > 1: # not sure why, but sometimes each atom is duplicated,
                             # despite having identical coords.
@@ -429,7 +428,6 @@ def get_bb_coords(obj):
             else:
                dist = pr.calcDistance(ambiguous_coords, atom.getCoords())
                if dist > 0.2:
-                  print('get_bb_coords: >1 atom defined in atom_obj.')
                   return None
       coord = atom_obj.getCoords()[0]
       bb_coords.append(coord)
@@ -603,7 +601,9 @@ def elements_in_clusters(indices_of_elements_in_cluster, cg_coords, vdm_bbcoords
 def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_coords, 
                        all_pdbpaths, all_scrr_cg_perm, all_cg_and_vdmbb_coords, 
                        all_flankbb_coords, num_flanking, first_pdb_out, 
-                       first_pdb_cg_vdmbb_coords, weights, atomgroup_dict, print_flankbb): 
+                       first_pdb_cg_vdmbb_coords, weights, atomgroup_dict, print_flankbb, 
+                       clusterlabel=None):
+   # clusterlabel can be 'flankbb', 'flankbb_and_seq', etc.
 
    assert len(all_pdbpaths) == len(all_cg_and_vdmbb_coords)
    ref = np.array([[0, 0, 0], [-1, 0, 1], [1, -1, 0]]) # it's just to align the 
@@ -613,7 +613,11 @@ def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_c
    failed = []
    for clusnum, clus_mem_indices in \
                 clus_assignments.items():
-      clusnum_dir = os.path.join(clusdir, f'clus_{clusnum}')
+      if clusterlabel is None:
+         subdir = f'clus_{clusnum}'
+      else: 
+         subdir = f'{clusterlabel}clus_{clusnum}'
+      clusnum_dir = os.path.join(clusdir, subdir)
       os.makedirs(clusnum_dir)
       centroid_ind = centroid_assignments[clusnum]
       # First, output the centroid before the other cluster members. Align centroids

@@ -217,30 +217,32 @@ def main():
       file.write(f"{minutes} mins, and {seconds} secs \n") 
 
 def copy_nr_to_outdir(vdglib_dir, nr_dir, reordered_AAs):
-   clustersdir = os.path.join(vdglib_dir, 'clusters', 'cgvdmbb', 
+   clustersdir = os.path.join(vdglib_dir, 'clusters', 'flankseq_and_bb', 
                               str(len(reordered_AAs)), '_'.join(reordered_AAs))
    nr_dir = os.path.join(nr_dir, str(len(reordered_AAs)), '_'.join(reordered_AAs))
    utils.handle_existing_files(nr_dir)
    os.makedirs(nr_dir, exist_ok=True)
    for cgvdmbbclus in os.listdir(clustersdir):
       cgvdmbbclusdir = os.path.join(clustersdir, cgvdmbbclus)
-      for pdb in os.listdir(cgvdmbbclusdir):
-         if 'centroid' not in pdb: 
-            continue
-         else:
-            # copy the centroid to the output dir
-            biounit = '_'.join(pdb.split('_')[:5])
-            vdmscrr_list = pdb.split('_')[5:-1]
-            # remove resnames for conciseness
-            vdmscrr_list = [vdmscrr_list[i] for i in range(len(vdmscrr_list)) 
-                            if (i + 1) % 4 != 0] 
-            vdmscrr_str = '_'.join(vdmscrr_list)
-            newname = f'{biounit}_{vdmscrr_str}.pdb.gz'
-            newpath = os.path.join(nr_dir, newname)
-            
-            assert not os.path.exists(newpath)
-            shutil.copy(os.path.join(cgvdmbbclusdir, pdb), newpath) 
-            break 
+      for flankseq_and_bb_dir in os.listdir(cgvdmbbclusdir):
+         flankseqandbbclusdir = os.path.join(cgvdmbbclusdir, flankseq_and_bb_dir)
+         for pdb in os.listdir(flankseqandbbclusdir):
+            if 'centroid' not in pdb: 
+               continue
+            else:
+               # copy the centroid to the output dir
+               biounit = '_'.join(pdb.split('_')[1:6]).removesuffix('.pdb.gz')
+               vdmscrr_list = pdb.split('_')[6:-1]
+               # remove resnames for conciseness
+               vdmscrr_list = [vdmscrr_list[i] for i in range(len(vdmscrr_list)) 
+                               if (i + 1) % 4 != 0] 
+               vdmscrr_str = '_'.join(vdmscrr_list)
+               newname = f'{biounit}_{vdmscrr_str}.pdb.gz'
+               newpath = os.path.join(nr_dir, newname)
+               
+               assert not os.path.exists(newpath)
+               shutil.copy(os.path.join(flankseqandbbclusdir, pdb), newpath) 
+               break 
 
 def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs, 
       symmetry_classes, vdglib_dir, align_cg_weight, num_flanking, 
@@ -340,7 +342,7 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
                         cgvdmbb_clus_flat_flankingCAs], ['flankseq', 'flankbb'])
       num_flank_bb_coords = len(cgvdmbb_clus_flat_flankingCAs[0])
       flankbb_rmsd_cut = normalize_rmsd(num_flank_bb_coords, 'flankbb')
-      # Combine rmsd and seq into a single metric and threshold
+      # Then, do secondary clustering on a metric and threshold that combines rmsd and seq
       flankseq_and_bb_thresh = flankbb_rmsd_cut + (1 - seq_sim_thresh)
       flankingseq_and_bb_cluster_assignments, flankingseq_and_bb_clus_centroids \
          = clust.get_hierarchical_clusters(flankseq_and_bb_to_clus, flankseq_and_bb_thresh, 
@@ -349,7 +351,7 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
       # Output the flankseq+bb clusters
       flankseq_and_bb_clusdir_for_this_cgvdmbb_clus = os.path.join(vdglib_dir, 'clusters', 
          'flankseq_and_bb', str(len(reordered_AAs)), '_'.join(reordered_AAs), 
-         f'flankseqclus_{cgvdmbb_clusnum}') 
+         f'cgvdmbb_{cgvdmbb_clusnum}') 
       utils.handle_existing_files(flankseq_and_bb_clusdir_for_this_cgvdmbb_clus) 
 
       first_pdb_out, first_pdb_cg_vdmbb_coords, failed_pdbs = clust.write_out_clusters(
@@ -358,7 +360,7 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
          cgvdmbb_clus_cg_coords, cgvdmbb_clus_pdbpaths, cgvdmbb_clus_vdm_scrr_cg_perm, 
          cgvdmbb_clus_cgvdmbb_coords, cgvdmbb_clus_flat_flankingCAs, num_flanking, 
          first_pdb_out, first_pdb_cg_vdmbb_coords, cgvdmbb_weights, atomgroup_dict, 
-         print_flankbb)
+         print_flankbb, clusterlabel='flankseq_and_bb')
 
       if len(failed_pdbs) > 0:
          with open(logfile, 'a') as file:
