@@ -602,7 +602,7 @@ def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_c
                        all_pdbpaths, all_scrr_cg_perm, all_cg_and_vdmbb_coords, 
                        all_flankbb_coords, num_flanking, first_pdb_out, 
                        first_pdb_cg_vdmbb_coords, weights, atomgroup_dict, print_flankbb, 
-                       clusterlabel=None):
+                       symmetry_classes, clusterlabel=None):
    # clusterlabel can be 'flankbb', 'flankbb_and_seq', etc.
 
    assert len(all_pdbpaths) == len(all_cg_and_vdmbb_coords)
@@ -611,8 +611,7 @@ def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_c
         # aligned to that first CG.
    # Iterate over each cluster
    failed = []
-   for clusnum, clus_mem_indices in \
-                clus_assignments.items():
+   for clusnum, clus_mem_indices in sorted(clus_assignments.items()):
       if clusterlabel is None:
          subdir = f'clus_{clusnum}'
       else: 
@@ -620,8 +619,7 @@ def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_c
       clusnum_dir = os.path.join(clusdir, subdir)
       os.makedirs(clusnum_dir)
       centroid_ind = centroid_assignments[clusnum]
-      # First, output the centroid before the other cluster members. Align centroids
-      # on cg+vdmbb.
+      # First, output the centroid before its cluster members. Align centroids on cg+vdmbb.
       data = get_clus_mem_data(centroid_ind, all_cg_coords, 
          all_cg_and_vdmbb_coords, all_flankbb_coords, all_pdbpaths, all_scrr_cg_perm, 
          num_flanking, atomgroup_dict)
@@ -635,7 +633,7 @@ def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_c
       if first_pdb_out is None:
          # If no pdb has been written out yet, align the first 3 CG atoms to the
          # reference 3 atoms and output the pdb.
-         first_pdb_out, first_pdb_cg_vdmbb_coords, centroid_transf = print_out_first_pdb_of_clus(
+         first_pdb_out, first_pdb_cg_vdmbb_coords = print_out_first_pdb_of_clus(
             cent_pdb_outpath, cent_cg_coords, cent_cg_vdmbb_coords, cent_pr_obj, ref,
             cent_scrr_cg_perm, print_flankbb)
          target_coords = first_pdb_cg_vdmbb_coords
@@ -643,53 +641,80 @@ def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_c
       else:
          # If a pdb has already been written out, align this vdg's cg+vdmbb onto that 
          # first pdb. "target_coords" to align to is cg+vdmbb of the first PDB (which 
-         # itself is a centroid). Return the transformation b/c this moved centroid 
-         # will be the "target" for all the other members of the cluster.
+         # itself is a centroid). 
+         # Note that target_coords has to be re-ordered to match the atom order in the 
+         # first PDB, because for CGs with symmetry, cluster members are aligned within a 
+         # a cluster, but often not to the first PDB. For example, the order of a phenyl 
+         # CG might be CG-CD1-CE1-CZ-CE2-CD2, but in another cluster, it might be CG-CD1-
+         # CE2-CZ-CE1-CD2, and there are I believe 3 configurations that minimize that RMSD. 
          target_coords = first_pdb_cg_vdmbb_coords
-         moved_centroid_cgvdmbb = write_out_subsequent_clus_pdbs(cent_cg_vdmbb_coords, 
-            cent_pr_obj, cent_pdb_outpath, target_coords, cent_scrr_cg_perm, 
-            print_flankbb, weights)
-         target_coords = moved_centroid_cgvdmbb
+         # Align centroid (cg+vdmbb) to the first pdb and return its new coords so that its 
+         # cluster mems can align onto it. 
+         moved_cent_transf, moved_cent_coords = get_transf_and_coords(cent_cg_vdmbb_coords, 
+               target_coords, weights, cent_pr_obj, cent_scrr_cg_perm, symmetry_classes)
+         # Apply transformation and write out the moved centroid.
+         write_out_subsequent_clus_pdbs(cent_pr_obj, cent_pdb_outpath, cent_scrr_cg_perm, 
+            print_flankbb, moved_cent_transf)
 
       # After centroid, output the rest of the cluster members
       for ind in clus_mem_indices:
          if ind == centroid_ind:
             continue
-         data = get_clus_mem_data(
-            ind, all_cg_coords, all_cg_and_vdmbb_coords, all_flankbb_coords, all_pdbpaths, 
-            all_scrr_cg_perm, num_flanking, atomgroup_dict)
+         data = get_clus_mem_data(ind, all_cg_coords, all_cg_and_vdmbb_coords, 
+            all_flankbb_coords, all_pdbpaths, all_scrr_cg_perm, num_flanking, atomgroup_dict)
          if data is None:
             failed.append(all_pdbpaths[ind])
             continue
          (clusmem_cg_coords, clusmem_cg_vdmbb_coords, clusmem_flankbb_coords, 
             clusmem_pdbpath, clusmem_scrr_cg_perm, clusmem_pr_obj) = data
+         clusmem_pdb_outpath = get_clus_pdb_outpath(clusnum, clusnum_dir, clusmem_pdbpath, 
+            clusmem_scrr_cg_perm, ind, is_centroid=False)
 
-         # Define atoms to align. 
-         clusmem_coords = clusmem_cg_vdmbb_coords
-
-         clusmem_pdb_outpath = get_clus_pdb_outpath(clusnum, clusnum_dir, 
-            clusmem_pdbpath, clusmem_scrr_cg_perm, ind, is_centroid=False)
-         write_out_subsequent_clus_pdbs(clusmem_coords, clusmem_pr_obj, 
-            clusmem_pdb_outpath, target_coords, clusmem_scrr_cg_perm, print_flankbb, weights)
+         # Align clus mem to the centroid and write out the pdb
+         if clusnum == 1: # the centroid to align onto _is_ the first pdb instead of a 
+            # cluster cent that's aligned onto the first pdb.
+            moved_cent_coords = first_pdb_cg_vdmbb_coords
+         transf, moved_coords = get_transf_and_coords(clusmem_cg_vdmbb_coords, 
+            moved_cent_coords, weights, clusmem_pr_obj, clusmem_scrr_cg_perm, 
+            symmetry_classes)
+         write_out_subsequent_clus_pdbs(clusmem_pr_obj, clusmem_pdb_outpath, 
+            clusmem_scrr_cg_perm, print_flankbb, transf)
    
    return first_pdb_out, first_pdb_cg_vdmbb_coords, failed
 
-def write_out_subsequent_clus_pdbs(clusmem_coords, clusmem_pr_obj, clusmem_pdb_outpath, 
-                                   target_coords, scrrs, print_flankbb, weights=None):
+def get_transf_and_coords(mobile_coords, target_coords, weights, obj, scrrs, 
+                          symmetry_classes):
    if weights is None:
-      weights = np.array([1/len(clusmem_coords) for i in clusmem_coords])
-   # Superpose
-   moved_clusmem_coords, transf = pr.superpose(clusmem_coords, target_coords, weights)
-   pr_obj_copy = clusmem_pr_obj.copy() # b/c of mutability
+      weights = np.array([1/len(mobile_coords) for i in mobile_coords])
+   # Superpose each permutation
+   cgcoords = mobile_coords[:len(symmetry_classes)]
+   perms = permute_on_indices(symmetry_classes, cgcoords)
+   lowest_rmsd, best_transf, best_moved_coords = None, None, None 
+   # Iterate through each permutation
+   for perm in perms:
+      # combing cg and vdmbb
+      rearranged_coords = np.vstack([perm, mobile_coords[len(symmetry_classes):]])
+      moved_coords, transf = pr.superpose(rearranged_coords, target_coords, weights)
+      rmsd = pr.calcRMSD(moved_coords, target_coords, weights)
+      if lowest_rmsd is None or rmsd < lowest_rmsd:
+         lowest_rmsd = rmsd
+         best_transf = transf
+         best_moved_coords = moved_coords
+   return best_transf, best_moved_coords
+
+def write_out_subsequent_clus_pdbs(pr_obj, pdb_outpath, scrrs, print_flankbb, transf):
+   # Align to the first PDB (if it's a centroid) or its cluster centroid (if it's a cluster 
+   # mem)
+   pr_obj_copy = pr_obj.copy() # b/c of mutability
    pr.applyTransformation(transf, pr_obj_copy)
-   # Set occupancies so that only the vdMs being clustered are 2.0
+   # Set occupancies so that only the vdMs being clustered are 2.0 (whereas originally, 
+   # all probe contacts were 2.0)
    pr_obj_copy = reset_occs(pr_obj_copy, scrrs)
    # Write out PDB
    if not print_flankbb: 
-      pr.writePDB(clusmem_pdb_outpath, pr_obj_copy.select('occupancy > 1.5')) # selects occ=2.0
+      pr.writePDB(pdb_outpath, pr_obj_copy.select('occupancy > 1.5')) # selects occ>=2.0
    else:
-      pr.writePDB(clusmem_pdb_outpath, pr_obj_copy)
-   return pr.applyTransformation(transf, clusmem_coords)
+      pr.writePDB(pdb_outpath, pr_obj_copy)
 
 def get_clus_pdb_outpath(clusnum, clusnum_dir, pdbpath, scrr_cg_perm, clusmem_ind, 
                          is_centroid):
@@ -704,8 +729,8 @@ def get_clus_pdb_outpath(clusnum, clusnum_dir, pdbpath, scrr_cg_perm, clusmem_in
 
    return os.path.join(clusnum_dir, pdb_str)
 
-def write_out_first_pdb(mobile, target, pr_obj, outpath, clusmem_cg_coords,
-                        clusmem_cg_vdmbb_coords, scrrs, print_flankbb):
+def write_out_first_pdb(mobile, target, pr_obj, outpath, clusmem_cg_vdmbb_coords, scrrs, 
+                        print_flankbb):
    # No weights because it's only aligning 3 atoms of CG
    mobile, target = np.array(mobile), np.array(target)
    moved_3atom_coords, transf = pr.superpose(mobile, target)
@@ -719,11 +744,7 @@ def write_out_first_pdb(mobile, target, pr_obj, outpath, clusmem_cg_coords,
       pr.writePDB(outpath, pr_obj_copy.select('occupancy > 1.5')) # selects occ=2.0
    else:
       pr.writePDB(outpath, pr_obj_copy)
-   # Return the moved coords so that the next PDB can be aligned onto this. 
-   # This was superposed on 3 reference atoms, but need to return coords of the entire CG 
-   # so that following vdgs will be aligned on the entire CG and not the ref.
-   moved_cg_coords = pr.applyTransformation(transf, clusmem_cg_coords)
-   return moved_cg_coords, moved_cg_vdmbb_coords, transf
+   return moved_cg_vdmbb_coords
 
 def rewrite_temp_clusters(clusdir, clean_dir, size_subset, subset_AAs):
    # Clean up the cluster directory by merging degenerate vdGs (based on diff
@@ -752,13 +773,16 @@ def rewrite_temp_clusters(clusdir, clean_dir, size_subset, subset_AAs):
    reassigned = reassign_temp_clusters(pruned_clusters)
 
    # Move the deduplicated and reassigned PDBs to the new clus dir.
+   renumbered_clusters = {}
    for new_cgvdmbb_clusnum, vdgs in reassigned.items():
+      renumbered_clusters[new_cgvdmbb_clusnum] = []
       reassigned_clusdir = os.path.join(clean_dir, f'clus_{new_cgvdmbb_clusnum}')
       os.makedirs(reassigned_clusdir)
 
       # Copy over the vdgs
       for vdg in vdgs:
          pdbbase, vdmscrrs, ix, vdgpath = vdg
+         renumbered_clusters[new_cgvdmbb_clusnum].append(int(ix))
          # rename the pdb for clarity
          scrr_str = '_'.join(['_'.join([str(z) for z in v_s]) for v_s in vdmscrrs])
          if 'centroid' in vdgpath:
@@ -768,7 +792,7 @@ def rewrite_temp_clusters(clusdir, clean_dir, size_subset, subset_AAs):
          assert not os.path.exists(new_pdbname)
          os.rename(vdgpath, os.path.join(reassigned_clusdir, new_pdbname))
    
-   return reassigned
+   return renumbered_clusters 
          
 def determine_redundant_temp_vdg(already_seen_temp_vdgs, 
                                  candidate_pdbbase, candidate_scrr):
@@ -967,11 +991,10 @@ def print_out_first_pdb_of_clus(pdb_outpath, cg_coords, cg_vdmbb_coords, pr_obj,
    # Sometimes the CG only has 2 atoms
    elif len(cg_coords)  == 2:
       mobile, target = cg_coords[:2], ref[:2]
-   moved_cg_coords, moved_cg_vdmbb_coords, centroid_transf = write_out_first_pdb(
-      mobile, target, pr_obj, pdb_outpath, cg_coords, cg_vdmbb_coords, scrrs, print_flankbb)
-   _cg_coords = moved_cg_coords
+   moved_cg_vdmbb_coords = write_out_first_pdb(
+      mobile, target, pr_obj, pdb_outpath, cg_vdmbb_coords, scrrs, print_flankbb)
    first_pdb_cg_vdmbb_coords = moved_cg_vdmbb_coords
-   return first_pdb_out, first_pdb_cg_vdmbb_coords, centroid_transf
+   return first_pdb_out, first_pdb_cg_vdmbb_coords
 
 def get_weights(num_cg_atoms, num_bb_atoms, align_cg_weight):
    cg_weights_arr = np.array([align_cg_weight/num_cg_atoms for i in range(num_cg_atoms)])

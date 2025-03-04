@@ -39,7 +39,7 @@ def parse_args():
                         help="Directory for the vdms of this CG.")
     #parser.add_argument('-o', "--output-clus-pdbs", action='store_true', 
     #                    help="Output clustered PDBs.")
-    parser.add_argument('-w', "--align-cg-weight", type=float, default=0.98, 
+    parser.add_argument('-w', "--align-cg-weight", type=float, default=0.99, 
                         help="Fraction of weights to assign to CG atoms (collectively) "
                         "when superposing output vdGs. Not weights for clustering. "
                         "Example: 0.5 means 1/2 of weight is assigned to CG atoms and "
@@ -165,7 +165,6 @@ def main():
             re_ordered_bbcoords, re_ordered_flankingseqs, re_ordered_CAs, 
             re_ordered_scrr, cg_coords, pdbpath)
    
-   
    # Evaluate the complete collection of vdGs (of size_subset) and determine redundancy 
    for num_vdms_in_subset, _subsets in vdm_combos.items():
       if num_vdms_in_subset != size_subset:
@@ -232,14 +231,13 @@ def copy_nr_to_outdir(vdglib_dir, nr_dir, reordered_AAs):
             else:
                # copy the centroid to the output dir
                biounit = '_'.join(pdb.split('_')[1:6]).removesuffix('.pdb.gz')
-               vdmscrr_list = pdb.split('_')[6:-1]
+               vdmscrr_list = pdb.split('_')[6:-3]
                # remove resnames for conciseness
                vdmscrr_list = [vdmscrr_list[i] for i in range(len(vdmscrr_list)) 
                                if (i + 1) % 4 != 0] 
                vdmscrr_str = '_'.join(vdmscrr_list)
                newname = f'{biounit}_{vdmscrr_str}.pdb.gz'
                newpath = os.path.join(nr_dir, newname)
-               
                assert not os.path.exists(newpath)
                shutil.copy(os.path.join(flankseqandbbclusdir, pdb), newpath) 
                break 
@@ -308,7 +306,8 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
       all_AA_cg_perm_cg_coords, all_AA_cg_perm_pdbpaths, 
       all_AA_cg_perm_vdm_scrr_cg_perm, all_AA_cg_perm_cg_and_vdmbb_coords, 
       all_AA_cg_perm_flat_flankCAs, num_flanking, first_pdb_out, 
-      first_pdb_cg_vdmbb_coords, cgvdmbb_weights, atomgroup_dict, print_flankbb)
+      first_pdb_cg_vdmbb_coords, cgvdmbb_weights, atomgroup_dict, print_flankbb, 
+      symmetry_classes)
 
    if len(failed_pdbs) > 0:
       with open(logfile, 'a') as file:
@@ -326,7 +325,7 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
    # Next, further subdivide each cluster on rmsd of the bb stretches flanking the vdms 
    # + their sequences. 
    for cgvdmbb_clusnum, indices_of_elements_in_cgvdmbb_cluster in \
-      cgvdmbb_clus_assignments.items():
+      reassigned_cgvdmbb_clus.items():
       # Select the data belonging to this cgvdmbb cluster.
       (cgvdmbb_clus_cg_coords, cgvdmbb_clus_vdmbb_coords, 
          cgvdmbb_clus_cgvdmbb_coords, cgvdmbb_clus_flat_flankingseqs, 
@@ -360,7 +359,7 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
          cgvdmbb_clus_cg_coords, cgvdmbb_clus_pdbpaths, cgvdmbb_clus_vdm_scrr_cg_perm, 
          cgvdmbb_clus_cgvdmbb_coords, cgvdmbb_clus_flat_flankingCAs, num_flanking, 
          first_pdb_out, first_pdb_cg_vdmbb_coords, cgvdmbb_weights, atomgroup_dict, 
-         print_flankbb, clusterlabel='flankseq_and_bb')
+         print_flankbb, symmetry_classes, clusterlabel='flankseq_and_bb')
 
       if len(failed_pdbs) > 0:
          with open(logfile, 'a') as file:
