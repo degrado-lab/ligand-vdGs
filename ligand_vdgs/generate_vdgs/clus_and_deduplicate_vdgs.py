@@ -199,7 +199,7 @@ def main():
    using the --keep-clustered-pdbs flag.
    '''
    delete_clusterdirs(vdglib_dir, logfile, size_subset, keep_clustered_pdbs)
-   delete_memmap(size_subset)
+   delete_memmap(size_subset, vdglib_dir)
 
    # Print out time elapsed
    seconds = time.time() - start_time
@@ -301,7 +301,7 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
    cgvdmbb_data_to_clus = zip([all_AA_cg_perm_cg_and_vdmbb_coords], ['cgvdmbb'])
    cgvdmbb_clus_assignments, cgvdmbb_clus_centroids = clust.get_hierarchical_clusters(
       cgvdmbb_data_to_clus, cgvdmbb_rmsd_cut, reordered_AAs_str, len(reordered_AAs), 
-      rmsd_max=1)
+      vdglib_dir, rmsd_max=1)
 
    # Output the cgvdmbb clusters
      
@@ -362,7 +362,7 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
       flankseq_and_bb_thresh = flankbb_rmsd_cut + (1 - seq_sim_thresh)
       flankingseq_and_bb_cluster_assignments, flankingseq_and_bb_clus_centroids \
          = clust.get_hierarchical_clusters(flankseq_and_bb_to_clus, flankseq_and_bb_thresh, 
-         reordered_AAs_str, len(reordered_AAs), rmsd_max=1.5)
+         reordered_AAs_str, len(reordered_AAs), vdglib_dir, rmsd_max=1.5)
             
       # Output the flankseq+bb clusters
       flankseq_and_bb_clusdir_for_this_cgvdmbb_clus = os.path.join(vdglib_dir, 'clusters', 
@@ -406,8 +406,8 @@ def delete_clusterdirs(vdglib_dir, logfile, size_subset, keep_clustered_pdbs):
          else:
             shutil.rmtree(flank_dir)
 
-def delete_memmap(size_subset):
-   pattern = f"tmp/*_{size_subset}.dat"
+def delete_memmap(size_subset, vdglib_dir):
+   pattern = f"{vdglib_dir}/tmp/*_{size_subset}.dat"
    files_to_delete = glob.glob(pattern)
    for file in files_to_delete:
       os.remove(file)

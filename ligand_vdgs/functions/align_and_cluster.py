@@ -100,7 +100,8 @@ def flatten_vdg_bbs(_vdmbb):
          bbs.append(atom)
    return bbs
 
-def get_hierarchical_clusters(data_to_clus, threshold, AA_subset, size_subset, rmsd_max):
+def get_hierarchical_clusters(data_to_clus, threshold, AA_subset, size_subset, 
+   vdglib_dir, rmsd_max):
    '''
    Returns dict where key = cluster number and value = indices of the list elements 
    that belong in that cluster. This dict is not ordered by size.
@@ -125,7 +126,7 @@ def get_hierarchical_clusters(data_to_clus, threshold, AA_subset, size_subset, r
       if len(data) == 1:
          return {1: [0]}, {1: 0} 
 
-      matrix = create_dist_matrix(data, dist_metric, AA_subset, size_subset)
+      matrix = create_dist_matrix(data, dist_metric, AA_subset, size_subset, vdglib_dir)
       if dist_metric == 'flankbb' or dist_metric == 'cgvdmbb':
          # "Normalize"/scale the rmsd matrix using min/max so that it's on the same scale 
          # as sequence dissimilarity.
@@ -167,13 +168,17 @@ def get_hierarchical_clusters(data_to_clus, threshold, AA_subset, size_subset, r
    
    return cluster_assignments, centroids
 
-def create_dist_matrix(data, dist_metric, AA_subset, size_subset):
+def create_dist_matrix(data, dist_metric, AA_subset, size_subset, vdglib_dir):
    n = len(data)
 
    # Need to initialize distance_matrix.dat with zeros.
-   if not os.path.exists('tmp'): # store memory-mapped arrays in tmp/
-      os.mkdir('tmp')
-   dist_matrix_filename = 'tmp/distance_matrix_{}_{}.dat'.format(AA_subset, size_subset)
+   tmp_dir = os.path.join(vdglib_dir, 'tmp')
+   if not os.path.exists(tmp_dir): # store memory-mapped arrays in tmp/
+      os.mkdir(tmp_dir)
+   dist_matrix_filename = os.path.join(tmp_dir, 'distance_matrix_{}_{}.dat'.format(
+      AA_subset, size_subset))
+   if os.path.exists(dist_matrix_filename):
+      os.remove(dist_matrix_filename) # stale data from prev. iteration
    np.zeros((n, n), dtype=np.float32).tofile(dist_matrix_filename)
 
    distance_matrix = np.memmap(dist_matrix_filename, dtype=np.float32, mode='r+', 
@@ -192,11 +197,15 @@ def create_dist_matrix(data, dist_metric, AA_subset, size_subset):
       n_atoms = len(data[0])
    
       # Create a memory-mapped array
-      mobile_filename = 'tmp/mobile_matrix_{}_{}.dat'.format(AA_subset, size_subset)
-      target_filename = 'tmp/target_matrix_{}_{}.dat'.format(AA_subset, size_subset)
+      mobile_filename = os.path.join(tmp_dir, 'mobile_matrix_{}_{}.dat'.format(
+         AA_subset, size_subset))
+      target_filename = os.path.join(tmp_dir, 'target_matrix_{}_{}.dat'.format(
+         AA_subset, size_subset))
       
       for filename in [mobile_filename, target_filename]:
          # Initialize each file with zeros.
+         if os.path.exists(filename):
+            os.remove(filename) # stale data from prev. iteration
          np.zeros((n * (n - 1) // 2, n_atoms, 3), dtype=np.float32).tofile(filename)
       mobile = np.memmap(mobile_filename, dtype=np.float32, mode='r+', 
          shape=(n * (n - 1) // 2, n_atoms, 3))
@@ -208,13 +217,13 @@ def create_dist_matrix(data, dist_metric, AA_subset, size_subset):
          mobile[k] = data[i]
          target[k] = data[j]
       # calc rmsd
-      _, _, ssd = kabsch(mobile, target, AA_subset, size_subset)
+      _, _, ssd = kabsch(mobile, target, AA_subset, size_subset, vdglib_dir)
       rmsd = np.sqrt(ssd / n_atoms)
       distance_matrix[np.triu_indices(n, 1)] = rmsd
       distance_matrix += distance_matrix.T
    return distance_matrix
 
-def kabsch(X, Y, AA_subset, size_subset, chunk_size=10000):
+def kabsch(X, Y, AA_subset, size_subset, vdglib_dir, chunk_size=10000):
    """Rotate and translate X into Y to minimize the SSD between the two, 
       and find the derivatives of the SSD with respect to the entries of Y. 
       
@@ -259,10 +268,12 @@ def kabsch(X, Y, AA_subset, size_subset, chunk_size=10000):
       U, S, Vt = np.linalg.svd(H)
       d = np.sign(np.linalg.det(np.matmul(U, Vt)))
 
-      # Only initialize D_matrix once, or else each chunk will overwrite the previous one.
-      D_matrix_filename = 'tmp/D_matrix_{}_{}.dat'.format(AA_subset, size_subset) 
-      if not os.path.exists(D_matrix_filename):
-         np.zeros((Xc.shape[0], 3, 3), dtype=np.float32).tofile(D_matrix_filename)
+      # Initialize memory mapping
+      D_matrix_filename = os.path.join(vdglib_dir, 'tmp', 
+         'D_matrix_{}_{}_chunk{}.dat'.format(AA_subset, size_subset, i))
+      if os.path.exists(D_matrix_filename):
+         os.remove(D_matrix_filename) # stale data from prev. iteration
+      np.zeros((Xc.shape[0], 3, 3), dtype=np.float32).tofile(D_matrix_filename)
 
       D = np.memmap(D_matrix_filename, dtype=np.float32, mode='r+', 
          shape=(Xc.shape[0], 3, 3))

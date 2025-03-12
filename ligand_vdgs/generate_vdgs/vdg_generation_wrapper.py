@@ -105,10 +105,10 @@ def main():
     # Clean up the final state of clusters dir. Each subset's tempdir, flankseq, and 
     # flankbb dirs were cleaned up along the way, but the highest level of these dirs 
     # need to be deleted too.
-    clean_up_dirs(out_dir, 'temp', logfile) 
-    clean_up_dirs(out_dir, 'cgvdmbb', logfile) 
+    clean_up_clusdirs(out_dir, 'temp', logfile) 
+    clean_up_clusdirs(out_dir, 'cgvdmbb', logfile) 
     delete_empty_dirs(os.path.join(out_dir, 'nr_vdgs'))
-    delete_tmp_memmap_dir()
+    delete_tmp_memmap_dir(out_dir)
     if not keep_clustered_pdbs:
         delete_empty_dirs(os.path.join(out_dir, 'clusters'))
     
@@ -116,19 +116,16 @@ def main():
         _log.write(f'='*79 + '\n')
         _log.write(f'Job completed.\n')
 
-def delete_tmp_memmap_dir(logfile):
-    if len(os.listdir('tmp')) == 0:
-        os.rmdir('tmp')
-    else:
-        with open(logfile, 'a') as _log:
-            _log.write('#'*79 + 'tmp/ contains mem map files.\n')
+def delete_tmp_memmap_dir(out_dir):
+    tmp_dir = os.path.join(out_dir, 'tmp')
+    shutil.rmtree(tmp_dir)
 
 def delete_empty_dirs(_dir):
     for root, dirs, files in os.walk(_dir):
         if not dirs and not files:
             os.system(f'rmdir {root}')
 
-def clean_up_dirs(out_dir, clus_level, logfile):
+def clean_up_clusdirs(out_dir, clus_level, logfile):
     direc = os.path.join(out_dir, 'clusters', clus_level)
     with open(logfile, 'a') as _log:
         if not os.path.exists(direc):
