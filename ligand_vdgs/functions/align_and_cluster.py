@@ -5,6 +5,7 @@ from scipy.spatial.distance import squareform
 import prody as pr
 import os
 import sys
+import tracemalloc
 
 def get_vdg_AA_permutations(reordered_AAs, _vdgs):
    permuted_indices = permute_AA_duplicates(reordered_AAs)
@@ -99,7 +100,7 @@ def flatten_vdg_bbs(_vdmbb):
          bbs.append(atom)
    return bbs
 
-def get_hierarchical_clusters(data_to_clus, threshold, rmsd_max):
+def get_hierarchical_clusters(data_to_clus, threshold, AA_subset, size_subset, rmsd_max):
    '''
    Returns dict where key = cluster number and value = indices of the list elements 
    that belong in that cluster. This dict is not ordered by size.
@@ -119,7 +120,12 @@ def get_hierarchical_clusters(data_to_clus, threshold, rmsd_max):
    '''
    matrices = []
    for data, dist_metric in data_to_clus:
-      matrix = create_dist_matrix(data, dist_metric)
+      # If there's only 1 sample in `data`, then it's a singleton. Return a single cluster
+      # with only the same as its centroid. 
+      if len(data) == 1:
+         return {1: [0]}, {1: 0} 
+
+      matrix = create_dist_matrix(data, dist_metric, AA_subset, size_subset)
       if dist_metric == 'flankbb' or dist_metric == 'cgvdmbb':
          # "Normalize"/scale the rmsd matrix using min/max so that it's on the same scale 
          # as sequence dissimilarity.
@@ -127,21 +133,20 @@ def get_hierarchical_clusters(data_to_clus, threshold, rmsd_max):
          matrices.append(matrix)
       elif dist_metric == 'flankseq':
          matrices.append(matrix)
-   # Add the matrices
+   # Add the matrices and condense
    if len(matrices) == 1:
       dist_matrix = matrices[0]
    elif len(matrices) == 2:
       dist_matrix = matrices[0] + matrices[1]
-
-   # If the distancee matrix is empty (because there's only one sample in `data`), then
-   # linkage() cannot be calculated on it. Return a single cluster with the only sample
-   # as its centroid.
-   if dist_matrix.shape == (1, 1):
-      return {1: [0]}, {1: 0} 
    condensed_dist_matrix = squareform(dist_matrix)
-   if len(condensed_dist_matrix) == 0:
-      return {1: [0]}, {1: 0} 
-   
+
+   #current, peak = tracemalloc.get_traced_memory()
+   #current_use = np.round(current / (1024 * 1024 * 1024),2)
+   #peak_use = np.round(peak / (1024 * 1024 * 1024),2)
+   #if peak_use > 10 or current_use > 10:
+   #   print(f"Current memory usage after dist matrix formation: {current_use} GB")
+   #   print(f"Peak memory usage after dist matrix formation: {peak_use} GB")
+
    Z = linkage(condensed_dist_matrix, method='complete')
    clusters = fcluster(Z, threshold, criterion='distance')
    cluster_assignments = {} # key = clusnum, value = indices of `coords` 
@@ -162,9 +167,18 @@ def get_hierarchical_clusters(data_to_clus, threshold, rmsd_max):
    
    return cluster_assignments, centroids
 
-def create_dist_matrix(data, dist_metric):
+def create_dist_matrix(data, dist_metric, AA_subset, size_subset):
    n = len(data)
-   distance_matrix = np.zeros((n, n))
+
+   # Need to initialize distance_matrix.dat with zeros.
+   if not os.path.exists('tmp'): # store memory-mapped arrays in tmp/
+      os.mkdir('tmp')
+   dist_matrix_filename = 'tmp/distance_matrix_{}_{}.dat'.format(AA_subset, size_subset)
+   np.zeros((n, n), dtype=np.float32).tofile(dist_matrix_filename)
+
+   distance_matrix = np.memmap(dist_matrix_filename, dtype=np.float32, mode='r+', 
+      shape=(n, n))
+
    if dist_metric == 'flankseq':
       for i in range(n):
          for j in range(i + 1, n):
@@ -176,20 +190,31 @@ def create_dist_matrix(data, dist_metric):
             distance_matrix[j][i] = value   # Symmetric matrix
    elif dist_metric == 'cgvdmbb' or dist_metric == 'flankbb':
       n_atoms = len(data[0])
-      mobile, target = np.zeros((n * (n - 1) // 2, n_atoms, 3)), \
-                       np.zeros((n * (n - 1) // 2, n_atoms, 3))
+   
+      # Create a memory-mapped array
+      mobile_filename = 'tmp/mobile_matrix_{}_{}.dat'.format(AA_subset, size_subset)
+      target_filename = 'tmp/target_matrix_{}_{}.dat'.format(AA_subset, size_subset)
+      
+      for filename in [mobile_filename, target_filename]:
+         # Initialize each file with zeros.
+         np.zeros((n * (n - 1) // 2, n_atoms, 3), dtype=np.float32).tofile(filename)
+      mobile = np.memmap(mobile_filename, dtype=np.float32, mode='r+', 
+         shape=(n * (n - 1) // 2, n_atoms, 3))
+      target = np.memmap(target_filename, dtype=np.float32, mode='r+', 
+         shape=(n * (n - 1) // 2, n_atoms, 3))
+
       triu_idxs = np.triu_indices(n, 1)
       for k, (i, j) in enumerate(np.vstack(triu_idxs).T):
          mobile[k] = data[i]
          target[k] = data[j]
       # calc rmsd
-      _, _, ssd = kabsch(mobile, target)
+      _, _, ssd = kabsch(mobile, target, AA_subset, size_subset)
       rmsd = np.sqrt(ssd / n_atoms)
       distance_matrix[np.triu_indices(n, 1)] = rmsd
       distance_matrix += distance_matrix.T
    return distance_matrix
 
-def kabsch(X, Y, chunk_size=20000):
+def kabsch(X, Y, AA_subset, size_subset, chunk_size=10000):
    """Rotate and translate X into Y to minimize the SSD between the two, 
       and find the derivatives of the SSD with respect to the entries of Y. 
       
@@ -233,7 +258,14 @@ def kabsch(X, Y, chunk_size=20000):
       H = np.matmul(np.transpose(Xc, (0, 2, 1)), Yc)
       U, S, Vt = np.linalg.svd(H)
       d = np.sign(np.linalg.det(np.matmul(U, Vt)))
-      D = np.zeros((Xc.shape[0], 3, 3))
+
+      # Only initialize D_matrix once, or else each chunk will overwrite the previous one.
+      D_matrix_filename = 'tmp/D_matrix_{}_{}.dat'.format(AA_subset, size_subset) 
+      if not os.path.exists(D_matrix_filename):
+         np.zeros((Xc.shape[0], 3, 3), dtype=np.float32).tofile(D_matrix_filename)
+
+      D = np.memmap(D_matrix_filename, dtype=np.float32, mode='r+', 
+         shape=(Xc.shape[0], 3, 3))
       D[:, 0, 0] = 1.
       D[:, 1, 1] = 1.
       D[:, 2, 2] = d
@@ -633,10 +665,14 @@ def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_c
       if first_pdb_out is None:
          # If no pdb has been written out yet, align the first 3 CG atoms to the
          # reference 3 atoms and output the pdb.
-         first_pdb_out, first_pdb_cg_vdmbb_coords = print_out_first_pdb_of_clus(
-            cent_pdb_outpath, cent_cg_coords, cent_cg_vdmbb_coords, cent_pr_obj, ref,
-            cent_scrr_cg_perm, print_flankbb)
-         target_coords = first_pdb_cg_vdmbb_coords
+         try:
+            first_pdb_out, first_pdb_cg_vdmbb_coords = print_out_first_pdb_of_clus(
+               cent_pdb_outpath, cent_cg_coords, cent_cg_vdmbb_coords, cent_pr_obj, ref,
+               cent_scrr_cg_perm, print_flankbb)
+            target_coords = first_pdb_cg_vdmbb_coords
+         except:
+            first_pdb_out, first_pdb_cg_vdmbb_coords, target_coords = None, None, None
+            continue
          
       else:
          # If a pdb has already been written out, align this vdg's cg+vdmbb onto that 

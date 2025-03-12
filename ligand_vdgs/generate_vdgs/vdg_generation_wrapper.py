@@ -23,6 +23,9 @@ def parse_args():
                         "files; see docs/database_generation_guide.md")
     parser.add_argument('-o', "--out-dir", type=str, required=True,
                         help="Output directory path.")
+    parser.add_argument('-k', "--keep-clustered-pdbs", action='store_true', 
+                        help="Keep the `clusters/flankseq_and_bb/` dir. to keep track of "
+                        "which clusters each nr_pdb came from.")
     parser.add_argument('-t', "--trial-run", type=int, 
                         help="Number of PDBs to process in a trial run used to "
                         "determine if smarts_to_cgs.py can run to completion "
@@ -30,6 +33,11 @@ def parse_args():
     parser.add_argument('--symmetry-classes', nargs='+', type=str,
                         help='Integers representing the symmetry classes of the CG '
                         'atoms on which clustering is to be performed.')
+    parser.add_argument('-w', "--align-cg-weight", type=float, default=0.99, 
+                        help="Fraction of weights to assign to CG atoms (collectively) "
+                        "when superposing output vdGs. Not weights for clustering. "
+                        "Example: 0.5 means 1/2 of weight is assigned to CG atoms and "
+                        "the remaining 1/2 goes to the vdM backbone atoms. Defaults to 0.99.")
     return parser.parse_args()
 
 
@@ -40,6 +48,7 @@ def main():
     pdb_dir = args.pdb_dir
     probe_dir = args.probe_dir
     out_dir = args.out_dir
+    keep_clustered_pdbs = args.keep_clustered_pdbs
     trial_run = args.trial_run
     symm_classes = args.symmetry_classes
     if symm_classes is not None:
@@ -98,15 +107,24 @@ def main():
     # need to be deleted too.
     clean_up_dirs(out_dir, 'temp', logfile) 
     clean_up_dirs(out_dir, 'cgvdmbb', logfile) 
-    delete_empty_nr_vdgs_dirs(out_dir)
+    delete_empty_dirs(os.path.join(out_dir, 'nr_vdgs'))
+    delete_tmp_memmap_dir()
+    if not keep_clustered_pdbs:
+        delete_empty_dirs(os.path.join(out_dir, 'clusters'))
     
     with open(logfile, 'a') as _log:
         _log.write(f'='*79 + '\n')
         _log.write(f'Job completed.\n')
 
-def delete_empty_nr_vdgs_dirs(out_dir):
-    nr_vdgs_dir = os.path.join(out_dir, 'nr_vdgs')
-    for root, dirs, files in os.walk(nr_vdgs_dir):
+def delete_tmp_memmap_dir(logfile):
+    if len(os.listdir('tmp')) == 0:
+        os.rmdir('tmp')
+    else:
+        with open(logfile, 'a') as _log:
+            _log.write('#'*79 + 'tmp/ contains mem map files.\n')
+
+def delete_empty_dirs(_dir):
+    for root, dirs, files in os.walk(_dir):
         if not dirs and not files:
             os.system(f'rmdir {root}')
 

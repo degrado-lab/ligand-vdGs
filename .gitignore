@@ -1,6 +1,8 @@
 __pycache__/
 *.py[cod]
 *.log
+*logs/
+*tmp/
 log
 *.chkpt
 *.bak

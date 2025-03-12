@@ -24,7 +24,10 @@ import os
 import sys
 import argparse
 import time
+import tracemalloc
 import shutil
+import glob
+import numpy as np
 import prody as pr
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'functions'))
 import align_and_cluster as clust
@@ -37,21 +40,23 @@ def parse_args():
                         "the SMARTS pattern.")
     parser.add_argument('-v', "--vdglib-dir", type=str, required=True,
                         help="Directory for the vdms of this CG.")
-    #parser.add_argument('-o', "--output-clus-pdbs", action='store_true', 
-    #                    help="Output clustered PDBs.")
+    parser.add_argument('-k', "--keep-clustered-pdbs", action='store_true', 
+                        help="Keep the `clusters/flankseq_and_bb/` dir. to keep track of "
+                        "which clusters each nr_pdb came from.")
     parser.add_argument('-w', "--align-cg-weight", type=float, default=0.99, 
                         help="Fraction of weights to assign to CG atoms (collectively) "
                         "when superposing output vdGs. Not weights for clustering. "
                         "Example: 0.5 means 1/2 of weight is assigned to CG atoms and "
-                        "the remaining 1/2 goes to the vdM backbone atoms.")
+                        "the remaining 1/2 goes to the vdM backbone atoms. Defaults to 0.99.")
     parser.add_argument('-q', "--seq", default=0.40,
                         help="Sequence similarity threshold for clustering sequences "
                         "flanking the vdM to determine redundancy. This should be a "
                         "value between 0 and 1. Values > seq will be considered "
-                        "redundant.")
+                        "redundant. Defaults to 0.4.")
     parser.add_argument('-f', "--flank", default=2,
                         help="Number of residues +/- the vdms for which to "
-                        "calculate sequence similarity and backbone similarity.")
+                        "calculate sequence similarity and backbone similarity. Defaults "
+                        "to 2.")
     parser.add_argument('-s', '--symmetry-classes', nargs='+', type=int,
                         help='Integers representing the symmetry classes of the CG '
                         'atoms on which clustering is to be performed. If provided, '
@@ -60,7 +65,7 @@ def parse_args():
     parser.add_argument('-n', '--size-subset', type=int, 
                         help='Specify the number of residues in the vdG subset. '
                         'The purpose of this arg is for parallelization (running '
-                        'this script with different -n values concurrently. 1, 2, '
+                        'this script with different -n values concurrently). 1, 2, '
                         '3, and 4 are recommended.')
     parser.add_argument('-l', "--logfile", help="Path to log file.")
     parser.add_argument('-p', "--print-flankbb", action='store_true', 
@@ -109,12 +114,14 @@ must be sampled when checking for redundancy.
 
 def main():
    start_time = time.time()
+   tracemalloc.start()
    args = parse_args()
    CG = args.cg
    seq_sim_thresh = args.seq
    num_flanking = args.flank
    symmetry_classes = args.symmetry_classes
    print_flankbb = args.print_flankbb
+   keep_clustered_pdbs = args.keep_clustered_pdbs
    size_subset = args.size_subset
    if size_subset not in [1, 2, 3, 4]:
       raise ValueError('size_subset must be an integer between 1 and 4.')
@@ -134,7 +141,7 @@ def main():
 
    # Iterate over the PDBs and CGs that were identified as containing the SMARTS group
    atomgroup_dict = {}
-   vdg_pdbs_in_dir = os.listdir(vdg_pdbs_dir)
+   vdg_pdbs_in_dir = sorted(os.listdir(vdg_pdbs_dir))
    for pdbname in vdg_pdbs_in_dir:
       pdbpath = os.path.join(vdg_pdbs_dir, pdbname)
       prody_obj = pr.parsePDB(pdbpath)
@@ -180,16 +187,19 @@ def main():
 
    '''
    Clean up the entire output from clus_and_deduplicate_vdgs.py.
-   At each clustering stage (flankseq, flankbb, then cgvdmbb), the clustered PDBs are 
+   At each clustering stage (cgvdmbb then flankseq_and_bb), the clustered PDBs are 
    output so that they can be loaded in for the next step. (The libraries 
-   are usually way too large to store in memory.) At the end of clustering (at the cgvdmbb
-   level), the clustered output for cgvdmbb is organized by: 
-   CG/clusters/cgvdmbb/cgvdmbb_clusnum/AAs/flankseq_clusnum/flankbb_clusnum/cgvdmbb_clusnum.
-   Therefore, it's easy to trace the flankseq, flankbb, and cgvdmbb cluster numbers, and
-   earlier output (clusters/flankseq/ and clusters/flankbb) can be deleted, as well as
-   the temp dir used for the different permutations of cgvdmbb.
+   are usually way too large to store in memory.) At the end of the final stage of 
+   clustering (the flankseq_and_bb level), the clustered output is organized by:
+   CG/clusters/flankseq_and_bb/size_subset/vdg_AAs/cgvdmbb_clusnum/flankseq_and_bb_clusnum.
+   Therefore, it's easy to trace the earlier cluster results, and that earlier output
+   (clusters/temp/ and clusters/cgvdmbb) can be deleted. By default, the final stage of
+   clustering (clusters/flankseq_and_bb) is deleted as well, because all of the clusters
+   are quite memory-intensive. However, this final stage of clustering can be preserved 
+   using the --keep-clustered-pdbs flag.
    '''
-   delete_clusterdirs(vdglib_dir, logfile, size_subset)
+   delete_clusterdirs(vdglib_dir, logfile, size_subset, keep_clustered_pdbs)
+   delete_memmap(size_subset)
 
    # Print out time elapsed
    seconds = time.time() - start_time
@@ -214,6 +224,11 @@ def main():
                  f'{size_subset} out of {num_vdg_pdbs} vdgs.\n')
       file.write(f"Completed clus_and_deduplicate_vdgs.py in {hours} h, ")
       file.write(f"{minutes} mins, and {seconds} secs \n") 
+   
+   #current, peak = tracemalloc.get_traced_memory()
+   #print(f"Current memory usage at end of script: {np.round(current / (1024 * 1024 * 1024),2)} GB")
+   #print(f"Peak memory usage at end of script: {np.round(peak / (1024 * 1024 * 1024),2)} GB")
+   tracemalloc.stop()
 
 def copy_nr_to_outdir(vdglib_dir, nr_dir, reordered_AAs):
    clustersdir = os.path.join(vdglib_dir, 'clusters', 'flankseq_and_bb', 
@@ -250,6 +265,7 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
    # [Ala1, Ala2, Glu], then we need to sample [Ala1, Ala2, Glu] and [Ala2, Ala1, 
    # Glu]. The easiest way to get the permutations is to label the index of the 
    # ordered AAs
+   reordered_AAs_str = '_'.join(reordered_AAs)
    
    # Include all AA permutations (for identical AAs) of the vdgs.
    all_AA_perm_cg_coords, all_AA_perm_vdm_bbcoords, \
@@ -284,7 +300,8 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
    cgvdmbb_rmsd_cut = normalize_rmsd(num_cgvdmbb_atoms, 'cgvdmbb') 
    cgvdmbb_data_to_clus = zip([all_AA_cg_perm_cg_and_vdmbb_coords], ['cgvdmbb'])
    cgvdmbb_clus_assignments, cgvdmbb_clus_centroids = clust.get_hierarchical_clusters(
-      cgvdmbb_data_to_clus, cgvdmbb_rmsd_cut, rmsd_max=1)
+      cgvdmbb_data_to_clus, cgvdmbb_rmsd_cut, reordered_AAs_str, len(reordered_AAs), 
+      rmsd_max=1)
 
    # Output the cgvdmbb clusters
      
@@ -293,7 +310,7 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
    # permutations of the same PDB).
 
    temp_cgvdmbb_clusdir = os.path.join(vdglib_dir, 'clusters', 'temp', 'cgvdmbb', 
-      str(len(reordered_AAs)), '_'.join(reordered_AAs)) 
+      str(len(reordered_AAs)), reordered_AAs_str) 
    utils.handle_existing_files(temp_cgvdmbb_clusdir)
    cgvdmbb_weights = clust.get_weights(num_cg_atoms, num_vdmbb_atoms, 
                                              align_cg_weight)
@@ -320,7 +337,7 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
    tempdir = os.path.join(vdglib_dir, 'clusters', 'temp', 'cgvdmbb')
    cleandir = os.path.join(vdglib_dir, 'clusters', 'cgvdmbb')
    reassigned_cgvdmbb_clus = clust.rewrite_temp_clusters(tempdir, cleandir, 
-                                    len(reordered_AAs), '_'.join(reordered_AAs))
+                                    len(reordered_AAs), reordered_AAs_str)
 
    # Next, further subdivide each cluster on rmsd of the bb stretches flanking the vdms 
    # + their sequences. 
@@ -345,11 +362,11 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
       flankseq_and_bb_thresh = flankbb_rmsd_cut + (1 - seq_sim_thresh)
       flankingseq_and_bb_cluster_assignments, flankingseq_and_bb_clus_centroids \
          = clust.get_hierarchical_clusters(flankseq_and_bb_to_clus, flankseq_and_bb_thresh, 
-                                           rmsd_max=1.5)
+         reordered_AAs_str, len(reordered_AAs), rmsd_max=1.5)
             
       # Output the flankseq+bb clusters
       flankseq_and_bb_clusdir_for_this_cgvdmbb_clus = os.path.join(vdglib_dir, 'clusters', 
-         'flankseq_and_bb', str(len(reordered_AAs)), '_'.join(reordered_AAs), 
+         'flankseq_and_bb', str(len(reordered_AAs)), reordered_AAs_str, 
          f'cgvdmbb_{cgvdmbb_clusnum}') 
       utils.handle_existing_files(flankseq_and_bb_clusdir_for_this_cgvdmbb_clus) 
 
@@ -366,7 +383,7 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
             for fail in failed_pdbs:
                file.write(f'\tFailed to parse {fail}.\n')
 
-def delete_clusterdirs(vdglib_dir, logfile, size_subset):
+def delete_clusterdirs(vdglib_dir, logfile, size_subset, keep_clustered_pdbs):
    with open(logfile, 'a') as file:
       all_clusters = os.path.join(vdglib_dir, 'clusters')
       # delete temp folder
@@ -381,6 +398,19 @@ def delete_clusterdirs(vdglib_dir, logfile, size_subset):
          file.write(f"\t{cgvdmbbdir} does not exist.\n")
       else:
          shutil.rmtree(cgvdmbbdir)
+      # delete flankseq_and_bb if specified
+      if not keep_clustered_pdbs:
+         flank_dir = os.path.join(all_clusters, 'flankseq_and_bb', str(size_subset))
+         if not os.path.exists(flank_dir):
+            file.write(f"\t{flank_dir} does not exist.\n")
+         else:
+            shutil.rmtree(flank_dir)
+
+def delete_memmap(size_subset):
+   pattern = f"tmp/*_{size_subset}.dat"
+   files_to_delete = glob.glob(pattern)
+   for file in files_to_delete:
+      os.remove(file)
 
 def normalize_rmsd(num_atoms, atoms):
    if atoms == 'flankbb':

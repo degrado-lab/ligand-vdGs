@@ -129,10 +129,16 @@ def get_coords(struct, atomnames, seg, ch, res, pdbpath):
             atom_sel_str = f'chain {ch} and resnum {res} and name {atom}'
 
         atom_sel = struct.select(atom_sel_str) 
-        if len(atom_sel) != 1 or atom_sel is None:
+
+        if atom_sel is None:
+            raise ValueError(f'segment {seg} chain {ch} resnum {res} name {atom} is '
+                             f'expected to select one atom, but it corresponds to '
+                             f'nothing in {pdbpath}')
+        elif len(atom_sel) != 1:
             raise ValueError(f'segment {seg} chain {ch} resnum {res} name {atom} is '
                              f'expected to select one atom, but it corresponds to '
                              f'{len(atom_sel)} atoms in {pdbpath}')
+
         coord = atom_sel.getCoords()[0]
         coords.append(list(coord)) # for ease of adding/flattening lists and not arrays
     return coords
@@ -156,8 +162,11 @@ def get_in_dir_and_out_dir(q_res_set, vdgs_dir):
 
 def get_database_vdgs_for_spec_AAs(_vdgs_dir, AAs):
     AA_str = '_'.join(sorted(AAs))
-    print(AAs)
-    database_vdg_names = os.listdir(os.path.join(_vdgs_dir, AA_str))
+    aa_path = os.path.join(_vdgs_dir, AA_str)
+    if not os.path.exists(aa_path):
+        return [], []
+    
+    database_vdg_names = os.listdir(aa_path)
     database_vdg_paths = [os.path.join(_vdgs_dir, AA_str, d) for d in database_vdg_names]
     #pdbnames = [i.split('/')[-1] for i in database_vdg_paths]
     #assert len(database_vdg_paths) == len(set(pdbnames))

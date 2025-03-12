@@ -117,7 +117,7 @@ def main():
                             bsr_str = '_'.join(bsr_flat_list)
                             output_vdg_name += f'_{bsr_str}'
                         subdir_path = os.path.join(output_dir, out_subdir)
-                        output_vdg_path = os.path.join(output_dir, out_subdir, output_vdg_name)
+                        output_vdg_path = os.path.join(output_dir, out_subdir, output_vdg_name+'.pdb')
                         if not os.path.exists(subdir_path):
                             os.makedirs(subdir_path)
                         pr.writePDB(output_vdg_path, 
