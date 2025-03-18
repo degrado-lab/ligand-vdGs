@@ -184,6 +184,7 @@ def main():
          '''Final results: vdgs that end up in the same cg+vdmbb, flanking bb, and 
          flanking seq clusters are redundant. Select only the centroid to be output.'''
          copy_nr_to_outdir(vdglib_dir, out_dir, _reordered_AAs)
+         delete_reorderedAA_memmaps(size_subset, vdglib_dir, _reordered_AAs)
 
    '''
    Clean up the entire output from clus_and_deduplicate_vdgs.py.
@@ -225,9 +226,10 @@ def main():
       file.write(f"Completed clus_and_deduplicate_vdgs.py in {hours} h, ")
       file.write(f"{minutes} mins, and {seconds} secs \n") 
    
-   #current, peak = tracemalloc.get_traced_memory()
-   #print(f"Current memory usage at end of script: {np.round(current / (1024 * 1024 * 1024),2)} GB")
-   #print(f"Peak memory usage at end of script: {np.round(peak / (1024 * 1024 * 1024),2)} GB")
+   current, peak = tracemalloc.get_traced_memory()
+   peak_mem = np.round(peak / (1024 * 1024 * 1024), 2)
+   if peak_mem > 20:
+      print(f"Peak memory usage at end of script: {peak_mem} GB")
    tracemalloc.stop()
 
 def copy_nr_to_outdir(vdglib_dir, nr_dir, reordered_AAs):
@@ -411,6 +413,24 @@ def delete_memmap(size_subset, vdglib_dir):
    files_to_delete = glob.glob(pattern)
    for file in files_to_delete:
       os.remove(file)
+   # Also remove if D_matrix chunk
+   pattern = f"{vdglib_dir}/tmp/D_matrix_*_{size_subset}_chunk*.dat"
+   files_to_delete = glob.glob(pattern)
+   for file in files_to_delete:
+      os.remove(file)
+
+def delete_reorderedAA_memmaps(size_subset, vdglib_dir, reordered_AAs):
+   reordered_AAs = '_'.join(reordered_AAs)
+   tmpdir = f'{vdglib_dir}/tmp/'
+   for pattern in [f'D_matrix_{reordered_AAs}_{size_subset}_chunk*.dat',
+                   f'distance_matrix_{reordered_AAs}_{size_subset}.dat',
+                   f'mobile_matrix_{reordered_AAs}_{size_subset}.dat',
+                   f'target_matrix_{reordered_AAs}_{size_subset}.dat'
+                   ]:
+
+      files_to_delete = glob.glob(tmpdir + pattern)
+      for file in files_to_delete:
+         os.remove(file)
 
 def normalize_rmsd(num_atoms, atoms):
    if atoms == 'flankbb':

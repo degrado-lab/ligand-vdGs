@@ -6,8 +6,7 @@
 #$ -cwd
 #$ -j y               # tells system STDERR and STDOUT should be joined
 #$ -l h_rt=100:00:00  #-- runtime limit - max 2 weeks == 336 hours
-#$ -l mem_free=50G
-#$ -l scratch=50G
+#$ -l mem_free=300G
 #$ -R yes             #-- SGE host reservation
 
 date

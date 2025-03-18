@@ -8,6 +8,7 @@
 #$ -l h_rt=300:00:00     #-- runtime limit - max 2 weeks == 336 hours
 #$ -R yes               #-- SGE host reservation
 #$ -l h=!qb3-as4
+#$ -l scratch=200G
 
 date
 hostname

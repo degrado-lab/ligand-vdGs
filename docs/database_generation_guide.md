@@ -21,7 +21,16 @@ If you want to use the RCSB PDB as your parent database, follow these instructio
 - [placeholder]
 
 ## Generating a vdG Database from the Parent Database
-
 Now that you've prepared your parent database, you can generate vdGs of SMARTS-defined chemical groups (CGs) using [`ligand-vdGs/ligand_vdgs/scripts/vdg_generation_wrapper.py`](../ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py), which calls on scripts within the `vdG-miner` package. Usage instructions are in the header, and all submission scripts for the CGs in the distributed vdG library can be found in [`ligand-vdGs/ligand_vdgs/generate_vdgs/lib_gen_submit_scripts`](../ligand_vdgs/generate_vdgs/lib_gen_submit_scripts/).
 
 [placeholder for deduplication step]
+
+## Optional: Preparing database ligand SMILES for fragmentation
+These steps describe how to generate [`ligand_smiles.csv`](../resources/ligand_smiles.csv) for breaking down into fragments. This is optional, because this file is provided in the [`resources`](../resources/) directory of this package. However, this is how you could generate your own: 
+
+If you're collecting SMILES of ligands in the RCSB, start by downloading the ligand.tsv.gz file from https://zhanggroup.org/BioLiP/data/ligand.tsv.gz to obtain pre-processed data of the ligands within the BioLiP2 database. Then, extract only the ligand names and SMILES strings by running [`ligand_vdgs/scripts/extract_smiles_from_biolip2.py`](../ligand_vdgs/scripts/extract_smiles_from_biolip2.py). 
+
+If you're collecting SMILES of ligands in a custom database, prepare a csv file in the same format as ligand_smiles.csv, where the 1st column contains the moelcule name (as it's named in the PDB files), and the 2nd column contains its SMILES string.
+
+
+TODO: summarize the process of database generation in top-level README

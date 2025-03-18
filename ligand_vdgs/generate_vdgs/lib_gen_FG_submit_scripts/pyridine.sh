@@ -5,8 +5,9 @@
 #$ -N pyridine
 #$ -cwd
 #$ -j y               # tells system STDERR and STDOUT should be joined
-#$ -l h_rt=24:00:00   #-- runtime limit - max 2 weeks == 336 hours
+#$ -l h_rt=300:00:00   #-- runtime limit - max 2 weeks == 336 hours
 #$ -R yes             #-- SGE host reservation
+#$ -l mem_free=300G
 
 date
 hostname

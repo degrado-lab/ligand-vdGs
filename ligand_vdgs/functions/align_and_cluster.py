@@ -223,7 +223,7 @@ def create_dist_matrix(data, dist_metric, AA_subset, size_subset, vdglib_dir):
       distance_matrix += distance_matrix.T
    return distance_matrix
 
-def kabsch(X, Y, AA_subset, size_subset, vdglib_dir, chunk_size=10000):
+def kabsch(X, Y, AA_subset, size_subset, vdglib_dir, chunk_size=30000):
    """Rotate and translate X into Y to minimize the SSD between the two, 
       and find the derivatives of the SSD with respect to the entries of Y. 
       
@@ -696,9 +696,14 @@ def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_c
          # CE2-CZ-CE1-CD2, and there are I believe 3 configurations that minimize that RMSD. 
          target_coords = first_pdb_cg_vdmbb_coords
          # Align centroid (cg+vdmbb) to the first pdb and return its new coords so that its 
-         # cluster mems can align onto it. 
-         moved_cent_transf, moved_cent_coords = get_transf_and_coords(cent_cg_vdmbb_coords, 
-               target_coords, weights, cent_pr_obj, cent_scrr_cg_perm, symmetry_classes)
+         # cluster mems can align onto it.
+         try: 
+            moved_cent_transf, moved_cent_coords = get_transf_and_coords(cent_cg_vdmbb_coords, 
+                  target_coords, weights, cent_pr_obj, cent_scrr_cg_perm, symmetry_classes)
+         except:
+            # Sometimes there's an error, though very rare. Skip this cluster.
+            print(f'Error: failed to write out {cent_pdb_outpath}. '
+                  f'Need to skip entire cluster of size {len(clus_mem_indices)}.')
          # Apply transformation and write out the moved centroid.
          write_out_subsequent_clus_pdbs(cent_pr_obj, cent_pdb_outpath, cent_scrr_cg_perm, 
             print_flankbb, moved_cent_transf)
@@ -963,9 +968,12 @@ def get_pr_obj_to_print(clusmem_pdbpath, vdg_scrr_cg_perm,
    vdg_scrrs, cg_perm = vdg_scrr_cg_perm
    # Iterate over vdms
    for vdm_scrr in vdg_scrrs:
-      flank_obj = add_flank_obj_for_cluslevel_flank(par, vdm_scrr, num_flanking,
-                                                    clusmem_pdbpath)
-      pr_obj += flank_obj
+      try:
+         flank_obj = add_flank_obj_for_cluslevel_flank(par, vdm_scrr, num_flanking,
+                                                       clusmem_pdbpath)
+         pr_obj += flank_obj
+      except:
+         pass
 
    return pr_obj.copy()
 

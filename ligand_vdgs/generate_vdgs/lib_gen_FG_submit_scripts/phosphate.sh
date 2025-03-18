@@ -5,9 +5,8 @@
 #$ -N phosphate
 #$ -cwd
 #$ -j y               # tells system STDERR and STDOUT should be joined
-#$ -l h_rt=100:00:00  #-- runtime limit - max 2 weeks == 336 hours
-#$ -l mem_free=100G
-#$ -l scratch=100G
+#$ -l h_rt=300:00:00  #-- runtime limit - max 2 weeks == 336 hours
+#$ -l mem_free=200G
 #$ -R yes             #-- SGE host reservation
 #$ -l h=!qb3-as4
 
