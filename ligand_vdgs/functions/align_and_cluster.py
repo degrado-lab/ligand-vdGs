@@ -255,15 +255,19 @@ def kabsch(X, Y, AA_subset, size_subset, vdglib_dir, chunk_size=30000):
    R_chunks, t_chunks, ssd_chunks = [], [], []
    for i in range(n_chunks):
       # compute R using the Kabsch algorithm
-      Xbar = np.nanmean(X[i*chunk_size:(i+1)*chunk_size], 
-                        axis=1, keepdims=True)
-      Ybar = np.nanmean(Y[i*chunk_size:(i+1)*chunk_size], 
-                        axis=1, keepdims=True)
       mask = np.logical_or(np.isnan(X[i*chunk_size:(i+1)*chunk_size]), 
                            np.isnan(Y[i*chunk_size:(i+1)*chunk_size]))
-      Xc, Yc = X[i*chunk_size:(i+1)*chunk_size] - Xbar, \
-               Y[i*chunk_size:(i+1)*chunk_size] - Ybar
-      Xc[mask], Yc[mask] = 0., 0.
+      N = np.sum(~mask, axis=1, keepdims=True)
+      X_nonan, Y_nonan = np.zeros_like(X), np.zeros_like(Y)
+      X_nonan[~mask], Y_nonan[~mask] = \
+         X[i*chunk_size:(i+1)*chunk_size][~mask], \
+         Y[i*chunk_size:(i+1)*chunk_size][~mask]
+      Xbar = np.sum(X_nonan, axis=1, keepdims=True) / N
+      Ybar = np.sum(Y_nonan, axis=1, keepdims=True) / N
+      Xc = X_nonan - Xbar
+      Yc = Y_nonan - Ybar
+      Xc[mask] = 0.0
+      Yc[mask] = 0.0
       H = np.matmul(np.transpose(Xc, (0, 2, 1)), Yc)
       U, S, Vt = np.linalg.svd(H)
       d = np.sign(np.linalg.det(np.matmul(U, Vt)))
