@@ -68,7 +68,7 @@ def parse_args():
                         'this script with different -n values concurrently). 1, 2, '
                         '3, and 4 are recommended.')
     parser.add_argument('-l', "--logfile", help="Path to log file.")
-    parser.add_argument('-p', "--print-flankbb", action='store_true', 
+    parser.add_argument('-x', "--print-flankbb", action='store_true', 
                         help="Include flanking bb residues when writing out PDB.")
     
     return parser.parse_args()
@@ -303,7 +303,7 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
    cgvdmbb_data_to_clus = zip([all_AA_cg_perm_cg_and_vdmbb_coords], ['cgvdmbb'])
    cgvdmbb_clus_assignments, cgvdmbb_clus_centroids = clust.get_hierarchical_clusters(
       cgvdmbb_data_to_clus, cgvdmbb_rmsd_cut, reordered_AAs_str, len(reordered_AAs), 
-      vdglib_dir, rmsd_max=1)
+      vdglib_dir)
 
    # Output the cgvdmbb clusters
      
@@ -361,10 +361,10 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
       num_flank_bb_coords = len(cgvdmbb_clus_flat_flankingCAs[0])
       flankbb_rmsd_cut = normalize_rmsd(num_flank_bb_coords, 'flankbb')
       # Then, do secondary clustering on a metric and threshold that combines rmsd and seq
-      flankseq_and_bb_thresh = flankbb_rmsd_cut + (1 - seq_sim_thresh)
+      flankseq_and_bb_thresh = flankbb_rmsd_cut + (1 - seq_sim_thresh) / 2
       flankingseq_and_bb_cluster_assignments, flankingseq_and_bb_clus_centroids \
          = clust.get_hierarchical_clusters(flankseq_and_bb_to_clus, flankseq_and_bb_thresh, 
-         reordered_AAs_str, len(reordered_AAs), vdglib_dir, rmsd_max=1.5)
+         reordered_AAs_str, len(reordered_AAs), vdglib_dir)
             
       # Output the flankseq+bb clusters
       flankseq_and_bb_clusdir_for_this_cgvdmbb_clus = os.path.join(vdglib_dir, 'clusters', 
@@ -445,11 +445,11 @@ def normalize_rmsd(num_atoms, atoms):
    max_atoms = 15
    
    if num_atoms < min_atoms:
-       return min_threshold  # below 5 atoms, use the minimum threshold (1.5 Å)
+       return min_threshold  # below 8 atoms, use the minimum threshold (0.5 Å)
    if num_atoms > max_atoms:
-       return max_threshold  # above 20 atoms, use the maximum threshold (2.5 Å)
+       return max_threshold  # above 15 atoms, use the maximum threshold
    
-   # Linear scaling for atoms between 5 and 20
+   # Linear scaling for atoms 
    scaling_factor = (num_atoms - min_atoms) / (max_atoms - min_atoms)
    threshold = min_threshold + scaling_factor * (max_threshold - min_threshold)
    

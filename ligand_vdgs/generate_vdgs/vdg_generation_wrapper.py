@@ -38,6 +38,8 @@ def parse_args():
                         "when superposing output vdGs. Not weights for clustering. "
                         "Example: 0.5 means 1/2 of weight is assigned to CG atoms and "
                         "the remaining 1/2 goes to the vdM backbone atoms. Defaults to 0.99.")
+    parser.add_argument('-x', "--print-flankbb", action='store_true', 
+                        help="Include flanking bb residues when writing out PDB.")
     return parser.parse_args()
 
 
@@ -50,6 +52,8 @@ def main():
     out_dir = args.out_dir
     keep_clustered_pdbs = args.keep_clustered_pdbs
     trial_run = args.trial_run
+    align_cg_weight = args.align_cg_weight
+    print_flankbb = args.print_flankbb
     symm_classes = args.symmetry_classes
     if symm_classes is not None:
         symm_classes = ' '.join(symm_classes)
@@ -94,12 +98,18 @@ def main():
 
     # Run clus_and_deduplicate_vdgs.py
     if symm_classes is not None:
-        deduplicate_template = f'python ligand_vdgs/generate_vdgs/clus_and_deduplicate_vdgs.py -c "{cg}" -v "{out_dir}" -s {symm_classes} -l "{logfile}" -n '
+        deduplicate_template = f'python ligand_vdgs/generate_vdgs/clus_and_deduplicate_vdgs.py -c "{cg}" -v "{out_dir}" -s {symm_classes} -l "{logfile}" -w {align_cg_weight}'
     else:
-        deduplicate_template = f'python ligand_vdgs/generate_vdgs/clus_and_deduplicate_vdgs.py -c "{cg}" -v "{out_dir}" -l "{logfile}" -n '
+        deduplicate_template = f'python ligand_vdgs/generate_vdgs/clus_and_deduplicate_vdgs.py -c "{cg}" -v "{out_dir}" -l "{logfile}" -w {align_cg_weight}'
+    
+    # Add optional flags, if requested 
+    if keep_clustered_pdbs:
+        deduplicate_template += ' -k'
+    if print_flankbb:
+        deduplicate_template += ' -x'
 
-    for num_vdms in [1,2,3,4]:
-        deduplicate_cmd = deduplicate_template + str(num_vdms)
+    for num_vdms in [1, 2, 3, 4]:
+        deduplicate_cmd = f'{deduplicate_template} -n {num_vdms}'
         subprocess.run(deduplicate_cmd, shell=True, check=True)
         
     # Clean up the final state of clusters dir. Each subset's tempdir, flankseq, and 
@@ -110,6 +120,7 @@ def main():
     delete_empty_dirs(os.path.join(out_dir, 'nr_vdgs'))
     delete_tmp_memmap_dir(out_dir)
     if not keep_clustered_pdbs:
+        clean_up_clusdirs(out_dir, 'flankseq_and_bb', logfile) 
         delete_empty_dirs(os.path.join(out_dir, 'clusters'))
     
     with open(logfile, 'a') as _log:
@@ -138,7 +149,6 @@ def clean_up_clusdirs(out_dir, clus_level, logfile):
                     _log.write(f"\t{direc} contains these files and will be deleted: \n")
                     for file in files:
                         _log.write(f"\t\t{file}\n")
-                    return
             shutil.rmtree(direc)
 
 def set_up_outdir(out_dir):
@@ -160,7 +170,7 @@ def write_out_commandline_params(logfile, smarts, cg, pdb_dir, probe_dir, out_di
                                  symm_classes, logdir):
     if not os.path.exists(logdir):
         os.mkdir(logdir)
-    print(f'\nLogdir: {logdir}\n')
+    #print(f'\nLogdir: {logdir}\n')
     with open(logfile, 'w') as _log:
         _log.write(f'SMARTS: {smarts} \n')
         _log.write(f'CG: {cg} \n')

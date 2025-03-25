@@ -101,7 +101,7 @@ def flatten_vdg_bbs(_vdmbb):
    return bbs
 
 def get_hierarchical_clusters(data_to_clus, threshold, AA_subset, size_subset, 
-   vdglib_dir, rmsd_max):
+   vdglib_dir):
    '''
    Returns dict where key = cluster number and value = indices of the list elements 
    that belong in that cluster. This dict is not ordered by size.
@@ -109,9 +109,6 @@ def get_hierarchical_clusters(data_to_clus, threshold, AA_subset, size_subset,
          list_metrics, where list_data is either a list of coords, or a list of seqs.
       -- dist_metrics is a list of strings, where each string can be 'flankseq', 
          'cgvdmbb', or 'flankbb'.
-      -- `rmsd_max` is the max rmsd used by normalize_rmsd in the script that calls this 
-         one. The purpose is to be able to scale/normalize the rmsd matrix if there are 2 
-         dist metrics that have to be combined.
    How to use this function: 
       -- for clustering on cgvdmbb only: 
          get_hierarchical_clusters(zip([cgvdmbb_coords], ['cgvdmbb']))
@@ -128,11 +125,9 @@ def get_hierarchical_clusters(data_to_clus, threshold, AA_subset, size_subset,
 
       matrix = create_dist_matrix(data, dist_metric, AA_subset, size_subset, vdglib_dir)
       if dist_metric == 'flankbb' or dist_metric == 'cgvdmbb':
-         # "Normalize"/scale the rmsd matrix using min/max so that it's on the same scale 
-         # as sequence dissimilarity.
-         matrix = matrix / rmsd_max
          matrices.append(matrix)
       elif dist_metric == 'flankseq':
+         matrix = matrix / 2
          matrices.append(matrix)
    # Add the matrices and condense
    if len(matrices) == 1:
@@ -258,7 +253,8 @@ def kabsch(X, Y, AA_subset, size_subset, vdglib_dir, chunk_size=30000):
       mask = np.logical_or(np.isnan(X[i*chunk_size:(i+1)*chunk_size]), 
                            np.isnan(Y[i*chunk_size:(i+1)*chunk_size]))
       N = np.sum(~mask, axis=1, keepdims=True)
-      X_nonan, Y_nonan = np.zeros_like(X), np.zeros_like(Y)
+      X_nonan = np.zeros_like(X[i*chunk_size:(i+1)*chunk_size])
+      Y_nonan = np.zeros_like(Y[i*chunk_size:(i+1)*chunk_size])
       X_nonan[~mask], Y_nonan[~mask] = \
          X[i*chunk_size:(i+1)*chunk_size][~mask], \
          Y[i*chunk_size:(i+1)*chunk_size][~mask]
