@@ -1,14 +1,12 @@
 import os
-import sys
 import time
 import subprocess
 import argparse 
 import shutil
+import multiprocessing
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Determine CGs matching a SMARTS pattern."
-    )
+    parser = argparse.ArgumentParser()
     parser.add_argument('-s', '--smarts', type=str, required=True, 
                         help="SMARTS pattern.")
     parser.add_argument('-c', '--cg', type=str, 
@@ -108,10 +106,12 @@ def main():
     if print_flankbb:
         deduplicate_template += ' -x'
 
-    for num_vdms in [1, 2, 3, 4]:
-        deduplicate_cmd = f'{deduplicate_template} -n {num_vdms}'
-        subprocess.run(deduplicate_cmd, shell=True, check=True)
-        
+    # Create a Pool of workers and run the deduplication commands concurrently
+    num_vdms_list = [1, 2, 3]
+    with multiprocessing.Pool(processes=len(num_vdms_list)) as pool:
+        pool.starmap(run_deduplicate, [(num_vdms, deduplicate_template) for num_vdms 
+                                       in num_vdms_list])
+
     # Clean up the final state of clusters dir. Each subset's tempdir, flankseq, and 
     # flankbb dirs were cleaned up along the way, but the highest level of these dirs 
     # need to be deleted too.
@@ -165,6 +165,10 @@ def set_up_outdir(out_dir):
             print('\n', dir_exists_msg)
             raise ValueError(dir_exists_msg)
     return out_dir
+
+def run_deduplicate(num_vdms, deduplicate_template):
+    deduplicate_cmd = f'{deduplicate_template} -n {num_vdms}'
+    subprocess.run(deduplicate_cmd, shell=True, check=True)
 
 def write_out_commandline_params(logfile, smarts, cg, pdb_dir, probe_dir, out_dir, 
                                  symm_classes, logdir):

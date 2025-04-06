@@ -1,11 +1,12 @@
+import os
+import random
+import time
 from itertools import permutations, combinations, product
 import numpy as np
+import multiprocessing
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
 import prody as pr
-import os
-import sys
-import tracemalloc
 
 def get_vdg_AA_permutations(reordered_AAs, _vdgs):
    permuted_indices = permute_AA_duplicates(reordered_AAs)
@@ -168,6 +169,14 @@ def create_dist_matrix(data, dist_metric, AA_subset, size_subset, vdglib_dir):
 
    # Need to initialize distance_matrix.dat with zeros.
    tmp_dir = os.path.join(vdglib_dir, 'tmp')
+   
+   # Stagger checking/creating the tmpdir because multiprocessing will run 
+   # clus_and_deduplicate_vdgs.py simultaneously for each num_size_subset. If tmpd_dir 
+   # doesn't exist in one second and exists in the next, then then os.mkdir() will crash 
+   # the program with a FileExistsError.
+   delay = random.randint(1, 30) # delay between 1 and 30 seconds to stagger
+   time.sleep(delay)
+
    if not os.path.exists(tmp_dir): # store memory-mapped arrays in tmp/
       os.mkdir(tmp_dir)
    dist_matrix_filename = os.path.join(tmp_dir, 'distance_matrix_{}_{}.dat'.format(
@@ -304,7 +313,6 @@ def get_overlapping_res_coords(list1, list2):
      
     return np.array(list1_overlap), np.array(list2_overlap)
 '''
-
 def calc_seq_similarity(list1, list2):
     # Count how many residues match
     list1 = [i for i in list1 if i != 'vdm']
@@ -507,7 +515,7 @@ def add_vdgs_to_dict(vdm_combos, vdg_subset, re_ordered_aas, re_ordered_bbcoords
 
    return vdm_combos
 
-def reorder_vdg_subset(vdg_subset, vdms_dict):
+def reorder_vdg_subset(vdg_subset, vdms_dict, cg_coords, prody_obj):
    '''Reorders vdms alphabetically.'''
    # First, record
    aas_of_vdms_in_order = []
@@ -517,13 +525,52 @@ def reorder_vdg_subset(vdg_subset, vdms_dict):
    seg_ch_res_of_vdms_in_order = []
    for _vdmresind in vdg_subset:
       vdmAA, vdm_features = vdms_dict[_vdmresind]
-      aas_of_vdms_in_order.append(vdmAA)
       vdm_seg_chain_resnum_resname, bb_coords, flanking_seq_dict = vdm_features
       seg_ch_res_of_vdms_in_order.append(vdm_seg_chain_resnum_resname)
       bb_coords_of_vdms_in_order.append(bb_coords)
       flankingseqs = []
       flankingCAs = []
       sorted_flank_indices = sorted(list(flanking_seq_dict.keys()))
+      # Check if it's a backbone-only contact. If it is, instead of recording vdmAA, 
+      # record "bb" as the vdm resname.
+      _vdg_seg, _vdg_ch, _vdg_resnum, _vdg_resname = vdm_seg_chain_resnum_resname
+      
+      if _vdg_resnum < 0:
+         res_sel = f'resnum `{_vdg_resnum}`'
+      else:
+         res_sel = f'resnum {_vdg_resnum}'
+
+      if _vdg_seg: 
+         vdm_sel = f'segname {_vdg_seg} and chain {_vdg_ch} and {res_sel}'
+      else:
+         vdm_sel = f'chain {_vdg_ch} and {res_sel}'
+      vdm_res_obj = prody_obj.select(f'{vdm_sel} and not element H D')
+      vdm_sc = vdm_res_obj.select(f'{vdm_sel} and sidechain') 
+      if vdm_sc is None:  # then Gly
+         aas_of_vdms_in_order.append(vdmAA)
+      elif len(vdm_sc) == 0: # also Gly
+         aas_of_vdms_in_order.append(vdmAA)
+      else: # not Gly, so check if it has a sc contact
+         has_sidechain_contact = False
+         for cg_atom in cg_coords:
+            dists_to_sc = pr.calcDistance(cg_atom, vdm_sc)
+            if np.any(dists_to_sc < 4.8):
+               has_sidechain_contact = True 
+               break 
+
+         if has_sidechain_contact:
+            aas_of_vdms_in_order.append(vdmAA)
+         else: 
+            # Even if it doesn't have a close sc contact, it may have a weaker sc 
+            # contact, so first see if it has a close bb contact, and if not, then 
+            # it should still be classified as a "sc" contact.
+            vdm_bb = vdm_res_obj.select(f'{vdm_sel} and backbone') 
+            dists_to_bb = pr.calcDistance(cg_atom, vdm_bb)
+            if np.any(dists_to_bb < 4.8):
+               aas_of_vdms_in_order.append('bb')
+            else:
+               aas_of_vdms_in_order.append(vdmAA)
+
       # Decompress the flanking AA and CA info
       for flank_ind in sorted_flank_indices:
          flank_resname, flank_ca = flanking_seq_dict[flank_ind]
@@ -531,6 +578,8 @@ def reorder_vdg_subset(vdg_subset, vdms_dict):
          flankingCAs.append(flank_ca)
       flankingseqs_of_vdms_in_order.append(flankingseqs)
       flanking_CA_coords_of_vdms_in_order.append(flankingCAs)
+   
+   assert len(aas_of_vdms_in_order) == len(bb_coords_of_vdms_in_order)
    # Then, re-order based on alphabetical order
    super_list = [aas_of_vdms_in_order, bb_coords_of_vdms_in_order, 
       flankingseqs_of_vdms_in_order, flanking_CA_coords_of_vdms_in_order, 
@@ -622,7 +671,7 @@ def get_vdg_AA_and_cg_perms(all_AA_perm_cg_coords,    all_AA_perm_vdm_bbcoords,
    return [all_AA_cg_perm_cg_coords,    all_AA_cg_perm_vdm_bbcoords, 
            all_AA_cg_perm_flankingseqs, all_AA_cg_perm_flankingCAs, 
            all_AA_cg_perm_pdbpaths,     all_AA_cg_perm_vdm_scrr_cg_perm]
-   
+
 def elements_in_clusters(indices_of_elements_in_cluster, cg_coords, vdm_bbcoords,
                          cgvdmbb_coords, flankingseqs, flankingCAs, pdbpaths, 
                          vdm_scrrs_cg_perms):
@@ -641,98 +690,134 @@ def elements_in_clusters(indices_of_elements_in_cluster, cg_coords, vdm_bbcoords
    return clus_cg_coords, clus_vdmbb_coords, clus_cgvdmbb_coords, clus_flankingseqs, \
       clus_flankingCAs, clus_pdbpaths, clus_vdm_scrr_cg_perms
 
+def process_cluster_member(ind, clusnum, clusnum_dir, centroid_ind, 
+                           all_cg_coords, all_cg_and_vdmbb_coords, all_flankbb_coords, 
+                           all_pdbpaths, all_scrr_cg_perm, num_flanking, atomgroup_dict, 
+                           weights, first_pdb_cg_vdmbb_coords, symmetry_classes, 
+                           print_flankbb):
+    
+    try:
+        data = get_clus_mem_data(ind, all_cg_coords, all_cg_and_vdmbb_coords, 
+               all_flankbb_coords, all_pdbpaths, all_scrr_cg_perm, num_flanking, 
+               atomgroup_dict)
+        if data is None:
+            return (None, all_pdbpaths[ind])  # Return None to mark failure
+        (clusmem_cg_coords, clusmem_cg_vdmbb_coords, clusmem_flankbb_coords, 
+         clusmem_pdbpath, clusmem_scrr_cg_perm, clusmem_pr_obj) = data
+        clusmem_pdb_outpath = get_clus_pdb_outpath(clusnum, clusnum_dir, clusmem_pdbpath, 
+                                             clusmem_scrr_cg_perm, ind, is_centroid=False)
+        
+        # Align clus mem to the centroid and write out the pdb
+        if clusnum == 1: # the centroid to align onto _is_ the first pdb instead of a 
+           # cluster cent that's aligned onto the first pdb.
+           moved_cent_coords = first_pdb_cg_vdmbb_coords
+        
+        transf, moved_coords = get_transf_and_coords(clusmem_cg_vdmbb_coords, 
+           moved_cent_coords, weights, clusmem_pr_obj, clusmem_scrr_cg_perm, 
+           symmetry_classes)
+        write_out_subsequent_clus_pdbs(clusmem_pr_obj, clusmem_pdb_outpath, 
+           clusmem_scrr_cg_perm, print_flankbb, transf)
+
+        transf, moved_coords = get_transf_and_coords(clusmem_cg_vdmbb_coords, 
+                                                     moved_cent_coords, weights, 
+                                                     clusmem_pr_obj, clusmem_scrr_cg_perm, 
+                                                     symmetry_classes)
+        write_out_subsequent_clus_pdbs(clusmem_pr_obj, clusmem_pdb_outpath, 
+                                       clusmem_scrr_cg_perm, print_flankbb, transf)
+        return (clusmem_pdb_outpath, None)  # Successful completion
+
+    except Exception as e:
+        print(f"Error processing cluster member {ind}: {e}")
+        return (None, all_pdbpaths[ind])  # Return failure if exception occurs
+
 def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_coords, 
                        all_pdbpaths, all_scrr_cg_perm, all_cg_and_vdmbb_coords, 
                        all_flankbb_coords, num_flanking, first_pdb_out, 
                        first_pdb_cg_vdmbb_coords, weights, atomgroup_dict, print_flankbb, 
-                       symmetry_classes, clusterlabel=None):
-   # clusterlabel can be 'flankbb', 'flankbb_and_seq', etc.
+                       symmetry_classes, clusterlabel=None, num_threads=10):
+    assert len(all_pdbpaths) == len(all_cg_and_vdmbb_coords)
+    ref = np.array([[0, 0, 0], [-1, 0, 1], [1, -1, 0]])  # reference for aligning CG
 
-   assert len(all_pdbpaths) == len(all_cg_and_vdmbb_coords)
-   ref = np.array([[0, 0, 0], [-1, 0, 1], [1, -1, 0]]) # it's just to align the 
-        # first 3 atoms of CG. then, all atoms of all subsequent CGs will be 
-        # aligned to that first CG.
-   # Iterate over each cluster
-   failed = []
-   for clusnum, clus_mem_indices in sorted(clus_assignments.items()):
-      if clusterlabel is None:
-         subdir = f'clus_{clusnum}'
-      else: 
-         subdir = f'{clusterlabel}clus_{clusnum}'
-      clusnum_dir = os.path.join(clusdir, subdir)
-      os.makedirs(clusnum_dir)
-      centroid_ind = centroid_assignments[clusnum]
-      # First, output the centroid before its cluster members. Align centroids on cg+vdmbb.
-      data = get_clus_mem_data(centroid_ind, all_cg_coords, 
-         all_cg_and_vdmbb_coords, all_flankbb_coords, all_pdbpaths, all_scrr_cg_perm, 
-         num_flanking, atomgroup_dict)
-      if data is None:
-         failed.append(all_pdbpaths[centroid_ind])
-         continue
-      (cent_cg_coords, cent_cg_vdmbb_coords, cent_flankbb_coords, cent_pdbpath, 
+    failed = []
+    for clusnum, clus_mem_indices in sorted(clus_assignments.items()):
+        if clusterlabel is None:
+            subdir = f'clus_{clusnum}'
+        else:
+            subdir = f'{clusterlabel}clus_{clusnum}'
+        clusnum_dir = os.path.join(clusdir, subdir)
+        os.makedirs(clusnum_dir)
+        centroid_ind = centroid_assignments[clusnum]
+        # First, output the centroid before its cluster members.
+        data = get_clus_mem_data(centroid_ind, all_cg_coords, all_cg_and_vdmbb_coords, 
+            all_flankbb_coords, all_pdbpaths, all_scrr_cg_perm, num_flanking, 
+            atomgroup_dict)
+        if data is None:
+            failed.append(all_pdbpaths[centroid_ind])
+            continue
+        (cent_cg_coords, cent_cg_vdmbb_coords, cent_flankbb_coords, cent_pdbpath, 
          cent_scrr_cg_perm, cent_pr_obj) = data
-      cent_pdb_outpath = get_clus_pdb_outpath(clusnum, clusnum_dir, cent_pdbpath, 
-                                       cent_scrr_cg_perm, centroid_ind, is_centroid=True)
-      if first_pdb_out is None:
-         # If no pdb has been written out yet, align the first 3 CG atoms to the
-         # reference 3 atoms and output the pdb.
-         try:
-            first_pdb_out, first_pdb_cg_vdmbb_coords = print_out_first_pdb_of_clus(
-               cent_pdb_outpath, cent_cg_coords, cent_cg_vdmbb_coords, cent_pr_obj, ref,
-               cent_scrr_cg_perm, print_flankbb)
+        cent_pdb_outpath = get_clus_pdb_outpath(clusnum, clusnum_dir, cent_pdbpath, 
+                                    cent_scrr_cg_perm, centroid_ind, is_centroid=True)
+
+        if first_pdb_out is None:
+            # If no pdb has been written out yet, align the first 3 CG atoms to the
+            # reference 3 atoms and output the pdb.
+            try:
+                first_pdb_out, first_pdb_cg_vdmbb_coords = print_out_first_pdb_of_clus(
+                    cent_pdb_outpath, cent_cg_coords, cent_cg_vdmbb_coords, cent_pr_obj, 
+                    ref, cent_scrr_cg_perm, print_flankbb)
+                target_coords = first_pdb_cg_vdmbb_coords
+            except:
+                first_pdb_out, first_pdb_cg_vdmbb_coords, target_coords = None, None, None
+                continue
+        else:
+            # If a pdb has already been written out, align this vdg's cg+vdmbb onto that 
+            # first pdb. "target_coords" to align to is cg+vdmbb of the first PDB (which 
+            # itself is a centroid). 
+            # Note that target_coords has to be re-ordered to match the atom order in the 
+            # first PDB, because for CGs with symmetry, cluster members are aligned within a 
+            # a cluster, but often not to the first PDB. For example, the order of a phenyl 
+            # CG might be CG-CD1-CE1-CZ-CE2-CD2, but in another cluster, it might be CG-CD1-
+            # CE2-CZ-CE1-CD2, and there are I believe 3 configurations that minimize that RMSD.             
+
             target_coords = first_pdb_cg_vdmbb_coords
-         except:
-            first_pdb_out, first_pdb_cg_vdmbb_coords, target_coords = None, None, None
-            continue
-         
-      else:
-         # If a pdb has already been written out, align this vdg's cg+vdmbb onto that 
-         # first pdb. "target_coords" to align to is cg+vdmbb of the first PDB (which 
-         # itself is a centroid). 
-         # Note that target_coords has to be re-ordered to match the atom order in the 
-         # first PDB, because for CGs with symmetry, cluster members are aligned within a 
-         # a cluster, but often not to the first PDB. For example, the order of a phenyl 
-         # CG might be CG-CD1-CE1-CZ-CE2-CD2, but in another cluster, it might be CG-CD1-
-         # CE2-CZ-CE1-CD2, and there are I believe 3 configurations that minimize that RMSD. 
-         target_coords = first_pdb_cg_vdmbb_coords
-         # Align centroid (cg+vdmbb) to the first pdb and return its new coords so that its 
-         # cluster mems can align onto it.
-         try: 
-            moved_cent_transf, moved_cent_coords = get_transf_and_coords(cent_cg_vdmbb_coords, 
-                  target_coords, weights, cent_pr_obj, cent_scrr_cg_perm, symmetry_classes)
-         except:
-            # Sometimes there's an error, though very rare. Skip this cluster.
-            print(f'Error: failed to write out {cent_pdb_outpath}. '
-                  f'Need to skip entire cluster of size {len(clus_mem_indices)}.')
-         # Apply transformation and write out the moved centroid.
-         write_out_subsequent_clus_pdbs(cent_pr_obj, cent_pdb_outpath, cent_scrr_cg_perm, 
-            print_flankbb, moved_cent_transf)
+            try:
+                moved_cent_transf, moved_cent_coords = get_transf_and_coords(
+                        cent_cg_vdmbb_coords, 
+                        target_coords, weights, cent_pr_obj, cent_scrr_cg_perm, 
+                        symmetry_classes)
+            except Exception as e:
+                # Sometimes there's an error, though very rare. Skip this cluster.
+                print(f"Error: {e}")
+                print(f'Error: failed to write out centroid {cent_pdb_outpath}. '
+                      f'Need to skip entire cluster of size {len(clus_mem_indices)}.')
+                continue
+            # Apply transformation and write out the moved centroid.
+            write_out_subsequent_clus_pdbs(cent_pr_obj, cent_pdb_outpath, cent_scrr_cg_perm, 
+                                           print_flankbb, moved_cent_transf)
 
-      # After centroid, output the rest of the cluster members
-      for ind in clus_mem_indices:
-         if ind == centroid_ind:
-            continue
-         data = get_clus_mem_data(ind, all_cg_coords, all_cg_and_vdmbb_coords, 
-            all_flankbb_coords, all_pdbpaths, all_scrr_cg_perm, num_flanking, atomgroup_dict)
-         if data is None:
-            failed.append(all_pdbpaths[ind])
-            continue
-         (clusmem_cg_coords, clusmem_cg_vdmbb_coords, clusmem_flankbb_coords, 
-            clusmem_pdbpath, clusmem_scrr_cg_perm, clusmem_pr_obj) = data
-         clusmem_pdb_outpath = get_clus_pdb_outpath(clusnum, clusnum_dir, clusmem_pdbpath, 
-            clusmem_scrr_cg_perm, ind, is_centroid=False)
+        # After centroid, output the rest of the cluster members using Pool.map
+        with multiprocessing.Pool(num_threads) as pool:
+            results = pool.starmap(process_cluster_member, 
+                                   [(ind, clusnum, clusnum_dir, centroid_ind, 
+                                     all_cg_coords, all_cg_and_vdmbb_coords, 
+                                     all_flankbb_coords, all_pdbpaths, 
+                                     all_scrr_cg_perm, num_flanking, atomgroup_dict, 
+                                     weights, first_pdb_cg_vdmbb_coords, symmetry_classes, 
+                                     print_flankbb) for ind in clus_mem_indices 
+                                          if ind != centroid_ind]) # skip if centroid
 
-         # Align clus mem to the centroid and write out the pdb
-         if clusnum == 1: # the centroid to align onto _is_ the first pdb instead of a 
-            # cluster cent that's aligned onto the first pdb.
-            moved_cent_coords = first_pdb_cg_vdmbb_coords
-         transf, moved_coords = get_transf_and_coords(clusmem_cg_vdmbb_coords, 
-            moved_cent_coords, weights, clusmem_pr_obj, clusmem_scrr_cg_perm, 
-            symmetry_classes)
-         write_out_subsequent_clus_pdbs(clusmem_pr_obj, clusmem_pdb_outpath, 
-            clusmem_scrr_cg_perm, print_flankbb, transf)
-   
-   return first_pdb_out, first_pdb_cg_vdmbb_coords, failed
+        # Collect failed members
+        for result in results:
+            pdb_outpath, failed_member = result
+            if failed_member:
+                failed.append(failed_member)
+
+    return first_pdb_out, first_pdb_cg_vdmbb_coords, failed
+
+
+
+
 
 def get_transf_and_coords(mobile_coords, target_coords, weights, obj, scrrs, 
                           symmetry_classes):

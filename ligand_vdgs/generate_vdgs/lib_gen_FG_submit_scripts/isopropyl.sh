@@ -7,13 +7,15 @@
 #$ -j y               # tells system STDERR and STDOUT should be joined
 #$ -l h_rt=240:00:00  #-- runtime limit - max 2 weeks == 336 hours
 #$ -R yes             #-- SGE host reservation
-#$ -l h=!qb3-as4
-#$ -l mem_free=100G
+#$ -l hostname='!(qb3-as4|qb3-id188|qb3-id340|qb3-id225)'
+#$ -l mem_free=20G
+#$ -pe smp 10          # Request 10 slots in the SMP parallel environment
+            
 
 date
 hostname
 
-conda activate smart_vdms_env
+conda activate vdgs
 
 python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py -s "[CH3][CX4][CH3]" -c isopropyl -p /wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2/ -b /wynton/group/degradolab/skt/docking/databases/probe_output/ -o /wynton/group/degradolab/skt/docking/databases/vdg_lib --symmetry-classes 0 1 0
 

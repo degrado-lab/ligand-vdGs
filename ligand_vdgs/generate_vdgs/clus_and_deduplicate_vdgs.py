@@ -26,6 +26,7 @@ import argparse
 import time
 import tracemalloc
 import shutil
+import random
 import glob
 import numpy as np
 import prody as pr
@@ -160,13 +161,14 @@ def main():
       # Determine the vdM combinations, up to 4 residues
       vdm_resinds = list(vdms_dict.keys())
       vdg_subsets = clust.get_vdg_subsets(vdm_resinds)
-      # Iterate over subsets
+      # Iterate over subsets of resinds
       for vdg_subset in vdg_subsets:
          # Record these features in the same order as in vdg_subset. Then, sort all 
-         # based on alphabetical order of the vdm AAs.
+         # based on alphabetical order of the vdm AAs. If you find a bb-only vdm, 
+         # assign the vdm resname as "bb".
          re_ordered_aas, re_ordered_bbcoords, re_ordered_flankingseqs, \
             re_ordered_CAs, re_ordered_scrr = clust.reorder_vdg_subset(
-            vdg_subset, vdms_dict)
+            vdg_subset, vdms_dict, cg_coords, prody_obj)
          # Add to `vdm_combos` dict
          vdm_combos = clust.add_vdgs_to_dict(vdm_combos, vdg_subset, re_ordered_aas, 
             re_ordered_bbcoords, re_ordered_flankingseqs, re_ordered_CAs, 
@@ -178,6 +180,14 @@ def main():
          continue
       for _reordered_AAs, _vdgs in _subsets.items():
          # vdG subsets that have identical vdm AA compositions may be redundant.
+         # If there are > max_num_vdgs samples, select only n samples randomly.
+         max_num_vdgs = 2500
+         if len(_vdgs) > max_num_vdgs:
+            with open(logfile, 'a') as file:
+               file.write(f'\tThere are {len(_vdgs)} vdgs for the {_reordered_AAs} '
+                          f'subset, so only {max_num_vdgs} were randomly selected.\n')
+            _vdgs = random.sample(_vdgs, max_num_vdgs)
+
          cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, _reordered_AAs, 
                symmetry_classes, vdglib_dir, align_cg_weight, num_flanking, 
                atomgroup_dict, print_flankbb, logfile)
