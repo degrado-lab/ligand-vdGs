@@ -169,16 +169,7 @@ def create_dist_matrix(data, dist_metric, AA_subset, size_subset, vdglib_dir):
 
    # Need to initialize distance_matrix.dat with zeros.
    tmp_dir = os.path.join(vdglib_dir, 'tmp')
-   
-   # Stagger checking/creating the tmpdir because multiprocessing will run 
-   # clus_and_deduplicate_vdgs.py simultaneously for each num_size_subset. If tmpd_dir 
-   # doesn't exist in one second and exists in the next, then then os.mkdir() will crash 
-   # the program with a FileExistsError.
-   delay = random.randint(1, 30) # delay between 1 and 30 seconds to stagger
-   time.sleep(delay)
-
-   if not os.path.exists(tmp_dir): # store memory-mapped arrays in tmp/
-      os.mkdir(tmp_dir)
+   os.makedirs(tmp_dir, exist_ok=True)  # store memory-mapped arrays in tmp/ 
    dist_matrix_filename = os.path.join(tmp_dir, 'distance_matrix_{}_{}.dat'.format(
       AA_subset, size_subset))
    if os.path.exists(dist_matrix_filename):
@@ -690,7 +681,7 @@ def elements_in_clusters(indices_of_elements_in_cluster, cg_coords, vdm_bbcoords
    return clus_cg_coords, clus_vdmbb_coords, clus_cgvdmbb_coords, clus_flankingseqs, \
       clus_flankingCAs, clus_pdbpaths, clus_vdm_scrr_cg_perms
 
-def process_cluster_member(ind, clusnum, clusnum_dir, centroid_ind, 
+def process_cluster_member(ind, clusnum, clusnum_dir, centroid_ind, moved_cent_coords, 
                            all_cg_coords, all_cg_and_vdmbb_coords, all_flankbb_coords, 
                            all_pdbpaths, all_scrr_cg_perm, num_flanking, atomgroup_dict, 
                            weights, first_pdb_cg_vdmbb_coords, symmetry_classes, 
@@ -706,7 +697,7 @@ def process_cluster_member(ind, clusnum, clusnum_dir, centroid_ind,
          clusmem_pdbpath, clusmem_scrr_cg_perm, clusmem_pr_obj) = data
         clusmem_pdb_outpath = get_clus_pdb_outpath(clusnum, clusnum_dir, clusmem_pdbpath, 
                                              clusmem_scrr_cg_perm, ind, is_centroid=False)
-        
+
         # Align clus mem to the centroid and write out the pdb
         if clusnum == 1: # the centroid to align onto _is_ the first pdb instead of a 
            # cluster cent that's aligned onto the first pdb.
@@ -718,16 +709,10 @@ def process_cluster_member(ind, clusnum, clusnum_dir, centroid_ind,
         write_out_subsequent_clus_pdbs(clusmem_pr_obj, clusmem_pdb_outpath, 
            clusmem_scrr_cg_perm, print_flankbb, transf)
 
-        transf, moved_coords = get_transf_and_coords(clusmem_cg_vdmbb_coords, 
-                                                     moved_cent_coords, weights, 
-                                                     clusmem_pr_obj, clusmem_scrr_cg_perm, 
-                                                     symmetry_classes)
-        write_out_subsequent_clus_pdbs(clusmem_pr_obj, clusmem_pdb_outpath, 
-                                       clusmem_scrr_cg_perm, print_flankbb, transf)
         return (clusmem_pdb_outpath, None)  # Successful completion
 
     except Exception as e:
-        print(f"Error processing cluster member {ind}: {e}")
+        print(f"Error processing cluster member {ind} of clusnum {clusnum}: {e}")
         return (None, all_pdbpaths[ind])  # Return failure if exception occurs
 
 def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_coords, 
@@ -796,28 +781,24 @@ def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_c
             write_out_subsequent_clus_pdbs(cent_pr_obj, cent_pdb_outpath, cent_scrr_cg_perm, 
                                            print_flankbb, moved_cent_transf)
 
-        # After centroid, output the rest of the cluster members using Pool.map
-        with multiprocessing.Pool(num_threads) as pool:
-            results = pool.starmap(process_cluster_member, 
-                                   [(ind, clusnum, clusnum_dir, centroid_ind, 
-                                     all_cg_coords, all_cg_and_vdmbb_coords, 
-                                     all_flankbb_coords, all_pdbpaths, 
-                                     all_scrr_cg_perm, num_flanking, atomgroup_dict, 
-                                     weights, first_pdb_cg_vdmbb_coords, symmetry_classes, 
-                                     print_flankbb) for ind in clus_mem_indices 
-                                          if ind != centroid_ind]) # skip if centroid
+            # After centroid, output the rest of the cluster members using Pool.map
+            with multiprocessing.Pool(num_threads) as pool:
+                results = pool.starmap(process_cluster_member, 
+                                       [(ind, clusnum, clusnum_dir, centroid_ind, moved_cent_coords,  
+                                         all_cg_coords, all_cg_and_vdmbb_coords, 
+                                         all_flankbb_coords, all_pdbpaths, 
+                                         all_scrr_cg_perm, num_flanking, atomgroup_dict, 
+                                         weights, first_pdb_cg_vdmbb_coords, symmetry_classes, 
+                                         print_flankbb) for ind in clus_mem_indices 
+                                              if ind != centroid_ind]) # skip if centroid
 
-        # Collect failed members
-        for result in results:
-            pdb_outpath, failed_member = result
-            if failed_member:
-                failed.append(failed_member)
+            # Collect failed members
+            for result in results:
+                pdb_outpath, failed_member = result
+                if failed_member:
+                    failed.append(failed_member)
 
     return first_pdb_out, first_pdb_cg_vdmbb_coords, failed
-
-
-
-
 
 def get_transf_and_coords(mobile_coords, target_coords, weights, obj, scrrs, 
                           symmetry_classes):
