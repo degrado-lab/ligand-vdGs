@@ -26,13 +26,16 @@ import argparse
 import time
 import tracemalloc
 import shutil
-import random
 import glob
 import numpy as np
+from numba import njit, prange, set_num_threads
 import prody as pr
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'functions'))
 import align_and_cluster as clust
 import utils
+
+max_num_to_clus = 2500 # max num of pdbs w/ vdgs of the same AA compositions
+set_num_threads(10) 
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -134,8 +137,11 @@ def main():
    vdg_pdbs_dir = os.path.join(vdglib_dir, 'vdg_pdbs')
    out_dir = os.path.join(vdglib_dir, 'nr_vdgs')
 
+   # Comment out bc will print out once for each thread
+   '''
    with open(logfile, 'a') as file:
         file.write(f"{'='*20} Starting deduplicate_reun_vdgs.py run {'='*20} \n")
+   '''
    
    # Initialize vdm_combos dict to store the subsets of vdMs within a vdG
    vdm_combos = {}
@@ -179,14 +185,19 @@ def main():
       if num_vdms_in_subset != size_subset:
          continue
       for _reordered_AAs, _vdgs in _subsets.items():
-         # vdG subsets that have identical vdm AA compositions may be redundant.
-         # If there are > max_num_vdgs samples, select only n samples randomly.
-         max_num_vdgs = 2500
-         if len(_vdgs) > max_num_vdgs:
+         # vdG subsets that have identical vdm AA compositions may be redundant, so cluster 
+         # them. If there are > max_num_to_clus samples, select only the top samples with 
+         # highest PDB ID diversity. Note that the same PDB can have multiple vdgs, so the 
+         # actual # of vdgs may be > max_num_to_clus.
+         if len(_vdgs) > max_num_to_clus:
+            pdbIDs = [z[-2].split('/')[-1][:4] for z in _vdgs]
+            diverse_pdbIDs = select_diverse_pdbIDs(pdbIDs, 5)
+            _vdgs = [z for z in _vdgs if z[-2].split('/')[-1][:4] in diverse_pdbIDs]
+
             with open(logfile, 'a') as file:
                file.write(f'\tThere are {len(_vdgs)} vdgs for the {_reordered_AAs} '
-                          f'subset, so only {max_num_vdgs} were randomly selected.\n')
-            _vdgs = random.sample(_vdgs, max_num_vdgs)
+                  f'subset, so only {max_num_to_clus} PDBs with maximum PDB ID '
+                  f'diversity were selected.\n')
 
          cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, _reordered_AAs, 
                symmetry_classes, vdglib_dir, align_cg_weight, num_flanking, 
@@ -464,6 +475,60 @@ def normalize_rmsd(num_atoms, atoms):
    threshold = min_threshold + scaling_factor * (max_threshold - min_threshold)
    
    return threshold
+
+def select_diverse_pdbIDs(strings, k): # k = max num to select
+    ascii_array = strings_to_ascii_array(strings)
+    selected_indices = select_diverse_subset_parallel(ascii_array, k)
+    return [strings[i] for i in selected_indices]
+
+def strings_to_ascii_array(strings):
+    return np.array([[ord(c) for c in s] for s in strings], dtype=np.uint8)
+
+@njit
+def hamming(s1, s2):
+    dist = 0
+    for i in range(len(s1)):
+        if s1[i] != s2[i]:
+            dist += 1
+    return dist
+
+@njit(parallel=True)
+def update_min_dists(data, selected_idx, selected_mask, min_dists):
+    n = data.shape[0]
+    for i in prange(n):
+        if selected_mask[i] == 0:
+            dist = hamming(data[selected_idx], data[i])
+            if dist < min_dists[i]:
+                min_dists[i] = dist
+
+@njit
+def select_diverse_subset_parallel(data, k):
+    n = data.shape[0]
+    selected = [0]  # start with first point
+    selected_mask = np.zeros(n, dtype=np.uint8)
+    selected_mask[0] = 1
+    min_dists = np.full(n, 255, dtype=np.uint8)
+
+    # Initial distance pass
+    for i in range(1, n):
+        min_dists[i] = hamming(data[0], data[i])
+
+    for _ in range(1, min(n, k)):
+        # Select max of min distances
+        max_idx = -1
+        max_val = -1
+        for i in range(n):
+            if selected_mask[i] == 0 and min_dists[i] > max_val:
+                max_val = min_dists[i]
+                max_idx = i
+
+        selected.append(max_idx)
+        selected_mask[max_idx] = 1
+
+        # Parallel update of min distances
+        update_min_dists(data, max_idx, selected_mask, min_dists)
+
+    return selected
 
 if __name__ == "__main__":
     main()

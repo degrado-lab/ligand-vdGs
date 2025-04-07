@@ -5,6 +5,8 @@ import argparse
 import shutil
 import multiprocessing
 
+num_procs = 20
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('-s', '--smarts', type=str, required=True, 
@@ -86,7 +88,11 @@ def main():
     match_pkl = os.path.join(out_dir, f'{cg}_matches.pkl') # output from smarts_to_cg.py
     fingerprints_cmd = f'python external/vdG-miner/vdg_miner/programs/generate_fingerprints.py -c "{cg}" -l "{logfile}" -m "{match_pkl}" -p {pdb_dir} -b {probe_dir} -o "{out_dir}"'
 
-    subprocess.run(fingerprints_cmd, shell=True, check=True)
+    # Pass tuple of arguments to starmap
+    args_for_fingerprint = [(i, num_procs, fingerprints_cmd) for i in range(num_procs)]
+
+    with multiprocessing.Pool(processes=num_procs) as pool:
+        pool.starmap(run_gen_fingerprints, args_for_fingerprint)
 
     # Run fingerprints_to_pdbs.py
     fingerprints = os.path.join(out_dir, 'fingerprints') # output from generate_fingerprints.py
@@ -169,6 +175,10 @@ def set_up_outdir(out_dir):
 def run_deduplicate(num_vdms, deduplicate_template):
     deduplicate_cmd = f'{deduplicate_template} -n {num_vdms}'
     subprocess.run(deduplicate_cmd, shell=True, check=True)
+
+def run_gen_fingerprints(job_index, num_procs, fingerprints_cmd):
+    fingerprints_cmd = f'{fingerprints_cmd} -j {job_index} -n {num_procs}'
+    subprocess.run(fingerprints_cmd, shell=True, check=True)
 
 def write_out_commandline_params(logfile, smarts, cg, pdb_dir, probe_dir, out_dir, 
                                  symm_classes, logdir):
