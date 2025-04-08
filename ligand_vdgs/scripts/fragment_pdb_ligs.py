@@ -1,6 +1,6 @@
 '''
 Generates fragments from all PDB ligands. Fragments are defined as all atoms that are 
-within 3 bonds of any ligand atom. This script takes a few minutes to run.
+within 3 bonds of any ligand atom. This script takes 5-10 mins to run on 46k smiles.
 
 Inputs: 
     CCD_smiles: tab-delimited file containing the smiles of molecules in the Chemical 
@@ -18,8 +18,6 @@ import re
 import csv
 import pickle as pkl
 from rdkit import Chem, RDLogger
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'functions'))
-import fragment as frag
 
 RDLogger.DisableLog('rdApp.*') 
 
@@ -111,27 +109,42 @@ def main():
             # Decompose the ligand into fragments and store the fragment SMILES. Use SMILES 
             # instead of SMARTS b/c only SMILES (from rdkit) differentiates aliphatic and 
             # aryl.
-            substructs = frag.fragment_on_bond_d(mol, bond_radius)
+            substructs = fragment_on_bond_d(mol, bond_radius)
             # Update frag_dict by adding the new fragments; skip if all-carbon
             for orig_sub in substructs: # contains H's that need to be scrubbed
                 sub, sub_smiles = manually_remove_Hs(orig_sub) 
-                frag_dict = record_frag(sub, frag_dict, sub_smiles)
+                # discard if < 4 atoms
+                if len(sub.GetAtoms()) < 4:
+                    continue
+                frag_dict = record_frag(sub, frag_dict, sub_smiles, lig_resname)
 
             num_ligs_passed += 1
 
     output_results(frag_dict, out_sdf_path, out_dict_path, min_counts_per_frag)
     report_stats(frag_dict, num_ligs_skipped, num_ligs_total, num_ligs_passed)
 
+def fragment_on_bond_d(mol, radius):
+    # Code from https://iwatobipen.wordpress.com/2020/08/12/get-and-draw-molecular-fragment-with-user-defined-path-rdkit-memo/
+    atoms = mol.GetAtoms()
+    submols = []
+    for atom in atoms:
+        env = Chem.FindAtomEnvironmentOfRadiusN(mol, radius, atom.GetIdx(), 
+            enforceSize=False) # don't enforce size to also get frags that are < radius away
+        amap = {}
+        submol = Chem.PathToSubmol(mol, env, atomMap=amap)
+        submols.append(submol)
+    return submols
+
 def output_results(frag_dict, out_sdf, out_pkl, min_counts_per_frag):
     # Determine which fragments to write out to an SDF file (based on the 
     # min_counts_per_frag) and order by size
+    '''
     sorted_mols_to_output, sorted_labels = sort_frag_dict(frag_dict, min_counts_per_frag)
-
     # Write out fragments to an SDF file .
     frag.output_sdf(sorted_mols_to_output, sorted_labels, out_sdf) 
+    '''
     
     # Write out frag_dict as a pickle file. 
-    # ### should be database_frags_dict.pkl 
     pkl.dump(frag_dict, open(out_pkl, 'wb'))
 
 
@@ -140,7 +153,8 @@ def sort_frag_dict(frag_dict, min_counts_per_frag):
     fragment_data = []
 
     for fragments in frag_dict.values():  # Iterate over elements
-        for smiles, count in fragments.items():
+        for smiles, lignames in fragments.items():
+            count = len(set(lignames))
             if count < min_counts_per_frag:
                 continue
             mol_from_smiles = Chem.MolFromSmarts(smiles) # treat as smarts
@@ -179,7 +193,7 @@ def manually_remove_Hs(orig_mol):
 
     return mol, smiles_no_Hs
 
-def record_frag(substruct, frag_dict, smiles):
+def record_frag(substruct, frag_dict, smiles, lig_resname):
 
     '''
     Update frag_dict to store these substructs and the molecule from which they are from.
@@ -196,9 +210,6 @@ def record_frag(substruct, frag_dict, smiles):
     Note: Skip fragment if all its atoms are carbons. 
     '''
 
-    if 'Mg' in smiles:
-        return frag_dict
-    
     elements = "".join(sorted([a.GetSymbol() for a in substruct.GetAtoms() if 
                                a.GetSymbol() != 'H'])) # b/c rdkit will add implicit H's
     
@@ -207,15 +218,14 @@ def record_frag(substruct, frag_dict, smiles):
     if len(elements) == num_carbons:
         return frag_dict
 
-    
-    if elements not in frag_dict.keys():
+    # Determine whether to add fragment to the dict
+    if elements not in frag_dict.keys(): # automatically a new entry 
         frag_dict[elements] = {}
-        frag_dict[elements][smiles] = 1 
+        frag_dict[elements][smiles] = [lig_resname] 
         return frag_dict
 
     if smiles in frag_dict[elements]: # Is the smiles already recorded?
-        frag_dict[elements][smiles] += 1 
-        return frag_dict # automatically duplicate
+        return frag_dict # automatically duplicate; don't need to add
 
     else: 
         # Even if the smiles isn't already recorded, it still might be represented b/c the 
@@ -224,18 +234,25 @@ def record_frag(substruct, frag_dict, smiles):
             try:
                 existing_sub_mol = Chem.MolFromSmarts(existing_smiles) # treat as smarts
                 if existing_sub_mol.HasSubstructMatch(substruct) and \
-                    substruct.HasSubstructMatch(existing_sub_mol): # then it's a duplicate
-                    frag_dict[elements][existing_smiles] += 1 
+                    substruct.HasSubstructMatch(existing_sub_mol): # then it's a duplicate, 
+                                                           # but still add bc diff lig name
+                    if lig_resname not in frag_dict[elements][existing_smiles]:
+                        frag_dict[elements][existing_smiles].append(lig_resname) 
                     return frag_dict
             except:
                 return frag_dict
 
     # Passed all checks and deemed nonredundant.
-    frag_dict[elements][smiles] = 1
+    if elements not in frag_dict.keys():
+        frag_dict[elements] = {}
+    if smiles not in frag_dict[elements].keys():
+        frag_dict[elements][smiles] = []
+    if lig_resname not in frag_dict[elements][smiles]:
+        frag_dict[elements][smiles].append(lig_resname)
     return frag_dict
 
 def undesired_elements(smiles): 
-    if re.search(r'(Be|Pt|Ru|Ir|Fe|Zn|Mg|Cu|Sn|Zr|Pb|Ga|Hg|Pd|Si|Mo|W|Se|Mn|Ti|Y|V|Ni|Rh|Te|Au|Ag|Co|Sb|Tb|Re|As|Cd|Hf|Lu|Na|Ca|Os|Cr|In|Al)', smiles):
+    if re.search(r'(Be|Pt|Ru|Ir|Fe|Zn|Mg|Cu|Sn|Zr|Pb|Ga|Hg|Pd|Si|Mo|W|Se|Mn|Ti|Y|V|Ni|Rh|Te|Au|Ag|Co|Sb|Tb|Re|As|Cd|Hf|Lu|Na|Ca|Os|Cr|In|Al|Pr|se)', smiles):
         return True
     if re.search(r'B(?!r)', smiles): # bypass if it's Br, but return as undesired if it's B w/o r
         return True

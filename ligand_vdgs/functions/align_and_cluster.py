@@ -546,8 +546,8 @@ def reorder_vdg_subset(vdg_subset, vdms_dict, cg_coords, prody_obj):
          # Determine whether the vdm is a bb or sc contact.
          for cg_atom in cg_coords:
             # sc condition
-            dists_to_sc = pr.calcDistance(cg_atom, vdm_sc)
-            if np.any(dists_to_sc < 4.8):
+            dists_cg_atom_to_sc = pr.calcDistance(cg_atom, vdm_sc)
+            if np.any(dists_cg_atom_to_sc < 4.5):
                has_sidechain_contact = True 
                break 
 
@@ -558,10 +558,25 @@ def reorder_vdg_subset(vdg_subset, vdms_dict, cg_coords, prody_obj):
             # contact, so don't rule it out completely. See whether the closest AA atom 
             # is bb or sc.
             vdm_bb = vdm_res_obj.select(f'{vdm_sel} and backbone') 
-            dists_to_bb = pr.calcDistance(cg_atom, vdm_bb)
+            min_dist_to_sc = None
+            min_dist_to_bb = None
+            for cg_atom in cg_coords:
+               # get closest dist to AA sc
+               dist_to_sc = pr.calcDistance(cg_atom, vdm_sc)
+               if min_dist_to_sc is None:
+                  min_dist_to_sc = min(dist_to_sc)
+               else:
+                  min_dist_to_sc = min(min_dist_to_sc, min(dist_to_sc))
+               # get closest dist to AA bb
+               dist_to_bb = pr.calcDistance(cg_atom, vdm_bb)
+               if min_dist_to_bb is None:
+                  min_dist_to_bb = min(dist_to_bb)
+               else:
+                  min_dist_to_bb = min(min_dist_to_bb, min(dist_to_bb))
+            
             # Is bb closer to lig by at least 0.3A compared to sc? If yes, then bb.
-            if ((min(dists_to_bb) < min(dists_to_sc)) and 
-                (min(dists_to_sc) - min(dists_to_bb) > 0.3)):
+            if ((min_dist_to_bb < min_dist_to_sc) and 
+                (min_dist_to_sc - min_dist_to_bb > 0.3)):
                aas_of_vdms_in_order.append('bb')
             else: # then sc
                aas_of_vdms_in_order.append(vdmAA)
