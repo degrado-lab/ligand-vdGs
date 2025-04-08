@@ -35,7 +35,8 @@ import align_and_cluster as clust
 import utils
 
 max_num_to_clus = 2500 # max num of pdbs w/ vdgs of the same AA compositions
-set_num_threads(10) 
+set_num_threads(10) # for numba in calc. max pdb ID diversity
+num_threads = 30 # for multiprocessing in write_out_clusters
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -190,18 +191,19 @@ def main():
          # highest PDB ID diversity. Note that the same PDB can have multiple vdgs, so the 
          # actual # of vdgs may be > max_num_to_clus.
          if len(_vdgs) > max_num_to_clus:
+            orig_num_vdgs = len(_vdgs)
             pdbIDs = [z[-2].split('/')[-1][:4] for z in _vdgs]
-            diverse_pdbIDs = select_diverse_pdbIDs(pdbIDs, 5)
+            diverse_pdbIDs = select_diverse_pdbIDs(pdbIDs, max_num_to_clus)
             _vdgs = [z for z in _vdgs if z[-2].split('/')[-1][:4] in diverse_pdbIDs]
 
             with open(logfile, 'a') as file:
-               file.write(f'\tThere are {len(_vdgs)} vdgs for the {_reordered_AAs} '
-                  f'subset, so only {max_num_to_clus} PDBs with maximum PDB ID '
+               file.write(f'\tThere are {orig_num_vdgs} vdgs for the {_reordered_AAs} '
+                  f'subset, so only {len(_vdgs)} PDBs with maximum PDB ID '
                   f'diversity were selected.\n')
 
          cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, _reordered_AAs, 
                symmetry_classes, vdglib_dir, align_cg_weight, num_flanking, 
-               atomgroup_dict, print_flankbb, logfile)
+               num_threads, atomgroup_dict, print_flankbb, logfile)
          '''Final results: vdgs that end up in the same cg+vdmbb, flanking bb, and 
          flanking seq clusters are redundant. Select only the centroid to be output.'''
          copy_nr_to_outdir(vdglib_dir, out_dir, _reordered_AAs)
@@ -281,7 +283,7 @@ def copy_nr_to_outdir(vdglib_dir, nr_dir, reordered_AAs):
                break 
 
 def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs, 
-      symmetry_classes, vdglib_dir, align_cg_weight, num_flanking, 
+      symmetry_classes, vdglib_dir, align_cg_weight, num_flanking, num_threads,  
       atomgroup_dict, print_flankbb, logfile):
    # vdG subsets that have identical vdm AA compositions may be redudant.
    # First, get all AA permutations for identical AAs. For example, if the vdms are 
@@ -345,7 +347,7 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
       temp_cgvdmbb_clusdir, cgvdmbb_clus_assignments, cgvdmbb_clus_centroids,
       all_AA_cg_perm_cg_coords, all_AA_cg_perm_pdbpaths, 
       all_AA_cg_perm_vdm_scrr_cg_perm, all_AA_cg_perm_cg_and_vdmbb_coords, 
-      all_AA_cg_perm_flat_flankCAs, num_flanking, first_pdb_out, 
+      all_AA_cg_perm_flat_flankCAs, num_flanking, num_threads, first_pdb_out, 
       first_pdb_cg_vdmbb_coords, cgvdmbb_weights, atomgroup_dict, print_flankbb, 
       symmetry_classes)
 
@@ -398,8 +400,8 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
          flankingseq_and_bb_cluster_assignments, flankingseq_and_bb_clus_centroids,
          cgvdmbb_clus_cg_coords, cgvdmbb_clus_pdbpaths, cgvdmbb_clus_vdm_scrr_cg_perm, 
          cgvdmbb_clus_cgvdmbb_coords, cgvdmbb_clus_flat_flankingCAs, num_flanking, 
-         first_pdb_out, first_pdb_cg_vdmbb_coords, cgvdmbb_weights, atomgroup_dict, 
-         print_flankbb, symmetry_classes, clusterlabel='flankseq_and_bb')
+         num_threads, first_pdb_out, first_pdb_cg_vdmbb_coords, cgvdmbb_weights, 
+         atomgroup_dict, print_flankbb, symmetry_classes, clusterlabel='flankseq_and_bb')
 
       if len(failed_pdbs) > 0:
          with open(logfile, 'a') as file:

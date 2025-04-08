@@ -19,3 +19,4 @@ conda activate vdgs
 python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py -s "[CX3,cX3]~1~[OX2,oX2]~[CX3,cX3]~[CX3,cX3]~[CX3,cX3]1" -c furan -p /wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2/ -b /wynton/group/degradolab/skt/docking/databases/probe_output/ -o /wynton/group/degradolab/skt/docking/databases/vdg_lib --symmetry-classes 0 1 0 2 2
 
 date
+echo "DONE"

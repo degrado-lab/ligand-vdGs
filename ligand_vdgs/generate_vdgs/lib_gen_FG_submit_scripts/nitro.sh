@@ -19,3 +19,4 @@ conda activate vdgs
 python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py -s "[NX3](~[OX1])(~[OX1])" -c nitro -p /wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2/ -b /wynton/group/degradolab/skt/docking/databases/probe_output/ -o /wynton/group/degradolab/skt/docking/databases/vdg_lib --symmetry-classes 0 1 1
 
 date
+echo "DONE"

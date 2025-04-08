@@ -19,3 +19,4 @@ conda activate vdgs
 python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py -s "[C,c][SX2R0][SX2R0][C,c]" -c disulfide -p /wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2/ -b /wynton/group/degradolab/skt/docking/databases/probe_output/ -o /wynton/group/degradolab/skt/docking/databases/vdg_lib --symmetry-classes 0 1 1 0
 
 date
+echo "DONE"

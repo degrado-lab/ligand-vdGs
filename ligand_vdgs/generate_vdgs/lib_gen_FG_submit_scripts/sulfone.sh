@@ -19,3 +19,4 @@ conda activate vdgs
 python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py -s "[C,c][SX4](=O)(=O)[C,c]" -c sulfone -p /wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2/ -b /wynton/group/degradolab/skt/docking/databases/probe_output/ -o /wynton/group/degradolab/skt/docking/databases/vdg_lib --symmetry-classes 0 1 2 2 0
 
 date
+echo "DONE"

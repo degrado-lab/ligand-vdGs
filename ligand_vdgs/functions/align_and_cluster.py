@@ -1,9 +1,9 @@
 import os
-import random
-import time
+import gzip
 from itertools import permutations, combinations, product
 import numpy as np
 import multiprocessing
+import gc
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
 import prody as pr
@@ -538,12 +538,14 @@ def reorder_vdg_subset(vdg_subset, vdms_dict, cg_coords, prody_obj):
       vdm_res_obj = prody_obj.select(f'{vdm_sel} and not element H D')
       vdm_sc = vdm_res_obj.select(f'{vdm_sel} and sidechain') 
       if vdm_sc is None:  # then Gly
-         aas_of_vdms_in_order.append(vdmAA)
+         aas_of_vdms_in_order.append('bb') # assign gly as 'bb'
       elif len(vdm_sc) == 0: # also Gly
-         aas_of_vdms_in_order.append(vdmAA)
+         aas_of_vdms_in_order.append('bb')
       else: # not Gly, so check if it has a sc contact
          has_sidechain_contact = False
+         # Determine whether the vdm is a bb or sc contact.
          for cg_atom in cg_coords:
+            # sc condition
             dists_to_sc = pr.calcDistance(cg_atom, vdm_sc)
             if np.any(dists_to_sc < 4.8):
                has_sidechain_contact = True 
@@ -553,13 +555,15 @@ def reorder_vdg_subset(vdg_subset, vdms_dict, cg_coords, prody_obj):
             aas_of_vdms_in_order.append(vdmAA)
          else: 
             # Even if it doesn't have a close sc contact, it may have a weaker sc 
-            # contact, so first see if it has a close bb contact, and if not, then 
-            # it should still be classified as a "sc" contact.
+            # contact, so don't rule it out completely. See whether the closest AA atom 
+            # is bb or sc.
             vdm_bb = vdm_res_obj.select(f'{vdm_sel} and backbone') 
             dists_to_bb = pr.calcDistance(cg_atom, vdm_bb)
-            if np.any(dists_to_bb < 4.8):
+            # Is bb closer to lig by at least 0.3A compared to sc? If yes, then bb.
+            if ((min(dists_to_bb) < min(dists_to_sc)) and 
+                (min(dists_to_sc) - min(dists_to_bb) > 0.3)):
                aas_of_vdms_in_order.append('bb')
-            else:
+            else: # then sc
                aas_of_vdms_in_order.append(vdmAA)
 
       # Decompress the flanking AA and CA info
@@ -686,7 +690,7 @@ def process_cluster_member(ind, clusnum, clusnum_dir, centroid_ind, moved_cent_c
                            all_pdbpaths, all_scrr_cg_perm, num_flanking, atomgroup_dict, 
                            weights, first_pdb_cg_vdmbb_coords, symmetry_classes, 
                            print_flankbb):
-    
+
     try:
         data = get_clus_mem_data(ind, all_cg_coords, all_cg_and_vdmbb_coords, 
                all_flankbb_coords, all_pdbpaths, all_scrr_cg_perm, num_flanking, 
@@ -708,6 +712,7 @@ def process_cluster_member(ind, clusnum, clusnum_dir, centroid_ind, moved_cent_c
            symmetry_classes)
         write_out_subsequent_clus_pdbs(clusmem_pr_obj, clusmem_pdb_outpath, 
            clusmem_scrr_cg_perm, print_flankbb, transf)
+        gc.collect()     # file handles may linger b/c inside process pool 
 
         return (clusmem_pdb_outpath, None)  # Successful completion
 
@@ -717,18 +722,18 @@ def process_cluster_member(ind, clusnum, clusnum_dir, centroid_ind, moved_cent_c
 
 def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_coords, 
                        all_pdbpaths, all_scrr_cg_perm, all_cg_and_vdmbb_coords, 
-                       all_flankbb_coords, num_flanking, first_pdb_out, 
+                       all_flankbb_coords, num_flanking, num_threads, first_pdb_out, 
                        first_pdb_cg_vdmbb_coords, weights, atomgroup_dict, print_flankbb, 
-                       symmetry_classes, clusterlabel=None, num_threads=10):
+                       symmetry_classes, clusterlabel=None):
+    
     assert len(all_pdbpaths) == len(all_cg_and_vdmbb_coords)
     ref = np.array([[0, 0, 0], [-1, 0, 1], [1, -1, 0]])  # reference for aligning CG
 
     failed = []
+    all_tasks = []  
+    #Collect all tasks for multiprocessing
     for clusnum, clus_mem_indices in sorted(clus_assignments.items()):
-        if clusterlabel is None:
-            subdir = f'clus_{clusnum}'
-        else:
-            subdir = f'{clusterlabel}clus_{clusnum}'
+        subdir = f'{clusterlabel}clus_{clusnum}' if clusterlabel else f'clus_{clusnum}'
         clusnum_dir = os.path.join(clusdir, subdir)
         os.makedirs(clusnum_dir)
         centroid_ind = centroid_assignments[clusnum]
@@ -768,9 +773,8 @@ def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_c
             target_coords = first_pdb_cg_vdmbb_coords
             try:
                 moved_cent_transf, moved_cent_coords = get_transf_and_coords(
-                        cent_cg_vdmbb_coords, 
-                        target_coords, weights, cent_pr_obj, cent_scrr_cg_perm, 
-                        symmetry_classes)
+                        cent_cg_vdmbb_coords, target_coords, weights, cent_pr_obj, 
+                        cent_scrr_cg_perm, symmetry_classes)
             except Exception as e:
                 # Sometimes there's an error, though very rare. Skip this cluster.
                 print(f"Error: {e}")
@@ -781,22 +785,26 @@ def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_c
             write_out_subsequent_clus_pdbs(cent_pr_obj, cent_pdb_outpath, cent_scrr_cg_perm, 
                                            print_flankbb, moved_cent_transf)
 
-            # After centroid, output the rest of the cluster members using Pool.map
-            with multiprocessing.Pool(num_threads) as pool:
-                results = pool.starmap(process_cluster_member, 
-                                       [(ind, clusnum, clusnum_dir, centroid_ind, moved_cent_coords,  
-                                         all_cg_coords, all_cg_and_vdmbb_coords, 
-                                         all_flankbb_coords, all_pdbpaths, 
-                                         all_scrr_cg_perm, num_flanking, atomgroup_dict, 
-                                         weights, first_pdb_cg_vdmbb_coords, symmetry_classes, 
-                                         print_flankbb) for ind in clus_mem_indices 
-                                              if ind != centroid_ind]) # skip if centroid
+            #Prepare all cluster member jobs
+            for ind in clus_mem_indices:
+                if ind == centroid_ind:
+                    continue
+                args = (
+                    ind, clusnum, clusnum_dir, centroid_ind, moved_cent_coords,
+                    all_cg_coords, all_cg_and_vdmbb_coords, all_flankbb_coords,
+                    all_pdbpaths, all_scrr_cg_perm, num_flanking, atomgroup_dict,
+                    weights, first_pdb_cg_vdmbb_coords, symmetry_classes, print_flankbb
+                )
+                all_tasks.append(args)
 
-            # Collect failed members
-            for result in results:
-                pdb_outpath, failed_member = result
-                if failed_member:
-                    failed.append(failed_member)
+    #Run pool ONCE after loop
+    with multiprocessing.Pool(num_threads) as pool:
+        results = pool.starmap(process_cluster_member, all_tasks)
+
+    for result in results:
+        pdb_outpath, failed_member = result
+        if failed_member:
+            failed.append(failed_member)
 
     return first_pdb_out, first_pdb_cg_vdmbb_coords, failed
 
@@ -830,9 +838,12 @@ def write_out_subsequent_clus_pdbs(pr_obj, pdb_outpath, scrrs, print_flankbb, tr
    pr_obj_copy = reset_occs(pr_obj_copy, scrrs)
    # Write out PDB
    if not print_flankbb: 
-      pr.writePDB(pdb_outpath, pr_obj_copy.select('occupancy > 1.5')) # selects occ>=2.0
+      manually_write_pdb(pdb_outpath, pr_obj_copy.select('occupancy > 1.5')) # selects occ>=2.0
    else:
-      pr.writePDB(pdb_outpath, pr_obj_copy)
+      manually_write_pdb(pdb_outpath, pr_obj_copy)
+   
+   del pr_obj_copy  # sometimes, deep copying leaves open handles 
+   gc.collect()     
 
 def get_clus_pdb_outpath(clusnum, clusnum_dir, pdbpath, scrr_cg_perm, clusmem_ind, 
                          is_centroid):
@@ -847,6 +858,11 @@ def get_clus_pdb_outpath(clusnum, clusnum_dir, pdbpath, scrr_cg_perm, clusmem_in
 
    return os.path.join(clusnum_dir, pdb_str)
 
+def manually_write_pdb(outpath, pr_obj):
+   # Workaround because of sge's "Too many open files" error.
+   with gzip.open(outpath, 'wt') as f:
+      pr.writePDBStream(f, pr_obj)
+
 def write_out_first_pdb(mobile, target, pr_obj, outpath, clusmem_cg_vdmbb_coords, scrrs, 
                         print_flankbb):
    # No weights because it's only aligning 3 atoms of CG
@@ -859,9 +875,13 @@ def write_out_first_pdb(mobile, target, pr_obj, outpath, clusmem_cg_vdmbb_coords
    pr_obj_copy = reset_occs(pr_obj_copy, scrrs)
    # Write out PDB
    if not print_flankbb: 
-      pr.writePDB(outpath, pr_obj_copy.select('occupancy > 1.5')) # selects occ=2.0
+      manually_write_pdb(outpath, pr_obj_copy.select('occupancy > 1.5')) # selects occ=2.0
    else:
-      pr.writePDB(outpath, pr_obj_copy)
+      manually_write_pdb(outpath, pr_obj_copy)
+   
+   del pr_obj_copy  # sometimes, deep copying leaves open handles 
+   gc.collect()     
+   
    return moved_cg_vdmbb_coords
 
 def rewrite_temp_clusters(clusdir, clean_dir, size_subset, subset_AAs):

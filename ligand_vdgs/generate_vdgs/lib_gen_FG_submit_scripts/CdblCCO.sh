@@ -19,3 +19,4 @@ conda activate vdgs
 python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py -s "C=C[CX3](=[OX1])" -c CdblCCO -p /wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2/ -b /wynton/group/degradolab/skt/docking/databases/probe_output/ -o /wynton/group/degradolab/skt/docking/databases/vdg_lib 
 
 date
+echo "DONE"

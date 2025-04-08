@@ -17,6 +17,7 @@ hostname
 
 conda activate vdgs
 
-python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py -s "[NX3]1CCCCC1" -c piperidine -p /wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2/ -b /wynton/group/degradolab/skt/docking/databases/probe_output/ -o /wynton/group/degradolab/skt/docking/databases/vdg_lib --symmetry-classes 0 1 2 3 2 1
+python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py -s "[NX3]1CCCCC1" -c piperidine -p /wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2/ -b /wynton/group/degradolab/skt/docking/databases/probe_output/ -o /wynton/group/degradolab/skt/docking/databases/vdg_lib --symmetry-classes 0 1 2 3 2 1 -w 1.0
 
 date
+echo "DONE"

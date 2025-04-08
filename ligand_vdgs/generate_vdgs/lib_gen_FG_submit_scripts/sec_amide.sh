@@ -8,7 +8,7 @@
 #$ -l h_rt=100:00:00  #-- runtime limit - max 2 weeks == 336 hours
 #$ -R yes             #-- SGE host reservation
 #$ -l hostname='!(qb3-as4|qb3-id188|qb3-id340|qb3-id225)'
-#$ -l mem_free=50G
+#$ -l mem_free=20G
 #$ -pe smp 10          # Request 10 slots in the SMP parallel environment
             
 
@@ -17,6 +17,7 @@ hostname
 
 conda activate vdgs
 
-python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py -s "[CX3H0](=O)[NX3H1]" -c sec_amide -p /wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2/ -b /wynton/group/degradolab/skt/docking/databases/probe_output/ -o /wynton/group/degradolab/skt/docking/databases/vdg_lib
+python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py -s "[CX3H0](=O)([NX3]([H])([C,c]))[C,c]" -c sec_amide -p /wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2/ -b /wynton/group/degradolab/skt/docking/databases/probe_output/ -o /wynton/group/degradolab/skt/docking/databases/vdg_lib
 
 date
+echo "DONE"

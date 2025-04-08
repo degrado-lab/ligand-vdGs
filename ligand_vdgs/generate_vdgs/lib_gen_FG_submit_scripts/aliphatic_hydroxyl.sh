@@ -10,15 +10,15 @@
 #$ -l hostname='!(qb3-as4|qb3-id188|qb3-id340|qb3-id225)'
 #$ -l mem_free=30G
 #$ -pe smp 10          # Request 10 slots in the SMP parallel environment
-            
 
 date
 hostname
 
 conda activate vdgs
 
-python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py -s "[OX2H1][C&!c]" -c aliphatic_hydroxyl -p /wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2/ -b /wynton/group/degradolab/skt/docking/databases/probe_output/ -o /wynton/group/degradolab/skt/docking/databases/vdg_lib 
+python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py -s "[C&!c][OX2][H]" -c aliphatic_hydroxyl -p /wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2/ -b /wynton/group/degradolab/skt/docking/databases/probe_output/ -o /wynton/group/degradolab/skt/docking/databases/vdg_lib 
 
 qstat -j $JOB_ID
 
 date
+echo "DONE"

@@ -8,7 +8,7 @@
 #$ -l h_rt=300:00:00     #-- runtime limit - max 2 weeks == 336 hours
 #$ -R yes                #-- SGE host reservation
 #$ -l hostname='!(qb3-as4|qb3-id188|qb3-id340|qb3-id225)'
-#$ -l mem_free=50G
+#$ -l mem_free=30G
 #$ -pe smp 10          # Request 10 slots in the SMP parallel environment
             
 
@@ -22,3 +22,4 @@ python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py -s "[C,c][OX2][C,c]" 
 qstat -j $JOB_ID
 
 date
+echo "DONE"

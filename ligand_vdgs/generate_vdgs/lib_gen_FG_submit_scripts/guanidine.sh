@@ -5,7 +5,7 @@
 #$ -N guanidine 
 #$ -cwd
 #$ -j y               # tells system STDERR and STDOUT should be joined
-#$ -l h_rt=100:00:00  #-- runtime limit - max 2 weeks == 336 hours
+#$ -l h_rt=300:00:00  #-- runtime limit - max 2 weeks == 336 hours
 #$ -R yes               #-- SGE host reservation
 #$ -l hostname='!(qb3-as4|qb3-id188|qb3-id340|qb3-id225)'
 #$ -l mem_free=10G
@@ -19,3 +19,4 @@ conda activate vdgs
 python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py -s "[NX3]~[CX3](~[NX2,NH2])~[NX3]" -c guanidine -p /wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2/ -b /wynton/group/degradolab/skt/docking/databases/probe_output/ -o /wynton/group/degradolab/skt/docking/databases/vdg_lib --symmetry-classes 0 1 0 0
 
 date
+echo "DONE"
