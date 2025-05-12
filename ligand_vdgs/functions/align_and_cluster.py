@@ -440,7 +440,7 @@ def get_cg_coords(prody_obj):
    # The CG atoms have their occupancies set to >= 3.0, with unique values (e.g., 
    # 3.0, 3.1, 3.2, etc.) to allow a 1:1 correspondence of equivalent atoms between 
    # different ligands.
-   cg = prody_obj.select('occupancy >= 3.0')
+   cg = prody_obj.select('occupancy >= 2.9')
    num_atoms = len(cg)
    cg_coords = []
    for ind in range(num_atoms):
@@ -506,7 +506,7 @@ def add_vdgs_to_dict(vdm_combos, vdg_subset, re_ordered_aas, re_ordered_bbcoords
 
    return vdm_combos
 
-def reorder_vdg_subset(vdg_subset, vdms_dict, cg_coords, prody_obj):
+def reorder_vdg_subset(vdg_subset, vdms_dict, cg_obj, prody_obj):
    '''Reorders vdms alphabetically.'''
    # First, record
    aas_of_vdms_in_order = []
@@ -525,7 +525,7 @@ def reorder_vdg_subset(vdg_subset, vdms_dict, cg_coords, prody_obj):
       # Check if it's a backbone-only contact. If it is, instead of recording vdmAA, 
       # record "bb" as the vdm resname.
       _vdg_seg, _vdg_ch, _vdg_resnum, _vdg_resname = vdm_seg_chain_resnum_resname
-      
+
       if _vdg_resnum < 0:
          res_sel = f'resnum `{_vdg_resnum}`'
       else:
@@ -537,17 +537,20 @@ def reorder_vdg_subset(vdg_subset, vdms_dict, cg_coords, prody_obj):
          vdm_sel = f'chain {_vdg_ch} and {res_sel}'
       vdm_res_obj = prody_obj.select(f'{vdm_sel} and not element H D')
       vdm_sc = vdm_res_obj.select(f'{vdm_sel} and sidechain') 
+      
       if vdm_sc is None:  # then Gly
          aas_of_vdms_in_order.append('bb') # assign gly as 'bb'
       elif len(vdm_sc) == 0: # also Gly
          aas_of_vdms_in_order.append('bb')
       else: # not Gly, so check if it has a sc contact
          has_sidechain_contact = False
-         # Determine whether the vdm is a bb or sc contact.
-         for cg_atom in cg_coords:
+         # Determine whether the vdm is a bb or sc contact. H is excluded in cg_obj b/c 
+         # a CG H within 4.5A of a sc atom is not necessarily a sc contact and will 
+         # give poor results.
+         for cg_atom in cg_obj:
             # sc condition
             dists_cg_atom_to_sc = pr.calcDistance(cg_atom, vdm_sc)
-            if np.any(dists_cg_atom_to_sc < 4.5):
+            if np.any(dists_cg_atom_to_sc <= 4.4):
                has_sidechain_contact = True 
                break 
 
@@ -560,7 +563,7 @@ def reorder_vdg_subset(vdg_subset, vdms_dict, cg_coords, prody_obj):
             vdm_bb = vdm_res_obj.select(f'{vdm_sel} and backbone') 
             min_dist_to_sc = None
             min_dist_to_bb = None
-            for cg_atom in cg_coords:
+            for cg_atom in cg_obj:
                # get closest dist to AA sc
                dist_to_sc = pr.calcDistance(cg_atom, vdm_sc)
                if min_dist_to_sc is None:

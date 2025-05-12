@@ -1,0 +1,36 @@
+CRYST1  102.400   68.300  102.800  90.00 105.60  90.00 P 1 21 1     24
+HETATM    1  C1  TSA L 211      62.143  12.025  99.292  1.00 38.42      X    C  
+HETATM    2  O1  TSA L 211      61.263   9.966  98.423  1.00 44.13      X    O  
+HETATM    3  C2  TSA L 211      62.676  12.414  97.921  1.00 38.59      X    C  
+HETATM    4  O2  TSA L 211      59.936  11.152  99.640  1.00 40.79      X    O  
+HETATM    5  C3  TSA L 211      63.083  13.670  97.612  1.00 35.18      X    C  
+HETATM    6  O3  TSA L 211      66.017  13.212  99.071  1.00 38.45      X    O  
+HETATM    7  C4  TSA L 211      63.099  14.776  98.631  1.00 29.78      X    C  
+HETATM    8  O4  TSA L 211      65.751  11.083  99.035  1.00 40.08      X    O  
+HETATM    9  C5  TSA L 211      62.838  14.277 100.048  1.00 30.84      X    C  
+HETATM   10  O5  TSA L 211      62.028  15.630  98.333  1.00 28.08      X    O  
+HETATM   11  C6  TSA L 211      61.680  13.282 100.035  1.00 34.35      X    C  
+HETATM   12  O7  TSA L 211      63.948  13.693 100.721  1.00 32.69      X    O  
+HETATM   13  C8  TSA L 211      64.360  12.346 100.529  1.00 35.25      X    C  
+HETATM   14  C9  TSA L 211      63.196  11.397 100.215  1.00 37.47      X    C  
+HETATM   15  C10 TSA L 211      61.032  10.973  99.108  1.00 39.64      X    C  
+HETATM   16  C11 TSA L 211      65.457  12.201  99.466  1.00 37.23      X    C  
+HETATM   17  HO5 TSA L 211      62.154  15.892  97.436  1.00  0.00      X    H  
+CONECT    1    3   11   14   15
+CONECT    2   15
+CONECT    3    1    5
+CONECT    4   15
+CONECT    5    3    7
+CONECT    6   16
+CONECT    7    5    9   10
+CONECT    8   16
+CONECT    9    7   11   12
+CONECT   10    7   17
+CONECT   11    1    9
+CONECT   12    9   13
+CONECT   13   12   14   16
+CONECT   14    1   13
+CONECT   15    1    2    4
+CONECT   16    6    8   13
+CONECT   17   10
+END

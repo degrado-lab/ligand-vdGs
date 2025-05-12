@@ -34,9 +34,8 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'functions'))
 import align_and_cluster as clust
 import utils
 
-max_num_to_clus = 2500 # max num of pdbs w/ vdgs of the same AA compositions
 set_num_threads(10) # for numba in calc. max pdb ID diversity
-num_threads = 30 # for multiprocessing in write_out_clusters
+num_threads = 10 # for multiprocessing in write_out_clusters
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -62,19 +61,22 @@ def parse_args():
                         help="Number of residues +/- the vdms for which to "
                         "calculate sequence similarity and backbone similarity. Defaults "
                         "to 2.")
-    parser.add_argument('-s', '--symmetry-classes', nargs='+', type=int,
-                        help='Integers representing the symmetry classes of the CG '
-                        'atoms on which clustering is to be performed. If provided, '
-                        'should have the same length as idxs. If not provided, the '
-                        'atoms are assumed to be symmetrically inequivalent.')
-    parser.add_argument('-n', '--size-subset', type=int, 
-                        help='Specify the number of residues in the vdG subset. '
-                        'The purpose of this arg is for parallelization (running '
-                        'this script with different -n values concurrently). 1, 2, '
-                        '3, and 4 are recommended.')
+    parser.add_argument('-s', "--symmetry-classes", nargs='+', type=int,
+                        help="Integers representing the symmetry classes of the CG "
+                        "atoms on which clustering is to be performed. If provided, "
+                        "should have the same length as idxs. If not provided, the "
+                        "atoms are assumed to be symmetrically inequivalent.")
+    parser.add_argument('-n', "--size-subset", type=int, 
+                        help="Specify the number of residues in the vdG subset. "
+                        "The purpose of this arg is for parallelization (running "
+                        "this script with different -n values concurrently). 1, 2, "
+                        "3, and 4 are recommended.")
     parser.add_argument('-l', "--logfile", help="Path to log file.")
     parser.add_argument('-x', "--print-flankbb", action='store_true', 
                         help="Include flanking bb residues when writing out PDB.")
+    parser.add_argument('-m', "--max-num-vdgs-to-clus", default=2500, type=int, 
+                        help="Maximum number of PDBs w/ vdgs of the same AA compositions "
+                        "to cluster.")
     
     return parser.parse_args()
 
@@ -128,6 +130,7 @@ def main():
    print_flankbb = args.print_flankbb
    keep_clustered_pdbs = args.keep_clustered_pdbs
    size_subset = args.size_subset
+   max_num_to_clus = args.max_num_vdgs_to_clus
    if size_subset not in [1, 2, 3, 4]:
       raise ValueError('size_subset must be an integer between 1 and 4.')
    logfile = args.logfile
@@ -175,7 +178,9 @@ def main():
          # assign the vdm resname as "bb".
          re_ordered_aas, re_ordered_bbcoords, re_ordered_flankingseqs, \
             re_ordered_CAs, re_ordered_scrr = clust.reorder_vdg_subset(
-            vdg_subset, vdms_dict, cg_coords, prody_obj)
+            vdg_subset, vdms_dict, prody_obj.select('occupancy >= 2.9 and not element H'), 
+            prody_obj) # exclude H b/c calculating dist to AA to determine bb or sc vdm
+         
          # Add to `vdm_combos` dict
          vdm_combos = clust.add_vdgs_to_dict(vdm_combos, vdg_subset, re_ordered_aas, 
             re_ordered_bbcoords, re_ordered_flankingseqs, re_ordered_CAs, 
@@ -198,8 +203,10 @@ def main():
 
             with open(logfile, 'a') as file:
                file.write(f'\tThere are {orig_num_vdgs} vdgs for the {_reordered_AAs} '
-                  f'subset, so only {len(_vdgs)} PDBs with maximum PDB ID '
+                  f'subset, so only {len(_vdgs)} vdgs with maximum PDB ID '
                   f'diversity were selected.\n')
+            # Note that len(_vdgs) may be > max_num_to_clus because >1 vdgs might 
+            # belong to the same PDB.
 
          cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, _reordered_AAs, 
                symmetry_classes, vdglib_dir, align_cg_weight, num_flanking, 
@@ -252,7 +259,8 @@ def main():
    current, peak = tracemalloc.get_traced_memory()
    peak_mem = np.round(peak / (1024 * 1024 * 1024), 2)
    if peak_mem > 20:
-      print(f"Peak memory usage at end of script: {peak_mem} GB")
+      print(f"Peak memory usage at end of script for clustering subset size {size_subset}: "
+            f"{peak_mem} GB")
    tracemalloc.stop()
 
 def copy_nr_to_outdir(vdglib_dir, nr_dir, reordered_AAs):

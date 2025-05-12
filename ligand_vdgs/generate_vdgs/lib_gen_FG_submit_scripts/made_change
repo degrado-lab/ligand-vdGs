@@ -1,0 +1,26 @@
+aliphatic_hydroxyl
+aliphatic_prim_amine
+aniline
+aryl_amine (deleted)
+aryl_prim_amine
+aryl_hydroxyl
+carbamate
+carboxamide
+CHF2
+gem_diol
+guan
+NOHCO
+prim_amide
+pyridone **
+pyrimidine **
+sat_morpholine
+sec_amide
+sec_amine
+tert_amide
+tert_amine
+thiol
+urea
+
+piperazine (weights)
+piperidine (weights)
+urea (wildcard)

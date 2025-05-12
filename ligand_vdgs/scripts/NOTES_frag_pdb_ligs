@@ -1,0 +1,10 @@
+'''
+TODO: 
+-- Exclude alkyl chains and overly common fragments that dilute the fragment pool
+-- Warning: if you load a lig with explicit H's (such as from an SDF file), the fragmented Mol 
+   objects will retain knowledge of which atoms have H's, but when convering to smiles, rdkit 
+   may add implicit H's incorrectly, even with canonical=False. 
+-- Determine whether or not to "turn off" charges in SMILES.
+
+'''
+#RDLogger.DisableLog('rdApp.*')

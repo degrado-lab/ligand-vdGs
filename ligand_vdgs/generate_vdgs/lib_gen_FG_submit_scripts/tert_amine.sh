@@ -17,7 +17,7 @@ hostname
 
 conda activate vdgs
 
-python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py -s "[C,c][NX3H0]([C,c])[C,c]" -c tert_amine -p /wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2/ -b /wynton/group/degradolab/skt/docking/databases/probe_output/ -o /wynton/group/degradolab/skt/docking/databases/vdg_lib  --symmetry-classes 0 1 0 0
+python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py -s "[C,c][NX3H0]([C,c])[C,c]" -c tert_amine -p /wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2/ -b /wynton/group/degradolab/skt/docking/databases/probe_output/ -o /wynton/group/degradolab/skt/docking/databases/vdg_lib  --symmetry-classes 0 1 0 0 -m 2000
 
 date
 echo "DONE"

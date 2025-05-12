@@ -40,6 +40,9 @@ def parse_args():
                         "the remaining 1/2 goes to the vdM backbone atoms. Defaults to 0.99.")
     parser.add_argument('-x', "--print-flankbb", action='store_true', 
                         help="Include flanking bb residues when writing out PDB.")
+    parser.add_argument('-m', "--max-num-vdgs-to-clus", default=2500, type=int, 
+                        help="Maximum number of PDBs w/ vdgs of the same AA compositions "
+                        "to cluster.")
     return parser.parse_args()
 
 
@@ -101,10 +104,11 @@ def main():
     subprocess.run(to_pdbs_cmd, shell=True, check=True)
 
     # Run clus_and_deduplicate_vdgs.py
+    max_num_to_clus = args.max_num_vdgs_to_clus
     if symm_classes is not None:
-        deduplicate_template = f'python ligand_vdgs/generate_vdgs/clus_and_deduplicate_vdgs.py -c "{cg}" -v "{out_dir}" -s {symm_classes} -l "{logfile}" -w {align_cg_weight}'
+        deduplicate_template = f'python ligand_vdgs/generate_vdgs/clus_and_deduplicate_vdgs.py -c "{cg}" -v "{out_dir}" -s {symm_classes} -l "{logfile}" -w {align_cg_weight} -m {max_num_to_clus}'
     else:
-        deduplicate_template = f'python ligand_vdgs/generate_vdgs/clus_and_deduplicate_vdgs.py -c "{cg}" -v "{out_dir}" -l "{logfile}" -w {align_cg_weight}'
+        deduplicate_template = f'python ligand_vdgs/generate_vdgs/clus_and_deduplicate_vdgs.py -c "{cg}" -v "{out_dir}" -l "{logfile}" -w {align_cg_weight} -m {max_num_to_clus}'
     
     # Add optional flags, if requested 
     if keep_clustered_pdbs:
@@ -140,7 +144,7 @@ def delete_tmp_memmap_dir(out_dir):
 def delete_empty_dirs(_dir):
     for root, dirs, files in os.walk(_dir):
         if not dirs and not files:
-            os.system(f'rmdir {root}')
+            os.system(f"rmdir '{root}'")
 
 def clean_up_clusdirs(out_dir, clus_level, logfile):
     direc = os.path.join(out_dir, 'clusters', clus_level)

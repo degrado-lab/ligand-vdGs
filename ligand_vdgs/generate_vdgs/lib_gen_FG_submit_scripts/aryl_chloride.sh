@@ -8,7 +8,7 @@
 #$ -l h_rt=330:00:00   #-- runtime limit - max 2 weeks == 336 hours
 #$ -R yes             #-- SGE host reservation
 #$ -l hostname='!(qb3-as4|qb3-id188|qb3-id340|qb3-id225)'
-#$ -l mem_free=20G
+#$ -l mem_free=30G
 #$ -pe smp 10          # Request 10 slots in the SMP parallel environment
             
 

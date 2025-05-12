@@ -17,7 +17,7 @@ hostname
 
 conda activate vdgs
 
-python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py -s "[CX3](~[OX2H1,OX1])(~[OX2H1,OX1])[C,c]" -c carboxylate -p /wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2/ -b /wynton/group/degradolab/skt/docking/databases/probe_output/ -o /wynton/group/degradolab/skt/docking/databases/vdg_lib --symmetry-classes 0 1 1 2
+python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py -s "[CX3](~[OX2H1,OX1])(~[OX2H1,OX1])[C,c]" -c carboxylate -p /wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2/ -b /wynton/group/degradolab/skt/docking/databases/probe_output/ -o /wynton/group/degradolab/skt/docking/databases/vdg_lib --symmetry-classes 0 1 1 2 -m 2000
 
 qstat -j $JOB_ID
 

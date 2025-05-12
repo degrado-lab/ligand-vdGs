@@ -51,7 +51,7 @@ def main():
     
     # Get subsets of vdg residues in query struct.
     query_res_sets = match.subsets_of_query_residues(bindingsite_residues)
-
+    print('query_res_sets', query_res_sets)
     # Iterate over subsets of binding site residues and determine
     # whether any of the vdGs in the database match the "ground truth" binding 
     # site residues and CG positions of the query structure.

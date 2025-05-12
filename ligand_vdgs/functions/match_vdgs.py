@@ -161,8 +161,11 @@ def get_in_dir_and_out_dir(q_res_set, vdgs_dir):
     return _vdgs_dir, subdir
 
 def get_database_vdgs_for_spec_AAs(_vdgs_dir, AAs):
+    AAs = ['bb' if i == 'GLY' else i for i in AAs]
     AA_str = '_'.join(sorted(AAs))
     aa_path = os.path.join(_vdgs_dir, AA_str)
+    print('aa_path', aa_path)
+    print(os.path.exists(aa_path))
     if not os.path.exists(aa_path):
         return [], []
     
