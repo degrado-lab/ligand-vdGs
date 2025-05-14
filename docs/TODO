@@ -17,3 +17,4 @@ in vdgs/cg.py must be commented out to view obabel errors. Unfortunately, sugars
 - Add symmetry for validate_known_poses.py (for example, the sulfonamide oxygens in 2ntr and 2nta)
 - Figure out why in /wynton/group/degradolab/skt/vdG/databases/vdgs/sulfonamide/vdg_pdbs/2vtd__A_1441_1.pdb, an extra N in "LKM" came along for the ride. And also UNDO the raise ValueError 'The query CG must have the same num. of atoms as the database CG.' in find_matches.py
 - Occasionally, in `get_pr_obj_to_print` in align_and_cluster.py, the parsePDB(clusmem_pdbpath) from different subprocesses (n=1, 2, 3) will try to read the same pdb, so the program crashes. Use filelock.
+- The probe file consume a lot of space. Redo the probe commands so that it only writes out contacts to ligands, not AA to AA.

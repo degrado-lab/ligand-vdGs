@@ -182,7 +182,7 @@ def report_stats(frag_dict, num_ligs_skipped, num_ligs_total, num_ligs_passed):
 
 def manually_remove_Hs(orig_mol):
     # Remove hydrogens. Docs say that Chem.RemoveHs() implicit and explicit are removed, 
-    # but this isn't true, so need to manually remove H's. 
+    # but this isn't true for [nH], [OH], [Ho], etc. so need to manually remove H's. 
     mol = Chem.RemoveHs(orig_mol, sanitize=False)
     # Convert back to SMILES, without showing explicit hydrogens
     smiles = Chem.MolToSmiles(mol, allHsExplicit=False, isomericSmiles=False) # still has H's
@@ -190,6 +190,9 @@ def manually_remove_Hs(orig_mol):
     smiles_no_Hs = re.sub(r'\[H\]', '', smiles)
     # Remove all 'H' except when part of '[Hg]'
     smiles_no_Hs = re.sub(r'H(?!g\])', '', smiles_no_Hs)
+    # Is there exactly one standalone character inside brackets? (i.e. the result of H 
+    # stripping for [nH], [OH], etc.). If so, remove the brackets. (e.g. [n] -> n) 
+    smiles_no_Hs = re.sub(r'\[([^\[\]])\]', r'\1', smiles_no_Hs)
 
     return mol, smiles_no_Hs
 
@@ -252,7 +255,7 @@ def record_frag(substruct, frag_dict, smiles, lig_resname):
     return frag_dict
 
 def undesired_elements(smiles): 
-    if re.search(r'(Be|Pt|Ru|Ir|Fe|Zn|Mg|Cu|Sn|Zr|Pb|Ga|Hg|Pd|Si|Mo|W|Se|Mn|Ti|Y|V|Ni|Rh|Te|Au|Ag|Co|Sb|Tb|Re|As|Cd|Hf|Lu|Na|Ca|Os|Cr|In|Al|Pr|se)', smiles):
+    if re.search(r'(Be|Pt|Ru|Ir|Fe|Zn|Mg|Cu|Sn|Zr|Pb|Ga|Hg|Pd|Si|Mo|W|Se|Mn|Ti|Y|V|Ni|Rh|Te|Au|Ag|Co|Sb|Tb|Re|As|Cd|Hf|Lu|Na|Ca|Os|Cr|In|Al|Pr|se|U)', smiles):
         return True
     if re.search(r'B(?!r)', smiles): # bypass if it's Br, but return as undesired if it's B w/o r
         return True

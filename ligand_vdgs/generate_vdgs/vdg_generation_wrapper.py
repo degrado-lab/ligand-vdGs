@@ -60,6 +60,7 @@ def main():
     symm_classes = args.symmetry_classes
     if symm_classes is not None:
         symm_classes = ' '.join(symm_classes)
+    max_num_to_clus = args.max_num_vdgs_to_clus
 
     if not cg: 
         cg = smarts
@@ -77,7 +78,7 @@ def main():
     if os.path.exists(logfile):
         logfile = logfile + '_' + str(time.time())
     write_out_commandline_params(logfile, smarts, cg, pdb_dir, probe_dir, out_dir, 
-                                 symm_classes, logdir)
+                                 symm_classes, logdir, max_num_to_clus)
 
     # Run smarts_to_cg.py
     if trial_run:
@@ -104,7 +105,6 @@ def main():
     subprocess.run(to_pdbs_cmd, shell=True, check=True)
 
     # Run clus_and_deduplicate_vdgs.py
-    max_num_to_clus = args.max_num_vdgs_to_clus
     if symm_classes is not None:
         deduplicate_template = f'python ligand_vdgs/generate_vdgs/clus_and_deduplicate_vdgs.py -c "{cg}" -v "{out_dir}" -s {symm_classes} -l "{logfile}" -w {align_cg_weight} -m {max_num_to_clus}'
     else:
@@ -144,7 +144,7 @@ def delete_tmp_memmap_dir(out_dir):
 def delete_empty_dirs(_dir):
     for root, dirs, files in os.walk(_dir):
         if not dirs and not files:
-            os.system(f"rmdir '{root}'")
+            os.system(f'rmdir "{root}"')
 
 def clean_up_clusdirs(out_dir, clus_level, logfile):
     direc = os.path.join(out_dir, 'clusters', clus_level)
@@ -185,7 +185,7 @@ def run_gen_fingerprints(job_index, num_procs, fingerprints_cmd):
     subprocess.run(fingerprints_cmd, shell=True, check=True)
 
 def write_out_commandline_params(logfile, smarts, cg, pdb_dir, probe_dir, out_dir, 
-                                 symm_classes, logdir):
+                                 symm_classes, logdir, max_num_to_clus):
     if not os.path.exists(logdir):
         os.mkdir(logdir)
     #print(f'\nLogdir: {logdir}\n')
@@ -193,6 +193,7 @@ def write_out_commandline_params(logfile, smarts, cg, pdb_dir, probe_dir, out_di
         _log.write(f'SMARTS: {smarts} \n')
         _log.write(f'CG: {cg} \n')
         _log.write(f'Symmetry classes: {symm_classes} \n')
+        _log.write(f'Max num vdgs to cluster: {max_num_to_clus} \n')
         _log.write(f'Parent PDB dir: {pdb_dir} \n')
         _log.write(f'Probe dir: {probe_dir} \n')
         _log.write(f'Output dir: {out_dir} \n')
