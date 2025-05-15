@@ -108,13 +108,17 @@ def main():
 
             # Decompose the ligand into fragments and store the fragment SMILES. Use SMILES 
             # instead of SMARTS b/c only SMILES (from rdkit) differentiates aliphatic and 
-            # aryl.
-            substructs = fragment_on_bond_d(mol, bond_radius)
+            # aryl (C,c vs. [#6]). Fragment on bond radii `bond_radius` AND the postive 
+            # integers less than `bond_radius`, because for example, drugs containing 
+            # sulfonamide might produce only 6-atom sulfonamides and not CS(N)(=O)=O. 
+            substructs = []
+            for rad in list(range(1, bond_radius + 1)):
+                substructs += fragment_on_bond_d(mol, rad)
             # Update frag_dict by adding the new fragments; skip if all-carbon
             for orig_sub in substructs: # contains H's that need to be scrubbed
                 sub, sub_smiles = manually_remove_Hs(orig_sub) 
-                # discard if < 4 atoms
-                if len(sub.GetAtoms()) < 4:
+                # discard if < 4 atoms or > 8 atoms
+                if len(sub.GetAtoms()) < 4 or len(sub.GetAtoms()) > 7:
                     continue
                 frag_dict = record_frag(sub, frag_dict, sub_smiles, lig_resname)
 
@@ -167,7 +171,6 @@ def sort_frag_dict(frag_dict, min_counts_per_frag):
     mols_to_output, labels, _ = zip(*fragment_data) if fragment_data else ([], [], [])
 
     return mols_to_output, labels
-    
 
 def report_stats(frag_dict, num_ligs_skipped, num_ligs_total, num_ligs_passed):
     # Report statistics    
@@ -227,8 +230,10 @@ def record_frag(substruct, frag_dict, smiles, lig_resname):
         frag_dict[elements][smiles] = [lig_resname] 
         return frag_dict
 
-    if smiles in frag_dict[elements]: # Is the smiles already recorded?
-        return frag_dict # automatically duplicate; don't need to add
+    if smiles in frag_dict[elements].keys(): # Is the smiles already recorded?
+        if lig_resname not in frag_dict[elements][smiles]:
+            frag_dict[elements][smiles].append(lig_resname)
+        return frag_dict 
 
     else: 
         # Even if the smiles isn't already recorded, it still might be represented b/c the 

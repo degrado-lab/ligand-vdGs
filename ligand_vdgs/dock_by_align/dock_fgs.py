@@ -11,20 +11,18 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('-y', "--yml-file", type=str, required=True,
                         help="Yaml file containing binding pocket information.")
-    parser.add_argument('-r', "--rmsd", type=float, default=1.3,
-                        help="RMSD cutoff of vdg bb alignment to define a match.")
     return parser.parse_args()
 
 def main():
-    print('WARNING: ONLY PROCESSING FRAGMENTS STARTING WITH "g" FOR TESTING PURPOSES')
+    print('WARNING: ONLY PROCESSING A SPECIFIC FRAGMENT FOR TESTING PURPOSES')
     # Parse inputs from yml file
     args = parse_args()
-    cutoff = args.rmsd
     yml_file = args.yml_file
-    (vdgs_dir, input_pdb_path, bindingsite_residues) = parse_yaml_input(yml_file)
+    (vdgs_dir, input_pdb_path, bindingsite_residues, out_dir, cutoff) = parse_yaml_input(
+        yml_file)
     # Parse the pdb and iterate through the combinations of binding site residues
     input_pdb = pr.parsePDB(input_pdb_path)
-    bsr_combos = get_vdg_subsets(bindingsite_residues)
+    bsr_combos = get_vdg_subsets(bindingsite_residues) # exclude subset sizse 1
     # Iterate over binding site residue combinations
     for bsr_combo in bsr_combos:
         bsr_AA_identities = []
@@ -32,23 +30,30 @@ def main():
         for bsr in bsr_combo: 
             bsr_seg, bsr_chain, bsr_resnum = bsr
             res_obj = select_residue(input_pdb, bsr_seg, bsr_chain, bsr_resnum)
+            res_bb_coords = []
             for atom_name in ['N', 'CA', 'C']:
-                input_bsr_bb_coords.append(get_atom_coords(res_obj, atom_name))
+                res_bb_coords.append(get_atom_coords(res_obj, atom_name))
+            input_bsr_bb_coords.append(res_bb_coords)
             AA = get_res_AA_identity(res_obj)
             bsr_AA_identities.append(AA)
-        input_bsr_bb_coords = np.array(input_bsr_bb_coords)
         bsr_AA_identities = [AA if AA != 'GLY' else 'bb' for AA in bsr_AA_identities]
+        # Reorder the bb coords and bsr_AA_identities in alphabetic order
+        paired = list(zip(bsr_AA_identities, input_bsr_bb_coords))
+        paired_sorted = sorted(paired, key=lambda pair: pair[0])
+        # Unzip them back
+        bsr_AA_identities, input_bsr_bb_coords = zip(*paired_sorted)
         bsr_AA_identities = '_'.join(sorted(bsr_AA_identities))
-        print(bsr_AA_identities)
+        input_bsr_bb_coords = np.array(input_bsr_bb_coords)
+        # Flatten input_bsr_bb_coords
+        input_bsr_bb_coords = input_bsr_bb_coords.reshape(-1, 3)
         # Dock fragments by aligning vdg backbones to bsr backbones
         for frag in os.listdir(vdgs_dir):
-            if not frag.startswith('gu'):
+            if not frag == 'CC(O)S':
                 continue
             print(frag)
             vdgs_path = os.path.join(vdgs_dir, frag, 'nr_vdgs', str(
                 len(bsr_combo)), bsr_AA_identities)
             if not os.path.exists(vdgs_path):
-                print(f"Directory {vdgs_path} does not exist.")
                 continue
             vdg_paths = os.listdir(vdgs_path)
             # Iterate over each vdg
@@ -61,8 +66,6 @@ def main():
                     [vdg_prody_obj.select(f'resindex {_r}').getResnames()[0] 
                         for _r in sorted(set(vdg_prody_obj.getResindices()))], 
                     bsr_AA_identities.split('_'), )
-                vdg_aminoacids = [vdg_prody_obj.select(f'resindex {_r}').getResnames()[0] 
-                    for _r in sorted(set(vdg_prody_obj.getResindices()))]
                 
                 # Iterate over each resind permutation, get bb coords, and superpose onto 
                 # the query structure (input structure)
@@ -80,7 +83,7 @@ def main():
                     rmsd = pr.calcRMSD(moved_coords, input_bsr_bb_coords)
                     if rmsd < cutoff:
                         print(rmsd)
-                        label = f'output/{bsr_combo}_{frag}_{vdg_path}_{resind_perm}.pdb'
+                        label = f'{out_dir}/{bsr_combo}_{frag}_{vdg_path}_{resind_perm}.pdb'
                         pr.writePDB(label, pr.applyTransformation(transf, vdg_prody_obj))
 
 def get_atom_coords(prody_obj, atom_name):
@@ -91,8 +94,8 @@ def get_atom_coords(prody_obj, atom_name):
 def get_vdg_subsets(input_list):
     # Initialize an empty list to store all subsets
     all_subsets = []
-    # Loop through subset sizes 1 to 3, generate combos, then add to list
-    for r in range(1, 4):
+    # Loop through subset sizes 2 to 3, generate combos, then add to list
+    for r in range(2, 4): # exclude subset size 1
         subsets = combinations(input_list, r)
         all_subsets.extend(subsets)
     return all_subsets
@@ -103,7 +106,9 @@ def parse_yaml_input(yml_file):
     vdgs_dir = user_data['vdgs_dir']
     input_pdb_path = user_data['input_pdb']
     bindingsite_residues = user_data['bindingsite_residues']
-    return [vdgs_dir, input_pdb_path, bindingsite_residues]
+    out_dir = user_data['out_dir']
+    cutoff = user_data['rmsd_threshold']
+    return [vdgs_dir, input_pdb_path, bindingsite_residues, out_dir, cutoff]
 
 def map_aa_identities_to_vdg_resinds(vdg_AAs, target_list, wildcard='bb'):
     '''
@@ -115,7 +120,7 @@ def map_aa_identities_to_vdg_resinds(vdg_AAs, target_list, wildcard='bb'):
 
     # Find all indices (resindices)for each unique element (AA) in the target list
     AA_indices = {}
-    
+
     # Handle regular AAs (non-wildcards, i.e. not `bb`)
     for AA in set(target_list):
         if AA != wildcard:
@@ -131,7 +136,7 @@ def map_aa_identities_to_vdg_resinds(vdg_AAs, target_list, wildcard='bb'):
     
     # Generate all permutations of indices
     result = []
-    
+
     def backtrack(current_indices, target_position):
         # If we've matched all target elements, add the current permutation to result
         if target_position == len(target_list):
@@ -148,7 +153,6 @@ def map_aa_identities_to_vdg_resinds(vdg_AAs, target_list, wildcard='bb'):
                 current_indices.append(idx)
                 backtrack(current_indices, target_position + 1)
                 current_indices.pop()  # Backtrack
-    
     backtrack([], 0)
     return result
 

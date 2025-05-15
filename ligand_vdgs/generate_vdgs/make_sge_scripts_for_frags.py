@@ -3,7 +3,8 @@ Create SGE submission scripts to run vdg generation pipeline on fragments define
 the database_frags_dict.pkl file.
 
 NOTE: the `symmetry_classes` flag of vdg_generation_wrapper.py has to be manually added to 
-the submission script (when applicable) after it's generated.
+the submission script (when applicable) after it's generated. 
+TODO: automate symmetry detection
 '''
 
 import os
@@ -12,12 +13,11 @@ import pickle as pkl
 
 frags_dict_path = 'resources/database_frags_dict.pkl'
 template = 'resources/frag_sge_template.sh' 
-counts_threshold = 3 # min number of ligs containing this frag in order to run vdg 
+counts_threshold = 88 # min number of ligs containing this frag in order to run vdg 
                         # vdg generatioin on
-max_size_frag = 5 # 5 atoms. Need to limit b/c otherwise, for example, the most common 
-    # sulfonamide frag is  [C]NS(=O)(=O)c(c)c (431 unique ligs) and CS(N)(=O)=O is all 
-    # the way down at 66 unique ligs for w/e reason. Set to 5 instead of 6 atoms b/c
-    # too many combinations with 6 atoms.
+max_size_frag = 5 # 5 atoms. 
+#frag_size = 4
+#out_dir_for_sge_scripts = 'ligand_vdgs/generate_vdgs/4mers/'
 out_dir_for_sge_scripts = 'ligand_vdgs/generate_vdgs/lib_gen_frag_submit_scripts/'
 out_dir_for_vdg_lib = '/wynton/group/degradolab/skt/docking/databases/frag_vdg_lib/'
 log_dir = '/wynton/home/degradolab/skt/docking/frag_sge_logs'
@@ -54,9 +54,9 @@ def main():
             copy_smiles = re.sub(r'(Cl|Br)', 'X', copy_smiles)  
             elems = copy_smiles
             size = len(elems)
+            #if size != frag_size:
             if size > max_size_frag:
                 continue
-
             # create SGE submission script
             output_script(template, smiles)
 
@@ -84,8 +84,5 @@ def output_script(template, smiles):
                     line = line.replace(key, value) 
                 # write out line
                 f.write(line)
-
-
-# account for symmetry classes            
 
 main()
