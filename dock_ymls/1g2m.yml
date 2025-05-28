@@ -1,0 +1,25 @@
+# This yml file is used to define a binding site of a known structure, so that
+# specified CGs can be docked into the binding site. 
+
+# ------------------------------------------------------------------------------
+#                       Please define these variables. 
+# ------------------------------------------------------------------------------
+# Path to vdG library
+vdgs_dir: /wynton/group/degradolab/skt/docking/databases/frag_vdg_lib/
+
+# Directory to output matches
+out_dir: output_1g2m
+
+# Path to the PDB to dock
+input_pdb: /wynton/home/degradolab/skt/docking/query_structs/1g2m.pdb
+
+frags_to_dock: ['cc(c)N', 'Cc(n)n', 'cC(=N)N']
+
+ligname: 'R11' # specify b/c it might select sugar you want to  keep, etc.
+
+# Binding site residues of the query structure to dock chemical groups onto.
+# Each residue should be classified by its [PDB segment, chain, residue number].
+additional_bindingsite_residues: []
+
+# RMSD threshold (in Ang) for defining a vdG as a match to the "ground truth".
+rmsd_threshold: 0.7

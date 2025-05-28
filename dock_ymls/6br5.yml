@@ -7,34 +7,21 @@
 # Path to vdG library
 vdgs_dir: /wynton/group/degradolab/skt/docking/databases/frag_vdg_lib/
 
+# Directory to output matches
+out_dir: output_6br5
 
 # Path to the PDB to dock
 input_pdb: /wynton/home/degradolab/skt/docking/query_structs/6br5.pdb
 
+frags_to_dock: ['N=C(N)N', 'CNC(C)=O', 'CNC(=N)N', 'CS(=O)(=O)O', 'CC(O)S']
+
 # Binding site residues of the query structure to dock chemical groups onto.
 # Each residue should be classified by its [PDB segment, chain, residue number].
-bindingsite_residues:
-    - ['A', 'A', 292]
-    - ['A', 'A', 371]
-    - ['A', 'A', 151]
-    #- ['A', 'A', 230] # this is a fake contact; just for testing
-
-
-# ------------------------------------------------------------------------------
-#                Default values set below. Redefine if necessary              
-# ------------------------------------------------------------------------------
+additional_bindingsite_residues:
+    - ['A', 'A', 156] # this CA is 10A away 
+    - ['A', 'A', 371] # this CA is also 10A away 
 
 # RMSD threshold (in Ang) for defining a vdG as a match to the "ground truth".
-rmsd_threshold: 0.5
+rmsd_threshold: 0.6
 
-# Directory to output matches
-out_dir: output
 
-# UNUSED VARIABLES FOR NOW
-## CG name (can be a common name or a SMARTS string)
-#cg_name: pyrazine 
-## Query ligand ([PDB segment, chain, residue number])
-#query_lig: ['H', 'A', 407]
-#
-## Atom names of the CG within the query ligand
-#query_cg_atoms: ['N21', 'C19', 'C25', 'N24', 'C23', 'C22']

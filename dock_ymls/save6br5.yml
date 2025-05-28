@@ -1,0 +1,80 @@
+# This yml file is used to define a binding site of a known structure, so that
+# specified CGs can be docked into the binding site. 
+
+# ------------------------------------------------------------------------------
+#                       Please define these variables. 
+# ------------------------------------------------------------------------------
+# Path to vdG library
+vdgs_dir: /wynton/group/degradolab/skt/docking/databases/frag_vdg_lib/
+
+
+# Path to the PDB to dock
+input_pdb: /wynton/home/degradolab/skt/docking/query_structs/6br5.pdb
+
+# Binding site residues of the query structure to dock chemical groups onto.
+# Each residue should be classified by its [PDB segment, chain, residue number].
+bindingsite_residues:
+    - ['A', 'A', 294] # all binding site residues
+    - ['A', 'A', 292] # all binding site residues
+    - ['A', 'A', 371] # all binding site residues
+    - ['A', 'A', 347] # all binding site residues
+    - ['A', 'A', 118] # all binding site residues
+    - ['A', 'A', 151] # all binding site residues
+    - ['A', 'A', 119] # all binding site residues
+    - ['A', 'A', 156] # all binding site residues
+    - ['A', 'A', 152] # all binding site residues
+    - ['A', 'A', 178] # all binding site residues
+    - ['A', 'A', 406] # all binding site residues
+    - ['A', 'A', 276] # all binding site residues
+    - ['A', 'A', 224] # all binding site residues
+    - ['A', 'A', 227] # all binding site residues
+    
+    
+    - ['A', 'A', 179] # CA 7A away
+    - ['A', 'A', 222] # CA 7A away
+    - ['A', 'A', 223] # CA 7A away
+    - ['A', 'A', 246] # CA 7A away
+    - ['A', 'A', 277] # CA 7A away
+    - ['A', 'A', 348] # CA 7A away
+    - ['A', 'A', 349] # CA 7A away
+    
+    
+    #- ['A', 'A', 178] # N=C(N)N # good
+    #- ['A', 'A', 227] # N=C(N)N # good
+    #- ['A', 'A', 151] # N=C(N)N # good
+    #- ['A', 'A', 151] # N=C(N)N # good
+    #- ['A', 'A', 156] # N=C(N)N # good
+    #- ['A', 'A', 119] # N=C(N)N # good
+    #- ['A', 'A', 151] # CC(O)S # no bb matches
+    #- ['A', 'A', 406] # CC(O)S # no bb matches
+    #- ['A', 'A', 292] # CS(=O)(=O)O # good
+    #- ['A', 'A', 371] # CS(=O)(=O)O # good
+    #- ['A', 'A', 347] # CS(=O)(=O)O # good
+    #- ['A', 'A', 118] # CS(=O)(=O)O # good
+    #- ['A', 'A', 406] # CS(=O)(=O)O # good
+
+    # CC(C)N not done
+    # CC(C)O not done
+    # CC(N)=O not done
+    # CNC(=N)N: 4 atom guanidine already taken care of
+    # CNC(C)=O not done
+    # CC(O)CO not done
+
+# ------------------------------------------------------------------------------
+#                Default values set below. Redefine if necessary              
+# ------------------------------------------------------------------------------
+
+# RMSD threshold (in Ang) for defining a vdG as a match to the "ground truth".
+rmsd_threshold: 0.6
+
+# Directory to output matches
+out_dir: output
+
+# UNUSED VARIABLES FOR NOW
+## CG name (can be a common name or a SMARTS string)
+#cg_name: pyrazine 
+## Query ligand ([PDB segment, chain, residue number])
+#query_lig: ['H', 'A', 407]
+#
+## Atom names of the CG within the query ligand
+#query_cg_atoms: ['N21', 'C19', 'C25', 'N24', 'C23', 'C22']

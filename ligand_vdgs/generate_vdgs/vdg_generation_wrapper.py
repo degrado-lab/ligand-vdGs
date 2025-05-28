@@ -117,7 +117,7 @@ def main():
         deduplicate_template += ' -x'
 
     # Create a Pool of workers and run the deduplication commands concurrently
-    num_vdms_list = [1, 2, 3]
+    num_vdms_list = [1, 2]
     with multiprocessing.Pool(processes=len(num_vdms_list)) as pool:
         pool.starmap(run_deduplicate, [(num_vdms, deduplicate_template) for num_vdms 
                                        in num_vdms_list])
@@ -128,7 +128,6 @@ def main():
     clean_up_clusdirs(out_dir, 'temp', logfile) 
     clean_up_clusdirs(out_dir, 'cgvdmbb', logfile) 
     delete_empty_dirs(os.path.join(out_dir, 'nr_vdgs'))
-    delete_tmp_memmap_dir(out_dir)
     if not keep_clustered_pdbs:
         clean_up_clusdirs(out_dir, 'flankseq_and_bb', logfile) 
         delete_empty_dirs(os.path.join(out_dir, 'clusters'))
@@ -136,10 +135,6 @@ def main():
     with open(logfile, 'a') as _log:
         _log.write(f'='*79 + '\n')
         _log.write(f'Job completed.\n')
-
-def delete_tmp_memmap_dir(out_dir):
-    tmp_dir = os.path.join(out_dir, 'tmp')
-    shutil.rmtree(tmp_dir)
 
 def delete_empty_dirs(_dir):
     for root, dirs, files in os.walk(_dir):

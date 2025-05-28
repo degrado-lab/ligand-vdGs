@@ -214,7 +214,6 @@ def main():
          '''Final results: vdgs that end up in the same cg+vdmbb, flanking bb, and 
          flanking seq clusters are redundant. Select only the centroid to be output.'''
          copy_nr_to_outdir(vdglib_dir, out_dir, _reordered_AAs)
-         delete_reorderedAA_memmaps(size_subset, vdglib_dir, _reordered_AAs)
 
    '''
    Clean up the entire output from clus_and_deduplicate_vdgs.py.
@@ -230,7 +229,6 @@ def main():
    using the --keep-clustered-pdbs flag.
    '''
    delete_clusterdirs(vdglib_dir, logfile, size_subset, keep_clustered_pdbs)
-   delete_memmap(size_subset, vdglib_dir)
 
    # Print out time elapsed
    seconds = time.time() - start_time
@@ -438,30 +436,6 @@ def delete_clusterdirs(vdglib_dir, logfile, size_subset, keep_clustered_pdbs):
             file.write(f"\t{flank_dir} does not exist.\n")
          else:
             shutil.rmtree(flank_dir)
-
-def delete_memmap(size_subset, vdglib_dir):
-   pattern = f"{vdglib_dir}/tmp/*_{size_subset}.dat"
-   files_to_delete = glob.glob(pattern)
-   for file in files_to_delete:
-      os.remove(file)
-   # Also remove if D_matrix chunk
-   pattern = f"{vdglib_dir}/tmp/D_matrix_*_{size_subset}_chunk*.dat"
-   files_to_delete = glob.glob(pattern)
-   for file in files_to_delete:
-      os.remove(file)
-
-def delete_reorderedAA_memmaps(size_subset, vdglib_dir, reordered_AAs):
-   reordered_AAs = '_'.join(reordered_AAs)
-   tmpdir = f'{vdglib_dir}/tmp/'
-   for pattern in [f'D_matrix_{reordered_AAs}_{size_subset}_chunk*.dat',
-                   f'distance_matrix_{reordered_AAs}_{size_subset}.dat',
-                   f'mobile_matrix_{reordered_AAs}_{size_subset}.dat',
-                   f'target_matrix_{reordered_AAs}_{size_subset}.dat'
-                   ]:
-
-      files_to_delete = glob.glob(tmpdir + pattern)
-      for file in files_to_delete:
-         os.remove(file)
 
 def normalize_rmsd(num_atoms, atoms):
    if atoms == 'flankbb':

@@ -13,12 +13,10 @@ import pickle as pkl
 
 frags_dict_path = 'resources/database_frags_dict.pkl'
 template = 'resources/frag_sge_template.sh' 
-counts_threshold = 88 # min number of ligs containing this frag in order to run vdg 
-                        # vdg generatioin on
+counts_threshold = 80 # min number of ligs containing this frag in order to run vdg 
+                        # vdg generation on
 max_size_frag = 5 # 5 atoms. 
-#frag_size = 4
-#out_dir_for_sge_scripts = 'ligand_vdgs/generate_vdgs/4mers/'
-out_dir_for_sge_scripts = 'ligand_vdgs/generate_vdgs/lib_gen_frag_submit_scripts/'
+out_dir_for_sge_scripts = 'ligand_vdgs/generate_vdgs/frag_submit_scripts/'
 out_dir_for_vdg_lib = '/wynton/group/degradolab/skt/docking/databases/frag_vdg_lib/'
 log_dir = '/wynton/home/degradolab/skt/docking/frag_sge_logs'
 pdb_parent_dir = '/wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2/'

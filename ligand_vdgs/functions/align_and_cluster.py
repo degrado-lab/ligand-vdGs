@@ -7,6 +7,7 @@ import gc
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
 import prody as pr
+import time
 
 def get_vdg_AA_permutations(reordered_AAs, _vdgs):
    permuted_indices = permute_AA_duplicates(reordered_AAs)
@@ -166,18 +167,7 @@ def get_hierarchical_clusters(data_to_clus, threshold, AA_subset, size_subset,
 
 def create_dist_matrix(data, dist_metric, AA_subset, size_subset, vdglib_dir):
    n = len(data)
-
-   # Need to initialize distance_matrix.dat with zeros.
-   tmp_dir = os.path.join(vdglib_dir, 'tmp')
-   os.makedirs(tmp_dir, exist_ok=True)  # store memory-mapped arrays in tmp/ 
-   dist_matrix_filename = os.path.join(tmp_dir, 'distance_matrix_{}_{}.dat'.format(
-      AA_subset, size_subset))
-   if os.path.exists(dist_matrix_filename):
-      os.remove(dist_matrix_filename) # stale data from prev. iteration
-   np.zeros((n, n), dtype=np.float32).tofile(dist_matrix_filename)
-
-   distance_matrix = np.memmap(dist_matrix_filename, dtype=np.float32, mode='r+', 
-      shape=(n, n))
+   distance_matrix = np.zeros((n, n), dtype=np.float32)
 
    if dist_metric == 'flankseq':
       for i in range(n):
@@ -190,23 +180,8 @@ def create_dist_matrix(data, dist_metric, AA_subset, size_subset, vdglib_dir):
             distance_matrix[j][i] = value   # Symmetric matrix
    elif dist_metric == 'cgvdmbb' or dist_metric == 'flankbb':
       n_atoms = len(data[0])
-   
-      # Create a memory-mapped array
-      mobile_filename = os.path.join(tmp_dir, 'mobile_matrix_{}_{}.dat'.format(
-         AA_subset, size_subset))
-      target_filename = os.path.join(tmp_dir, 'target_matrix_{}_{}.dat'.format(
-         AA_subset, size_subset))
-      
-      for filename in [mobile_filename, target_filename]:
-         # Initialize each file with zeros.
-         if os.path.exists(filename):
-            os.remove(filename) # stale data from prev. iteration
-         np.zeros((n * (n - 1) // 2, n_atoms, 3), dtype=np.float32).tofile(filename)
-      mobile = np.memmap(mobile_filename, dtype=np.float32, mode='r+', 
-         shape=(n * (n - 1) // 2, n_atoms, 3))
-      target = np.memmap(target_filename, dtype=np.float32, mode='r+', 
-         shape=(n * (n - 1) // 2, n_atoms, 3))
-
+      mobile, target = np.zeros((n * (n - 1) // 2, n_atoms, 3), dtype=np.float32), \
+                       np.zeros((n * (n - 1) // 2, n_atoms, 3), dtype=np.float32) 
       triu_idxs = np.triu_indices(n, 1)
       for k, (i, j) in enumerate(np.vstack(triu_idxs).T):
          mobile[k] = data[i]
@@ -268,15 +243,7 @@ def kabsch(X, Y, AA_subset, size_subset, vdglib_dir, chunk_size=30000):
       U, S, Vt = np.linalg.svd(H)
       d = np.sign(np.linalg.det(np.matmul(U, Vt)))
 
-      # Initialize memory mapping
-      D_matrix_filename = os.path.join(vdglib_dir, 'tmp', 
-         'D_matrix_{}_{}_chunk{}.dat'.format(AA_subset, size_subset, i))
-      if os.path.exists(D_matrix_filename):
-         os.remove(D_matrix_filename) # stale data from prev. iteration
-      np.zeros((Xc.shape[0], 3, 3), dtype=np.float32).tofile(D_matrix_filename)
-
-      D = np.memmap(D_matrix_filename, dtype=np.float32, mode='r+', 
-         shape=(Xc.shape[0], 3, 3))
+      D = np.zeros((Xc.shape[0], 3, 3), dtype=np.float32)
       D[:, 0, 0] = 1.
       D[:, 1, 1] = 1.
       D[:, 2, 2] = d
@@ -1065,8 +1032,18 @@ def get_pr_obj_to_print(clusmem_pdbpath, vdg_scrr_cg_perm,
          par = atomgroup_dict[clusmem_pdbpath]
       else:
          par = pr.parsePDB(clusmem_pdbpath)
-   except:
-      raise ValueError(f'Could not parse {clusmem_pdbpath}.')
+   except: # retry
+      for attempt in range(100):
+          try:
+              par = pr.parsePDB(clusmem_pdbpath)
+              break
+          except Exception as e:  
+              if attempt < 99:
+                  time.sleep(100)  # Wait before retrying
+              else:
+                  print(f"align_and_cluster failed to parse {clusmem_pdbpath}: {e}")
+                  return None
+
    # Add CG to pr obj
    pr_obj = par.select('occupancy > 2.8') # occ >= 3 is CG
    vdg_scrrs, cg_perm = vdg_scrr_cg_perm

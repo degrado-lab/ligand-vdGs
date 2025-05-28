@@ -2,10 +2,12 @@ import os
 import yaml
 import sys
 import argparse
-from itertools import combinations
+from itertools import combinations, product
 import time
 import numpy as np
 import prody as pr
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'functions'))
+import utils
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -13,17 +15,38 @@ def parse_args():
                         help="Yaml file containing binding pocket information.")
     return parser.parse_args()
 
+def get_bindingsite_residues(prody_obj, addl_residues, ligname):
+    res = []
+    CAs = prody_obj.select(
+        f'name CA within 8 of resname {ligname} and not element CA') # exclude calcium
+    for ca in CAs:
+        res_tup = (ca.getSegname(), ca.getChid(), ca.getResnum())
+        if res_tup not in res:
+            res.append(res_tup)
+    if addl_residues:
+        res += addl_residues 
+    for r in res:
+        if not isinstance(r, tuple) or len(r) != 3:
+            print(f"Invalid residue tuple: {r}")
+    print('\nbinding site residues for pymol selection:\n')
+    print('select bindingsite, ' + ' or '.join(
+    f'(seg {seg} and chain {chain} and resi {resnum})' for seg, chain, resnum in res))
+    return res
+
 def main():
-    print('WARNING: ONLY PROCESSING A SPECIFIC FRAGMENT FOR TESTING PURPOSES')
     # Parse inputs from yml file
     args = parse_args()
     yml_file = args.yml_file
-    (vdgs_dir, input_pdb_path, bindingsite_residues, out_dir, cutoff) = parse_yaml_input(
-        yml_file)
+    (vdgs_dir, input_pdb_path, addl_bsr_res, out_dir, cutoff, frags_to_dock,
+     ligname) = parse_yaml_input(yml_file)
+    utils.set_up_outdir(out_dir, overwrite=False)
     # Parse the pdb and iterate through the combinations of binding site residues
     input_pdb = pr.parsePDB(input_pdb_path)
-    bsr_combos = get_vdg_subsets(bindingsite_residues) # exclude subset sizse 1
-    # Iterate over binding site residue combinations
+    bindingsite_residues = get_bindingsite_residues(input_pdb,
+        set([tuple(b) for b in addl_bsr_res]), ligname)
+    bsr_combos = get_vdg_subsets(bindingsite_residues)
+    # Gather all binding site residue combinations
+    all_bsr_combos = []
     for bsr_combo in bsr_combos:
         bsr_AA_identities = []
         input_bsr_bb_coords = []
@@ -37,27 +60,40 @@ def main():
             AA = get_res_AA_identity(res_obj)
             bsr_AA_identities.append(AA)
         bsr_AA_identities = [AA if AA != 'GLY' else 'bb' for AA in bsr_AA_identities]
+        # All of the AAs have potential to provide bb contacts, so sample "bb" vdms
+        options = [(x,) if x == 'bb' else (x, 'bb') for x in bsr_AA_identities]
+        combo_variants = list(product(*options))
+        for c in combo_variants:
+            if c not in all_bsr_combos:
+                all_bsr_combos.append((c, input_bsr_bb_coords.copy())) 
+
+    for combo, coords in all_bsr_combos:
+        bsr_incl_bb_identities = combo
+        input_bsr_bb_coords = coords
         # Reorder the bb coords and bsr_AA_identities in alphabetic order
-        paired = list(zip(bsr_AA_identities, input_bsr_bb_coords))
+        paired = list(zip(bsr_incl_bb_identities, input_bsr_bb_coords))
         paired_sorted = sorted(paired, key=lambda pair: pair[0])
         # Unzip them back
-        bsr_AA_identities, input_bsr_bb_coords = zip(*paired_sorted)
-        bsr_AA_identities = '_'.join(sorted(bsr_AA_identities))
+        bsr_incl_bb_identities, input_bsr_bb_coords = zip(*paired_sorted)
+        bsr_incl_bb_identities = '_'.join(sorted(bsr_incl_bb_identities))
         input_bsr_bb_coords = np.array(input_bsr_bb_coords)
         # Flatten input_bsr_bb_coords
         input_bsr_bb_coords = input_bsr_bb_coords.reshape(-1, 3)
         # Dock fragments by aligning vdg backbones to bsr backbones
         for frag in os.listdir(vdgs_dir):
-            if not frag == 'CC(O)S':
+            if not frag in frags_to_dock: 
                 continue
-            print(frag)
             vdgs_path = os.path.join(vdgs_dir, frag, 'nr_vdgs', str(
-                len(bsr_combo)), bsr_AA_identities)
+                len(bsr_incl_bb_identities.split('_'))), bsr_incl_bb_identities)
             if not os.path.exists(vdgs_path):
                 continue
             vdg_paths = os.listdir(vdgs_path)
             # Iterate over each vdg
             for vdg_path in vdg_paths:
+                input_pdbname = os.path.basename(input_pdb_path)[:4]
+                vdg_pdbname = vdg_path[:4]
+                if input_pdbname == vdg_pdbname:
+                    continue
                 vdg_full_path = os.path.join(vdgs_path, vdg_path)
                 vdg_prody_obj = pr.parsePDB(vdg_full_path)
                 # Superpose the vdg backbone atoms onto the input structure.
@@ -65,7 +101,7 @@ def main():
                 resind_perms = map_aa_identities_to_vdg_resinds(
                     [vdg_prody_obj.select(f'resindex {_r}').getResnames()[0] 
                         for _r in sorted(set(vdg_prody_obj.getResindices()))], 
-                    bsr_AA_identities.split('_'), )
+                    bsr_incl_bb_identities.split('_'), )
                 
                 # Iterate over each resind permutation, get bb coords, and superpose onto 
                 # the query structure (input structure)
@@ -81,10 +117,34 @@ def main():
                     moved_coords, transf = pr.superpose(vdg_perm_bb_coords, 
                                                         input_bsr_bb_coords)
                     rmsd = pr.calcRMSD(moved_coords, input_bsr_bb_coords)
-                    if rmsd < cutoff:
-                        print(rmsd)
-                        label = f'{out_dir}/{bsr_combo}_{frag}_{vdg_path}_{resind_perm}.pdb'
-                        pr.writePDB(label, pr.applyTransformation(transf, vdg_prody_obj))
+                    if rmsd > cutoff: 
+                        continue
+                    aligned_vdg_obj = pr.applyTransformation(transf, vdg_prody_obj)
+                    # Check for clashes w/ protein backbone
+                    assert len(set(aligned_vdg_obj.hetatm.getResindices())) == 1 # make sure 
+                                                                    # selecting only 1 lig
+                    # If there are atoms within 3.5A, they may be suspicious, so check them
+                    neighbs = pr.findNeighbors(aligned_vdg_obj.hetatm.select(
+                        '(not element H) and (not ion) and (not water)'), 3.5, 
+                        input_pdb.select('name N CA C O and not element CA')) 
+                    found_clash = False
+                    for n in neighbs:
+                        elem1, elem2, dist = n[0].getElement(), n[1].getElement(), n[2]
+                        if dist < utils.min_clash_dist(elem1, elem2):
+                            found_clash = True
+                            break
+                    if found_clash:
+                        continue # continue to next vdg res permutation
+                    # Write out pdb
+                    vdgpdb = vdg_path.removesuffix('.pdb.gz')
+                    label = f'{out_dir}/{frag}/{frag}_{vdgpdb}_' \
+                            f'{"_".join([str(r) for r in resind_perm])}_{rmsd:.2f}'
+                    # Make base dirs if they don't exist
+                    if not os.path.exists(os.path.join(out_dir, frag)):
+                        os.makedirs(os.path.join(out_dir, frag))
+                    pr.writePDB(label, aligned_vdg_obj)
+    print('counts:', len(os.listdir(out_dir)))
+    print('DONE')
 
 def get_atom_coords(prody_obj, atom_name):
     atom = prody_obj.select(f'name {atom_name}')
@@ -105,10 +165,15 @@ def parse_yaml_input(yml_file):
         user_data = yaml.load(inF, Loader=yaml.FullLoader)
     vdgs_dir = user_data['vdgs_dir']
     input_pdb_path = user_data['input_pdb']
-    bindingsite_residues = user_data['bindingsite_residues']
+    addl_bindingsite_residues = user_data['additional_bindingsite_residues']
+    if not addl_bindingsite_residues:
+        addl_bindingsite_residues = []
     out_dir = user_data['out_dir']
     cutoff = user_data['rmsd_threshold']
-    return [vdgs_dir, input_pdb_path, bindingsite_residues, out_dir, cutoff]
+    frags_to_dock = user_data['frags_to_dock']
+    ligname = user_data['ligname']
+    return [vdgs_dir, input_pdb_path, addl_bindingsite_residues, out_dir, cutoff, 
+            frags_to_dock, ligname]
 
 def map_aa_identities_to_vdg_resinds(vdg_AAs, target_list, wildcard='bb'):
     '''

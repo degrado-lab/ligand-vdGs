@@ -18,6 +18,8 @@ import re
 import csv
 import pickle as pkl
 from rdkit import Chem, RDLogger
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'functions'))
+import Frags 
 
 RDLogger.DisableLog('rdApp.*') 
 
@@ -37,7 +39,7 @@ def parse_args():
                         help="Path to output log file.")
     parser.add_argument('--bond-radius', default=2, type=int,
                         help="Number of bonds away from an atom to cut during "
-                        "fragmentation. Bonds to H's count. Defaults to 2.") 
+                        "fragmentation. Defaults to 2.") 
     return parser.parse_args()
 
 def main():
@@ -97,12 +99,12 @@ def main():
 
             # Convert SMILES to RDKit molecule and remove H's
             orig_mol = Chem.MolFromSmiles(smiles, sanitize=False)
-            mol, smiles_no_Hs = manually_remove_Hs(orig_mol) # rdkit's remove H methods 
-                                                             # don't work 
+            mol, smiles_no_Hs = Frags.manually_remove_Hs(orig_mol) # rdkit's remove 
+                                                    # H method isn't good enough.
 
-            # Make sure there's at least a C, O, or N (rule out Fe-S clusters, ions, etc.) 
-            elements = [atom.GetSymbol() for atom in mol.GetAtoms()]
-            if not any(elem in elements for elem in ['C', 'O', 'N']):
+            # Make sure there's at least a C, O, or N (rule out Fe-S clusters, ions, etc.)
+            if not Frags.is_organic(mol):
+                print('compound is not organic:', smiles) 
                 num_ligs_skipped += 1
                 continue
 
@@ -111,33 +113,14 @@ def main():
             # aryl (C,c vs. [#6]). Fragment on bond radii `bond_radius` AND the postive 
             # integers less than `bond_radius`, because for example, drugs containing 
             # sulfonamide might produce only 6-atom sulfonamides and not CS(N)(=O)=O. 
-            substructs = []
-            for rad in list(range(1, bond_radius + 1)):
-                substructs += fragment_on_bond_d(mol, rad)
-            # Update frag_dict by adding the new fragments; skip if all-carbon
-            for orig_sub in substructs: # contains H's that need to be scrubbed
-                sub, sub_smiles = manually_remove_Hs(orig_sub) 
-                # discard if < 4 atoms or > 8 atoms
-                if len(sub.GetAtoms()) < 4 or len(sub.GetAtoms()) > 7:
-                    continue
+            filtered_frags = Frags.get_fragments(bond_radius, mol, 4, 7)
+            for (sub, sub_smiles) in filtered_frags: 
                 frag_dict = record_frag(sub, frag_dict, sub_smiles, lig_resname)
 
             num_ligs_passed += 1
 
     output_results(frag_dict, out_sdf_path, out_dict_path, min_counts_per_frag)
     report_stats(frag_dict, num_ligs_skipped, num_ligs_total, num_ligs_passed)
-
-def fragment_on_bond_d(mol, radius):
-    # Code from https://iwatobipen.wordpress.com/2020/08/12/get-and-draw-molecular-fragment-with-user-defined-path-rdkit-memo/
-    atoms = mol.GetAtoms()
-    submols = []
-    for atom in atoms:
-        env = Chem.FindAtomEnvironmentOfRadiusN(mol, radius, atom.GetIdx(), 
-            enforceSize=False) # don't enforce size to also get frags that are < radius away
-        amap = {}
-        submol = Chem.PathToSubmol(mol, env, atomMap=amap)
-        submols.append(submol)
-    return submols
 
 def output_results(frag_dict, out_sdf, out_pkl, min_counts_per_frag):
     # Determine which fragments to write out to an SDF file (based on the 
@@ -183,22 +166,6 @@ def report_stats(frag_dict, num_ligs_skipped, num_ligs_total, num_ligs_passed):
     print(f'Number of mols passed: {num_ligs_passed}')
     print(f'Number of mols unsuccessfully parsed: {num_ligs_skipped} out of {num_ligs_total}') 
 
-def manually_remove_Hs(orig_mol):
-    # Remove hydrogens. Docs say that Chem.RemoveHs() implicit and explicit are removed, 
-    # but this isn't true for [nH], [OH], [Ho], etc. so need to manually remove H's. 
-    mol = Chem.RemoveHs(orig_mol, sanitize=False)
-    # Convert back to SMILES, without showing explicit hydrogens
-    smiles = Chem.MolToSmiles(mol, allHsExplicit=False, isomericSmiles=False) # still has H's
-    # Remove standalone [H] completely
-    smiles_no_Hs = re.sub(r'\[H\]', '', smiles)
-    # Remove all 'H' except when part of '[Hg]'
-    smiles_no_Hs = re.sub(r'H(?!g\])', '', smiles_no_Hs)
-    # Is there exactly one standalone character inside brackets? (i.e. the result of H 
-    # stripping for [nH], [OH], etc.). If so, remove the brackets. (e.g. [n] -> n) 
-    smiles_no_Hs = re.sub(r'\[([^\[\]])\]', r'\1', smiles_no_Hs)
-
-    return mol, smiles_no_Hs
-
 def record_frag(substruct, frag_dict, smiles, lig_resname):
 
     '''
@@ -218,11 +185,6 @@ def record_frag(substruct, frag_dict, smiles, lig_resname):
 
     elements = "".join(sorted([a.GetSymbol() for a in substruct.GetAtoms() if 
                                a.GetSymbol() != 'H'])) # b/c rdkit will add implicit H's
-    
-    # Skip if the elements are all carbons
-    num_carbons = len([i for i in elements if i == 'C' or i == 'c'])
-    if len(elements) == num_carbons:
-        return frag_dict
 
     # Determine whether to add fragment to the dict
     if elements not in frag_dict.keys(): # automatically a new entry 
@@ -241,6 +203,8 @@ def record_frag(substruct, frag_dict, smiles, lig_resname):
         for existing_smiles in frag_dict[elements].keys():
             try:
                 existing_sub_mol = Chem.MolFromSmarts(existing_smiles) # treat as smarts
+                # The smiles are equivalent only if they are both substructs of each other, 
+                # b/c rdkit is often wrong. 
                 if existing_sub_mol.HasSubstructMatch(substruct) and \
                     substruct.HasSubstructMatch(existing_sub_mol): # then it's a duplicate, 
                                                            # but still add bc diff lig name
@@ -260,7 +224,8 @@ def record_frag(substruct, frag_dict, smiles, lig_resname):
     return frag_dict
 
 def undesired_elements(smiles): 
-    if re.search(r'(Be|Pt|Ru|Ir|Fe|Zn|Mg|Cu|Sn|Zr|Pb|Ga|Hg|Pd|Si|Mo|W|Se|Mn|Ti|Y|V|Ni|Rh|Te|Au|Ag|Co|Sb|Tb|Re|As|Cd|Hf|Lu|Na|Ca|Os|Cr|In|Al|Pr|se|U)', smiles):
+    if re.search(r'(Be|Pt|Ru|Ir|Fe|Zn|Mg|Cu|Sn|Zr|Pb|Ga|Hg|Pd|Si|Mo|W|Se|Mn|Ti|Y|V|Ni|Rh|Te|Au|Ag|Co|Sb|Tb|Re|As|Cd|Hf|Lu|Na|Ca|Os|Cr|In|Al|Pr|se|U|K)', smiles):
+    #if re.search(r'(Be|Pt|Ru|Ir|Fe|Zn|Mg|Cu|Sn|Zr|Pb|Ga|Hg|Pd|Si|Mo|W|Se|Mn|Ti|Y|V|Ni|Rh|Te|Au|Ag|Co|Sb|Tb|Re|As|Cd|Hf|Lu|Na|Ca|Os|Cr|In|Al|Pr|se|U|K)', smiles):
         return True
     if re.search(r'B(?!r)', smiles): # bypass if it's Br, but return as undesired if it's B w/o r
         return True

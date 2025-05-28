@@ -55,3 +55,35 @@ def valid_database_subdir_format(input_dir):
     # No valid subdir was found
     error_message()
     return False
+
+vdw_radii = {'C': 1.70, 'N': 1.55, 'O': 1.52, 'F': 1.47, 'P': 1.80, 'S': 1.80, 'Cl': 1.75, 
+            'Br': 1.85,'I': 1.98,}
+
+def min_clash_dist(elem1, elem2, hbond_tol=0.6, general_tol=0.4):
+    # Params: tolerance (Å) for decreasing the minimum allowable distance for atoms 
+    # that may participate in hbonds (hbond_tol) or non-hbond interactions (general_tol).
+    # Returns the minimum distance at which atoms are considered to clash.
+
+    can_hbond = {frozenset(['N', 'O']), frozenset(['O', 'O']), frozenset(['N', 'N'])}
+
+    if elem1 not in vdw_radii:
+        print('Undefined vdw radius for elemen:', elem1)
+        vdw1 = max(vdw_radii.values())
+    else:
+        vdw1 = vdw_radii[elem1]
+
+    if elem2 not in vdw_radii:
+        print('Undefined vdw radius for element:', elem2)
+        vdw2 = max(vdw_radii.values())
+    else:
+        vdw2 = vdw_radii[elem2]
+
+    min_dist = vdw1 + vdw2
+
+    # Apply tolerance
+    if frozenset([elem1, elem2]) in can_hbond:
+        min_dist -= hbond_tol 
+    else:
+        min_dist -= general_tol 
+
+    return min_dist
