@@ -20,4 +20,6 @@ python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py -s "CNCCO" -c "CNCCO"
 
 date # end time
 
+qstat -j $JOB_ID
+
 echo "DONE"

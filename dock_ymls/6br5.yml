@@ -13,7 +13,9 @@ out_dir: output_6br5
 # Path to the PDB to dock
 input_pdb: /wynton/home/degradolab/skt/docking/query_structs/6br5.pdb
 
-frags_to_dock: ['N=C(N)N', 'CNC(C)=O', 'CNC(=N)N', 'CS(=O)(=O)O', 'CC(O)S']
+frags_to_dock: ['N=C(N)N', 'CNC(=N)N', 'CC(N)=O', 'CS(=O)(=O)O', 'CC(O)S']
+
+ligname: 'GYG'
 
 # Binding site residues of the query structure to dock chemical groups onto.
 # Each residue should be classified by its [PDB segment, chain, residue number].

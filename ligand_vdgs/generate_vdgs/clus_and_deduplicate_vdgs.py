@@ -274,19 +274,33 @@ def copy_nr_to_outdir(vdglib_dir, nr_dir, reordered_AAs):
          for pdb in os.listdir(flankseqandbbclusdir):
             if 'centroid' not in pdb: 
                continue
-            else:
-               # copy the centroid to the output dir
-               biounit = '_'.join(pdb.split('_')[1:6]).removesuffix('.pdb.gz')
-               vdmscrr_list = pdb.split('_')[6:-3]
-               # remove resnames for conciseness
-               vdmscrr_list = [vdmscrr_list[i] for i in range(len(vdmscrr_list)) 
-                               if (i + 1) % 4 != 0] 
-               vdmscrr_str = '_'.join(vdmscrr_list)
-               newname = f'{biounit}_{vdmscrr_str}.pdb.gz'
-               newpath = os.path.join(nr_dir, newname)
-               assert not os.path.exists(newpath)
+            # copy the centroid to the output dir
+            biounit = '_'.join(pdb.split('_')[1:6]).replace('.pdb.gz', '')
+            vdmscrr_list = pdb.split('_')[6:-3]
+            # remove resnames for conciseness
+            vdmscrr_list = [vdmscrr_list[i] for i in range(len(vdmscrr_list)) 
+                            if (i + 1) % 4 != 0] 
+            vdmscrr_str = '_'.join(vdmscrr_list)
+            newname = f'{biounit}_{vdmscrr_str}.pdb.gz'
+            newpath = os.path.join(nr_dir, newname)
+            assert not os.path.exists(newpath)
+            # attempt to copy it to the newpath, but sge sometimes gives a 
+            # communication send error when there's lag, so allow 100 attempts
+            try:
                shutil.copy(os.path.join(flankseqandbbclusdir, pdb), newpath) 
-               break 
+            except: # retry
+               for attempt in range(100):
+                   try:
+                       shutil.copy(os.path.join(flankseqandbbclusdir, pdb), newpath) 
+                       break
+                   except Exception as e:  
+                       if attempt < 99:
+                           time.sleep(100)  # Wait before retrying
+                       else:
+                           print(f"clus_and_deduplicate failed to access "
+                                 f"{os.path.join(flankseqandbbclusdir, pdb)}: {e}")
+
+            break # identified the centroid, so break out of loop
 
 def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs, 
       symmetry_classes, vdglib_dir, align_cg_weight, num_flanking, num_threads,  

@@ -119,14 +119,14 @@ def main():
                     rmsd = pr.calcRMSD(moved_coords, input_bsr_bb_coords)
                     if rmsd > cutoff: 
                         continue
+
                     aligned_vdg_obj = pr.applyTransformation(transf, vdg_prody_obj)
                     # Check for clashes w/ protein backbone
                     assert len(set(aligned_vdg_obj.hetatm.getResindices())) == 1 # make sure 
                                                                     # selecting only 1 lig
                     # If there are atoms within 3.5A, they may be suspicious, so check them
-                    neighbs = pr.findNeighbors(aligned_vdg_obj.hetatm.select(
-                        '(not element H) and (not ion) and (not water)'), 3.5, 
-                        input_pdb.select('name N CA C O and not element CA')) 
+                    neighbs = pr.findNeighbors(aligned_vdg_obj.select('occupancy > 2.9'),
+                        3.5, input_pdb.select('name N CA C O and not element CA')) 
                     found_clash = False
                     for n in neighbs:
                         elem1, elem2, dist = n[0].getElement(), n[1].getElement(), n[2]
@@ -143,7 +143,6 @@ def main():
                     if not os.path.exists(os.path.join(out_dir, frag)):
                         os.makedirs(os.path.join(out_dir, frag))
                     pr.writePDB(label, aligned_vdg_obj)
-    print('counts:', len(os.listdir(out_dir)))
     print('DONE')
 
 def get_atom_coords(prody_obj, atom_name):

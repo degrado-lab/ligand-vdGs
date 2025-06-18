@@ -7,7 +7,7 @@
 #$ -j y                #-- tells system STDERR and STDOUT should be joined
 #$ -l h_rt=300:00:00   #-- runtime limit - max 2 weeks == 336 hours
 #$ -R yes              #-- SGE host reservation
-#$ -l mem_free=15G
+#$ -l mem_free=1G
 #$ -pe smp 10          #-- Request 10 slots in the SMP parallel environment
             
 date # start time
@@ -19,5 +19,7 @@ conda activate vdgs
 python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py -s "C=C(C)CO" -c "C=C(C)CO" -p /wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2/ -b /wynton/group/degradolab/skt/docking/databases/probe_output/ -o /wynton/group/degradolab/skt/docking/databases/frag_vdg_lib/ -m 1000 --symmetry-classes 0 1 0 2 3
 
 date # end time
+
+qstat -j $JOB_ID
 
 echo "DONE"
