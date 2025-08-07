@@ -9,6 +9,7 @@ Usage:
 
 import sys
 import os
+import yaml
 import numpy as np
 import prody as pr
 from rdkit import Chem
@@ -18,150 +19,310 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'functions'))
 import match_vdgs as match
 import utils
 import Frags
+import dock
 import tempfile
+from itertools import product
 
 # TODO: DETECT AROMATICITY INSTEAD OF SUPPLYING LIG SMILES
 
-rmsd_threshold = 0.7
-query_pdbs_dir = '/wynton/home/degradolab/skt/docking/query_structs/4eyr_preds/'
-lig_smiles = 'CC(C)c1nc(cs1)CN(C)C(=O)N[C@@H](C(C)C)C(=O)N[C@@H](Cc2ccccc2)C[C@@H]([C@H](Cc3ccccc3)NC(=O)OCc4cncs4)O'
-pdbs_to_exclude = ['4eyr_10.pdb']
-vdg_lib_dir = '/wynton/group/degradolab/skt/docking/databases/frag_vdg_lib'
+with open(sys.argv[1], 'r') as f:
+    config = yaml.safe_load(f)
+
+# Config variables
+rmsd_threshold = config['rmsd_threshold']
+query_pdbs_dir = config['query_pdbs_dir']
+solved_struct_path = config['solved_struct_path']
+lig_smiles = config['lig_smiles']
+vdg_lib_dir = config['vdg_lib_dir']
+outdir = config['outdir']
+query_lig_res = config['query_lig_res']  # (segment, chain, resnum
+frags_to_exclude = config['frags_to_exclude']  # list of SM
+
+
+def get_bsr_combinations(solved_struct, ligname):
+    bindingsite_residues = dock.get_bindingsite_residues(solved_struct,
+        [], ligname, dist_from_lig=4.5, CA_only=False)
+    bsr_combos = dock.get_vdg_subsets(bindingsite_residues)
+    all_bsr_combos = []
+    for bsr_combo in bsr_combos:
+        bsr_AA_identities = []
+        input_bsr_bb_coords = []
+        if len(bsr_combo) != 2:
+            continue
+        for bsr in bsr_combo: 
+            bsr_seg, bsr_chain, bsr_resnum = bsr
+            res_obj = dock.select_residue(solved_struct, bsr_seg, bsr_chain, bsr_resnum)
+            res_bb_coords = []
+            for atom_name in ['N', 'CA', 'C']:
+                res_bb_coords.append(dock.get_atom_coords(res_obj, atom_name))
+            input_bsr_bb_coords.append(res_bb_coords)
+            AA = dock.get_res_AA_identity(res_obj)
+            bsr_AA_identities.append(AA)
+        bsr_AA_identities = [AA if AA != 'GLY' else 'bb' for AA in bsr_AA_identities]
+        # All of the AAs have potential to provide bb contacts, so sample "bb" vdms
+        options = [(x,) if x == 'bb' else (x, 'bb') for x in bsr_AA_identities]
+        combo_variants = list(product(*options))
+        for c in combo_variants:
+            if c not in all_bsr_combos:
+                all_bsr_combos.append((c, input_bsr_bb_coords.copy())) 
+    return all_bsr_combos
+
+def get_frags_from_pdbfile(query_pdbs_dir, pdbfile):
+    query_struct = pr.parsePDB(os.path.join(query_pdbs_dir, pdbfile))
+    # Identify ligand and fragment it
+    hetatms = query_struct.hetatm
+    assert len(set(hetatms.getResindices())) == 1
+    # Convert from prody obj to rdkit Mol obj
+    with tempfile.NamedTemporaryFile(suffix=".pdb", delete=False) as tmp_pdb:
+        pr.writePDB(tmp_pdb.name, hetatms)
+    
+    pdb_mol = Chem.MolFromPDBFile(tmp_pdb.name, removeHs=True)
+    lig_template = Chem.MolFromSmiles(lig_smiles) 
+    # Assign bond orders (b/c rdkit doesn't calculate this from PDB coords) to detect 
+    # correct valence and aromaticity 
+    try:
+        pdb_mol_assigned_bonds = AllChem.AssignBondOrdersFromTemplate(lig_template, pdb_mol)
+        pdb_mol_assigned_bonds_no_H, pdb_mol_smiles_no_H = Frags.manually_remove_Hs(pdb_mol_assigned_bonds, 
+                                                                                    pdb_mol_assigned_bonds)
+        filtered_frags = Frags.get_fragments(2, pdb_mol_assigned_bonds_no_H, 4, 5)
+        return filtered_frags, pdb_mol_assigned_bonds_no_H, query_struct
+    except ValueError as e:
+        print(f"Error processing {pdbfile}: {e}")
+        return [], None, query_struct
+
+def get_query_cg_coords(mol, sub):
+    query_matches = mol.GetSubstructMatches(sub, uniquify=False) # tuple of atom inds
+    q_cg_coord_perms = [] # each element is a permutation
+    for query_match in query_matches: # each permutation
+        perm_coords = []
+        # Get atom names, etc.
+        conf = mol.GetConformer()  # Get the 3D conformer to get coords 
+        assert len(query_match) == sub.GetNumAtoms()
+        
+        for atom_idx in query_match:
+            atom = mol.GetAtomWithIdx(atom_idx)
+            #print(atom.GetSymbol())
+            pos = conf.GetAtomPosition(atom_idx)  # returns an RDKit Point3D object
+            info = atom.GetPDBResidueInfo()
+            xyz = (pos.x, pos.y, pos.z)
+            perm_coords.append(xyz)
+        q_cg_coord_perms.append(np.array(perm_coords))
+    return q_cg_coord_perms
+
+def make_outdir(pdbfile, output_dir):
+    # Name the outdir for this pdb query
+    pdbname = pdbfile.removesuffix('.pdb')
+    pdb_id = pdbname[:4]
+    output_dir = os.path.join(outdir, pdb_id, pdbname)
+    return output_dir
+
+def smiles_equiv(existingfrag, sub_smiles):
+    mol1 = Chem.MolFromSmarts(existingfrag)
+    mol2 = Chem.MolFromSmarts(sub_smiles)
+    is_equivalent = (mol1.HasSubstructMatch(mol2) and 
+                 mol2.HasSubstructMatch(mol1) and 
+                 mol1.GetNumAtoms() == mol2.GetNumAtoms())
+    return is_equivalent
 
 def main():
     
-    # Load pdbs
-    query_pdbs = []
+    # Load ground truth structure
+    solved_struct = pr.parsePDB(solved_struct_path)
 
-    for pdbfile in os.listdir(query_pdbs_dir):
-        if pdbfile in pdbs_to_exclude:
-            continue
-        par = pr.parsePDB(os.path.join(query_pdbs_dir, pdbfile))
-        # Identify ligand and fragment it
-        hetatms = par.hetatm
-        assert len(set(hetatms.getResindices())) == 1
-        # Convert from prody obj to rdkit Mol obj
-        with tempfile.NamedTemporaryFile(suffix=".pdb", delete=False) as tmp_pdb:
-            pr.writePDB(tmp_pdb.name, hetatms)
-        pdb_mol = Chem.MolFromPDBFile(tmp_pdb.name, removeHs=True)
-        lig_template = Chem.MolFromSmiles(lig_smiles) 
-        # Assign bond orders (b/c rdkit doesn't calculate this from PDB corods) to detect 
-        # correct valence and aromaticity 
-        lig_template, template_smiles = Frags.manually_remove_Hs(lig_template)
-        pdb_mol, _ = Frags.manually_remove_Hs(pdb_mol)
-        mol = AllChem.AssignBondOrdersFromTemplate(lig_template, pdb_mol)
-        filtered_frags = Frags.get_fragments(2, mol, 4, 5)
-        for (sub, sub_smiles) in filtered_frags:
-            print(sub_smiles)
+    # Get binding site residues from the solved structure
+    ligname = set(solved_struct.hetatm.getResnames())
+    assert len(ligname) == 1
+    ligname = list(ligname)[0]
 
-
-
-
-
-
-
+    # Gather all binding site residue combinations
+    all_bsr_combos = get_bsr_combinations(solved_struct, ligname)
+    # For each prediction, get the frags and CG coords in the pred, iterate through 
+    # binding site res combos, align, and determine if there are vdg matches. 
     
- 
+    # Keep track of which frags are in vdg lib and which aren't
+    frags_in_lib = {}
     
-    # Set up output dir
-    pdbname = query_path.split('/')[-1].removesuffix('.pdb')
-    output_dir = os.path.join(out_dir, yml_file.removesuffix('.yml').split('/')[-1])
-    utils.handle_existing_files(output_dir)
-    os.makedirs(output_dir, exist_ok=True)
+    # Load predictions
+    for pdbfile in sorted(os.listdir(query_pdbs_dir)):
+        print('\n' + '='*10, pdbfile, '='*10)
+        output_dir = make_outdir(pdbfile, outdir)
 
-    # Get the coords of the query structure's ligand chemical group. Permute any
-    # symmetrically equivalent atoms.
-    query_struct = pr.parsePDB(query_path)
-    q_lig_seg, q_lig_ch, q_lig_resnum = query_lig_res
-    q_cg_coords = match.get_coords(query_struct, query_cg_atoms, q_lig_seg, q_lig_ch, 
-                                   q_lig_resnum, query_path)
-    q_cg_name_perms, q_cg_coord_perms = match.permute_cg_coords(q_cg_coords, query_cg_atoms, 
-                                                                symm_query_cg_atoms)
-     
-    # Iterate over the query structure's binding site residues and superpose vdGs 
-    # (incl. the CG) onto it, keeping track of the vdGs that have low rmsd to the 
-    # known bb+CG.
-    query_bb_coords = {}
-    for bsr in bindingsite_residues:
-        bsr_seg, bsr_chain, bsr_resnum = bsr
-        bbcoords = match.get_coords(query_struct, ['N', 'CA', 'C'], bsr_seg, 
-            bsr_chain, bsr_resnum, query_path)
-        query_bb_coords[tuple(bsr)] = bbcoords
-    
-    # Get subsets of vdg residues in query struct.
-    query_res_sets = match.subsets_of_query_residues(bindingsite_residues)
-    print('query_res_sets', query_res_sets)
-    # Iterate over subsets of binding site residues and determine
-    # whether any of the vdGs in the database match the "ground truth" binding 
-    # site residues and CG positions of the query structure.
-    for q_res_set in query_res_sets:
+        # Get all fragments. For every frag, iterate over the bsr combos and determine 
+        # vdg matches.
+        orig_filtered_frags, pdb_mol_reassigned, query_struct = get_frags_from_pdbfile(
+            query_pdbs_dir, pdbfile)
+        # Remove duplicates of filtered_frags 
+        deduplicated_filtered_frags = []
+        for (sub, sub_smiles) in orig_filtered_frags:
+            # If sub_smiles already exists, then skip
+            if sub_smiles in [i[1] for i in deduplicated_filtered_frags]:
+                continue
+            # Even if not, it may be represented with a diff smiles str
+            degenerate = False
+            for _s in [i[1] for i in deduplicated_filtered_frags]:
+                if smiles_equiv(_s, sub_smiles):
+                    degenerate = True
+                    break
+            if degenerate:
+                continue
+            # Otherwise, add it to deduplicated_filtered_frags
+            if sub_smiles not in [i[1] for i in deduplicated_filtered_frags]:
+                deduplicated_filtered_frags.append((sub, sub_smiles))
+            # Determine if this frag is in vdg lib
+            if sub_smiles in frags_to_exclude: # Exclude specified frags 
+                continue
+            _degenerate = False
+            for _f in frags_to_exclude:
+                if smiles_equiv(_f, sub_smiles):
+                    degenerate = True
+                    break
+            if _degenerate:
+                continue
+            # Check if the sub_smiles is in the vdg lib
+            if sub_smiles not in frags_in_lib.keys():
+                if sub_smiles in os.listdir(vdg_lib_dir):
+                    frags_in_lib[sub_smiles] = True
+                else: 
+                    # If the str isn't in os.listdir(), it's still possible that a 
+                    # degernate smiles is in vdg_lib_dir
+                    for existingfrag in os.listdir(vdg_lib_dir):
+                        # Is it equivalent to sub_smiles?
+                        is_equivalent = smiles_equiv(existingfrag, sub_smiles)
+                        if is_equivalent:
+                            frags_in_lib[sub_smiles] = True
+                            break
+                    else:
+                        frags_in_lib[sub_smiles] = False
+        # Iterate over frags that are in the vdg lib
+        for sub, sub_smiles in deduplicated_filtered_frags:
+            if sub_smiles not in frags_in_lib.keys():
+                # Meaning: not being searched for (possibly being excluded in yml file)
+                continue
+            if not frags_in_lib[sub_smiles]:
+                # Meaning: not in vdg lib
+                continue
+            print('Searching for', sub_smiles)
+            # Get the query CG coords for this substructure in the query struct. Should 
+            # return all instances and permutations.
+            # get the atom indices for the sub molecule
 
-        # Determine the AA resnames of the subset of query vdms.
-        query_vdm_resnames = []
-        for q_res in q_res_set:
-            bsr_seg, bsr_chain, bsr_resnum = q_res
-            q_res_obj = match.get_residue_obj(query_struct, bsr_seg, bsr_chain, 
-                                              bsr_resnum, query_path)
-            query_vdm_resnames.append(q_res_obj.getResnames()[0])
-        
-        # Retrieve database vdGs
-        _vdgs_dir, out_subdir = match.get_in_dir_and_out_dir(q_res_set, vdgs_dir)
-        database_vdg_paths, database_vdgs = match.get_database_vdgs_for_spec_AAs(
-            _vdgs_dir, query_vdm_resnames)
-
-
-        # Calc rmsd on subsets of bb residues (incl. CG) on CG atom permutations. 
-        q_bbcoords_list = [query_bb_coords[tuple(r)] for r in q_res_set]
-        q_flattened_bb_list = [item for sub in q_bbcoords_list for item in sub]
-        # Iterate over the database vdGs.
-        for database_vdg_index, database_vdg in enumerate(database_vdgs):
-            db_vdg_path = database_vdg_paths[database_vdg_index]
-            db_cg_coords = match.get_database_cg_coords(database_vdg)
-            # Iterate over the query CG permutations and try to match them to the 
-            # database vdGs.
-            for q_cg_coord_perm in q_cg_coord_perms:
-                q_bb_and_cg = np.array(q_flattened_bb_list + q_cg_coord_perm)
-                if len(db_cg_coords) != len(q_cg_coord_perm) : 
-                    raise ValueError(
-                        'The query CG must have the same num. of atoms as the database CG.')
-
-                # Get vdm bb coordinates if they're the same AA identity as the binding site 
-                # residues being queried. Make sure all valid AA permutations are sampled.
-                all_AA_perms_db_vdm_bb_coords_and_resinds = match.get_database_vdm_bb_coords(
-                    database_vdg, query_vdm_resnames, db_vdg_path)
-                if all_AA_perms_db_vdm_bb_coords_and_resinds is None:
+            q_cg_coord_perms = get_query_cg_coords(pdb_mol_reassigned, sub)
+            # Iterate over the query structure's binding site residues and superpose vdGs 
+            # (incl. the CG) onto it, keeping track of the vdGs that have low rmsd to the 
+            # known bb+CG.
+            for combo, coords in all_bsr_combos:
+                # Retain PAIRS ONLY
+                if len(combo) != 2:
                     continue
-                
-                # Iterate over the vdM permutations and superpose/calc RMSD against the
-                # known structure (incl. CG).
-                for perm_resinds, AA_perm_db_vdm_bb_coords in \
-                                    all_AA_perms_db_vdm_bb_coords_and_resinds.items():
-                    db_vdg_bb_and_cg = np.array(AA_perm_db_vdm_bb_coords + db_cg_coords)
+                bsr_incl_bb_identities = combo
+                input_bsr_bb_coords = coords
+                # Reorder the bb coords and bsr_AA_identities in alphabetic order
+                paired = list(zip(bsr_incl_bb_identities, input_bsr_bb_coords))
+                paired_sorted = sorted(paired, key=lambda pair: pair[0])
+                # Unzip them back
+                bsr_incl_bb_identities, input_bsr_bb_coords = zip(*paired_sorted)
+                bsr_incl_bb_identities = '_'.join(sorted(bsr_incl_bb_identities))
+                input_bsr_bb_coords = np.array(input_bsr_bb_coords)
+                # Flatten input_bsr_bb_coords
+                input_bsr_bb_coords = input_bsr_bb_coords.reshape(-1, 3)
+                # Dock fragments by aligning vdg backbones to bsr backbones
+                vdgs_path = os.path.join(vdg_lib_dir, sub_smiles, 'nr_vdgs', str(
+                    len(bsr_incl_bb_identities.split('_'))), bsr_incl_bb_identities)
+                if not os.path.exists(vdgs_path):
+                    continue
+                vdg_paths = os.listdir(vdgs_path)
+                # Iterate over each vdg
+                for vdg_path in vdg_paths:
+                    vdg_full_path = os.path.join(vdgs_path, vdg_path)
+                    try:
+                        vdg_prody_obj = pr.parsePDB(vdg_full_path)
+                    except Exception as e:
+                        print(f"WARNING: could not parse, {vdg_full_path}")
+                        continue
+                    # Superpose the vdg backbone atoms onto the input structure.
+                    # Make sure order of query vdg AAs is consistent with order of input_pdb AAs
+                    resind_perms = dock.map_aa_identities_to_vdg_resinds(
+                        [vdg_prody_obj.select(f'resindex {_r}').getResnames()[0] 
+                            for _r in sorted(set(vdg_prody_obj.getResindices()))], 
+                        bsr_incl_bb_identities.split('_'), )
                     
-                    moved_db_vdg_bb_cg_coords, transf = pr.superpose(db_vdg_bb_and_cg, 
-                                                                     q_bb_and_cg)
-                    rmsd = round(pr.calcRMSD(moved_db_vdg_bb_cg_coords, q_bb_and_cg), 2)
-                    if rmsd < rmsd_threshold:
-                        moved_vdg = pr.applyTransformation(transf, database_vdg.copy())
-
-                        # Write out just the vdms in this AA permutation
-                        AA_perm_resinds_str = ' '.join([str(i) for i in perm_resinds])
-                        AA_perm_resinds_sele = f'resindex {AA_perm_resinds_str}'
-                        moved_vdg_AA_perm_resinds_obj = moved_vdg.copy().select(
-                            f'({AA_perm_resinds_sele}) or (occupancy > 2.8)') # occ 3 = CG
-                        vdg_pdbname = db_vdg_path.rstrip('/').split('/')[-1].removesuffix('.pdb')
-                        output_vdg_name = f'{vdg_pdbname}'
-                        for residue in q_res_set:
-                            bsr_flat_list = [str(it) for it in residue]
-                            bsr_str = '_'.join(bsr_flat_list)
-                            output_vdg_name += f'_{bsr_str}'
+                    # Iterate over each resind permutation, get bb coords, and superpose onto 
+                    # the query structure (input structure). Multiple resind perms or cg atom 
+                    # perms could have rmsd < threshold, so keep track of minimum rmsd 
+                    best_rmsd, best_resind_perm, best_transf = [None, None, None]
+                    for resind_perm in resind_perms:
+                        vdg_perm_bb_coords = []
+                        for _r in resind_perm:
+                            for atom_name in ['N', 'CA', 'C']: 
+                                _coords = dock.get_atom_coords(vdg_prody_obj.select(
+                                    f'resindex {_r}'), atom_name)
+                                vdg_perm_bb_coords.append(_coords)
+                        vdg_perm_bb_coords = np.array(vdg_perm_bb_coords)
+                        # Superpose the database vdg bb + cg atoms onto the input structure 
+                        # and calculate rmsd.
+                        # --- First, get combined bb+cg coords for db vdg
+                        vdg_db_cg_coords = np.array(match.get_database_cg_coords(vdg_prody_obj))
+                        try:
+                            db_bb_and_cg_coords = np.concatenate((vdg_perm_bb_coords, vdg_db_cg_coords), 
+                                                             axis=0)
+                        except:
+                            continue
+                        # --- Then, superpose and calc rmsd for all query CG permutations
+                        for q_cg_coord_perm in q_cg_coord_perms:
+                            q_bb_and_cg = np.concatenate((input_bsr_bb_coords, q_cg_coord_perm), 
+                                                         axis=0)
+                            if db_bb_and_cg_coords.shape != q_bb_and_cg.shape:
+                                raise ValueError(
+                                    'The query CG must have the same num. of atoms as the database CG.')
+                            moved_db_vdg_bb_and_cg_coords, db_transf = pr.superpose(
+                                db_bb_and_cg_coords, q_bb_and_cg)
+                            db_to_query_rmsd = round(pr.calcRMSD(moved_db_vdg_bb_and_cg_coords, 
+                                                           q_bb_and_cg), 2)
+                            if db_to_query_rmsd > rmsd_threshold:
+                                continue
+                            # If this is the best rmsd so far, keep track of it
+                            if best_rmsd is None or db_to_query_rmsd < best_rmsd:
+                                best_rmsd = db_to_query_rmsd
+                                best_resind_perm = resind_perm
+                                #best_q_cg_coord_perm = q_cg_coord_perm
+                                best_transf = db_transf
+                    # If we found a best rmsd, write out the vdg with the best rmsd
+                    if best_rmsd is not None:
+                        resind_perm = best_resind_perm
+                        #q_cg_coord_perm = best_q_cg_coord_perm
+                        db_transf = best_transf
+                        db_to_query_rmsd = best_rmsd
+                        # Determine output name
+                        bsr_perm_str = ''
+                        for _resix in resind_perm: 
+                            resix_sel = vdg_prody_obj.select(f'resindex {_resix}')
+                            resname = resix_sel.getResnames()[0]
+                            reschain = resix_sel.getChids()[0]
+                            resnum = resix_sel.getResnums()[0]
+                            resseg = resix_sel.getSegnames()[0]
+                            bsr_perm_str += f'_{resname}_{resseg}_{reschain}_{resnum}'
+                        # Output vdg name 
+                        out_subdir = f'{sub_smiles}{bsr_perm_str}'
                         subdir_path = os.path.join(output_dir, out_subdir)
-                        output_vdg_path = os.path.join(output_dir, out_subdir, output_vdg_name+'.pdb')
+                        os.makedirs(subdir_path, exist_ok=True)
                         if not os.path.exists(subdir_path):
                             os.makedirs(subdir_path)
-                        pr.writePDB(output_vdg_path, 
-                                    moved_vdg_AA_perm_resinds_obj.copy().select(
-                                        'occupancy > 1.5'))
+                        output_vdg_name = f'{sub_smiles}_' + vdg_path.rstrip('/').split(
+                            '/')[-1].removesuffix('.pdb.gz') + f'_{db_to_query_rmsd}'
+                        output_vdg_path = os.path.join(subdir_path, output_vdg_name+'.pdb')
+                        # check if a file in output_vdg_path already exists
+                        if os.path.exists(output_vdg_path):
+                            print('WARNING: overwriting existing file', output_vdg_path)
+                        pr.writePDB(output_vdg_path, pr.applyTransformation(db_transf, 
+                            vdg_prody_obj.copy()))
+
+    print('\nFragment SMILES found in the vdg lib:', 
+                [smiles for smiles, in_lib in frags_in_lib.items() if in_lib])
+    print('\nFragment SMILES not found in the vdg lib:', 
+          [smiles for smiles, in_lib in frags_in_lib.items() if not in_lib])
+    return
+
+    
 
 
 if __name__ == "__main__":

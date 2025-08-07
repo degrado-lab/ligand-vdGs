@@ -14,7 +14,7 @@ def get_fragments(bond_radius, mol, min_frag_size=4, max_frag_size=7):
     # Update frag_dict by adding the new fragments; skip if all-carbon
     for orig_sub in substructs: # contains H's that need to be scrubbed.
         # will have duplicates b/c we didn't check for duplicates yet.
-        sub, sub_smiles = manually_remove_Hs(orig_sub) 
+        sub, sub_smiles = manually_remove_Hs(orig_sub, mol) 
         # apply size threshold.
         frag_size = len([i for i in sub.GetAtoms() if i.GetSymbol() != 'H'])
         if frag_size < min_frag_size or frag_size > max_frag_size:
@@ -29,21 +29,35 @@ def get_fragments(bond_radius, mol, min_frag_size=4, max_frag_size=7):
 
     return filtered_frags
 
-def manually_remove_Hs(orig_mol):
+def manually_remove_Hs(orig_substruct, orig_full_moll):
     # Remove hydrogens. Docs say that Chem.RemoveHs() implicit and explicit are removed, 
     # but this isn't true for [nH], [OH], [Ho], etc. so need to manually remove H's. 
-    mol = Chem.RemoveHs(orig_mol, sanitize=False)
     # Convert back to SMILES, without showing explicit hydrogens
-    smiles = Chem.MolToSmiles(mol, allHsExplicit=False, isomericSmiles=False) # still has H's
+    smiles_w_H = Chem.MolToSmiles(orig_substruct, allHsExplicit=False, 
+                              isomericSmiles=False) # still has H's though unfortunately
+    
     # Remove standalone [H] completely
-    smiles_no_Hs = re.sub(r'\[H\]', '', smiles)
+    smiles_no_Hs = re.sub(r'\[H\]', '', smiles_w_H)
     # Remove all 'H' except when part of '[Hg]'
     smiles_no_Hs = re.sub(r'H(?!g\])', '', smiles_no_Hs)
     # Is there exactly one standalone character inside brackets? (i.e. the result of H 
     # stripping for [nH], [OH], etc.). If so, remove the brackets. (e.g. [n] -> n) 
     smiles_no_Hs = re.sub(r'\[([^\[\]])\]', r'\1', smiles_no_Hs)
-
-    return mol, smiles_no_Hs
+    
+    # Complication: after converting the Mol obj to smiles, the Mol obj won't have the same 
+    # atom order as the original Mol obj, which is important when extract CG coords. 
+    # We need to rearrange the atom order of orig_substruct by getting the atom indices in 
+    # the orig full molecule.
+    # -- Parse the SMILES back into a new molecule
+    mol_from_smarts = Chem.MolFromSmarts(smiles_no_Hs)
+    # -- Map original atoms to new atom order using substructure matching
+    matches_to_map_to_sub = orig_substruct.GetSubstructMatches(mol_from_smarts, 
+        uniquify=False) # returns all permutations of order of atom inds
+    # -- Reorder atoms in the original mol. matches_to_map_to_sub is a list of perms, so 
+    #    we just need to use the first one
+    renumbered_substruct = Chem.RenumberAtoms(orig_substruct, list(matches_to_map_to_sub[0]))
+    
+    return renumbered_substruct, smiles_no_Hs
 
 def fragment_on_bond_d(mol, radius):
     # Code from https://iwatobipen.wordpress.com/2020/08/12/get-and-draw-molecular-fragment-with-user-defined-path-rdkit-memo/
