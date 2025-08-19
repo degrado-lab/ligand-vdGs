@@ -23,8 +23,6 @@ import dock
 import tempfile
 from itertools import product
 
-# TODO: DETECT AROMATICITY INSTEAD OF SUPPLYING LIG SMILES
-
 with open(sys.argv[1], 'r') as f:
     config = yaml.safe_load(f)
 
@@ -37,6 +35,21 @@ vdg_lib_dir = config['vdg_lib_dir']
 outdir = config['outdir']
 query_lig_res = config['query_lig_res']  # (segment, chain, resnum
 frags_to_exclude = config['frags_to_exclude']  # list of SM
+frags_to_include = config['frags_to_include']  # list of SM
+query_pdbs = config.get('query_pdbs')  # value should be either 'all' 
+                                       # (i.e. all pdbs in query_pdbs_dir) or a list
+
+print('Config variables:')
+print(f"rmsd_threshold: {rmsd_threshold}")
+print(f"query_pdbs_dir: {query_pdbs_dir}")
+print(f"solved_struct_path: {solved_struct_path}")
+print(f"lig_smiles: {lig_smiles}")
+print(f"vdg_lib_dir: {vdg_lib_dir}")
+print(f"outdir: {outdir}")
+print(f"query_lig_res: {query_lig_res}")
+print(f"frags_to_exclude: {frags_to_exclude}")
+print(f"frags_to_include: {frags_to_include}")
+print(f"query_pdbs: {query_pdbs}")
 
 
 def get_bsr_combinations(solved_struct, ligname):
@@ -70,7 +83,7 @@ def get_bsr_combinations(solved_struct, ligname):
 def get_frags_from_pdbfile(query_pdbs_dir, pdbfile):
     query_struct = pr.parsePDB(os.path.join(query_pdbs_dir, pdbfile))
     # Identify ligand and fragment it
-    hetatms = query_struct.hetatm
+    hetatms = query_struct.hetatm.select('not (ion or resname SEP or resname TPO or resname MSE)')
     assert len(set(hetatms.getResindices())) == 1
     # Convert from prody obj to rdkit Mol obj
     with tempfile.NamedTemporaryFile(suffix=".pdb", delete=False) as tmp_pdb:
@@ -101,7 +114,6 @@ def get_query_cg_coords(mol, sub):
         
         for atom_idx in query_match:
             atom = mol.GetAtomWithIdx(atom_idx)
-            #print(atom.GetSymbol())
             pos = conf.GetAtomPosition(atom_idx)  # returns an RDKit Point3D object
             info = atom.GetPDBResidueInfo()
             xyz = (pos.x, pos.y, pos.z)
@@ -130,7 +142,7 @@ def main():
     solved_struct = pr.parsePDB(solved_struct_path)
 
     # Get binding site residues from the solved structure
-    ligname = set(solved_struct.hetatm.getResnames())
+    ligname = set(solved_struct.hetatm.select('not (ion or resname SEP or resname TPO or resname MSE)').getResnames())
     assert len(ligname) == 1
     ligname = list(ligname)[0]
 
@@ -141,9 +153,20 @@ def main():
     
     # Keep track of which frags are in vdg lib and which aren't
     frags_in_lib = {}
-    
+
+    # Keep track of which database vdg files could not be loaded
+    failed_vdg_files = []
+
     # Load predictions
     for pdbfile in sorted(os.listdir(query_pdbs_dir)):
+        if query_pdbs == 'all':
+            pass
+        elif isinstance(query_pdbs, list):
+            # If query_pdbs is a list, check if pdbfile is in the list
+            if pdbfile not in query_pdbs:
+                continue
+        else:
+            raise ValueError("query_pdbs must be 'all' or a list of pdb files.")
         print('\n' + '='*10, pdbfile, '='*10)
         output_dir = make_outdir(pdbfile, outdir)
 
@@ -194,7 +217,18 @@ def main():
                     else:
                         frags_in_lib[sub_smiles] = False
         # Iterate over frags that are in the vdg lib
+        print('Full list of ligand frags:')
+        print([sub_smiles for sub, sub_smiles in deduplicated_filtered_frags 
+               if sub_smiles in frags_in_lib and frags_in_lib[sub_smiles]])
         for sub, sub_smiles in deduplicated_filtered_frags:
+            if frags_to_include == 'all':
+                pass
+            elif isinstance(frags_to_include, list):
+                # If frags_to_include is a list, check if sub_smiles is in the list
+                if sub_smiles not in frags_to_include:
+                    continue
+            else:
+                raise ValueError("frags_to_include must be 'all' or a list of SMILES.")
             if sub_smiles not in frags_in_lib.keys():
                 # Meaning: not being searched for (possibly being excluded in yml file)
                 continue
@@ -237,7 +271,7 @@ def main():
                     try:
                         vdg_prody_obj = pr.parsePDB(vdg_full_path)
                     except Exception as e:
-                        print(f"WARNING: could not parse, {vdg_full_path}")
+                        failed_vdg_files.append(vdg_full_path)
                         continue
                     # Superpose the vdg backbone atoms onto the input structure.
                     # Make sure order of query vdg AAs is consistent with order of input_pdb AAs
@@ -303,11 +337,11 @@ def main():
                             bsr_perm_str += f'_{resname}_{resseg}_{reschain}_{resnum}'
                         # Output vdg name 
                         out_subdir = f'{sub_smiles}{bsr_perm_str}'
-                        subdir_path = os.path.join(output_dir, out_subdir)
+                        subdir_path = os.path.join(output_dir, sub_smiles, out_subdir)
                         os.makedirs(subdir_path, exist_ok=True)
                         if not os.path.exists(subdir_path):
                             os.makedirs(subdir_path)
-                        output_vdg_name = f'{sub_smiles}_' + vdg_path.rstrip('/').split(
+                        output_vdg_name = f'{pdbfile.removesuffix(".pdb")}_{sub_smiles}_' + vdg_path.rstrip('/').split(
                             '/')[-1].removesuffix('.pdb.gz') + f'_{db_to_query_rmsd}'
                         output_vdg_path = os.path.join(subdir_path, output_vdg_name+'.pdb')
                         # check if a file in output_vdg_path already exists
@@ -315,6 +349,10 @@ def main():
                             print('WARNING: overwriting existing file', output_vdg_path)
                         pr.writePDB(output_vdg_path, pr.applyTransformation(db_transf, 
                             vdg_prody_obj.copy()))
+
+    print('\nvdG files that could not be parsed:')
+    for failed_file in failed_vdg_files:
+        print(f" - {failed_file}")
 
     print('\nFragment SMILES found in the vdg lib:', 
                 [smiles for smiles, in_lib in frags_in_lib.items() if in_lib])
