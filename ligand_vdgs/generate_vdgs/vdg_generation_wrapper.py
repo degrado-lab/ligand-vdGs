@@ -78,7 +78,7 @@ def main():
     if os.path.exists(logfile):
         logfile = logfile + '_' + str(time.time())
     write_out_commandline_params(logfile, smarts, cg, pdb_dir, probe_dir, out_dir, 
-                                 symm_classes, logdir, max_num_to_clus)
+                                 symm_classes, logdir, max_num_to_clus, align_cg_weight)
 
     # Run smarts_to_cg.py
     if trial_run:
@@ -180,7 +180,7 @@ def run_gen_fingerprints(job_index, num_procs, fingerprints_cmd):
     subprocess.run(fingerprints_cmd, shell=True, check=True)
 
 def write_out_commandline_params(logfile, smarts, cg, pdb_dir, probe_dir, out_dir, 
-                                 symm_classes, logdir, max_num_to_clus):
+                                 symm_classes, logdir, max_num_to_clus, align_cg_weight):
     if not os.path.exists(logdir):
         os.mkdir(logdir)
     #print(f'\nLogdir: {logdir}\n')
@@ -188,6 +188,7 @@ def write_out_commandline_params(logfile, smarts, cg, pdb_dir, probe_dir, out_di
         _log.write(f'SMARTS: {smarts} \n')
         _log.write(f'CG: {cg} \n')
         _log.write(f'Symmetry classes: {symm_classes} \n')
+        _log.write(f'Weight to align CGs: {align_cg_weight} \n')
         _log.write(f'Max num vdgs to cluster: {max_num_to_clus} \n')
         _log.write(f'Parent PDB dir: {pdb_dir} \n')
         _log.write(f'Probe dir: {probe_dir} \n')

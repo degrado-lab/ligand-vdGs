@@ -14,7 +14,7 @@ date # start time
 
 hostname
 
-conda activate vdgs
+conda activate py3.10
 
 python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py -s "C=CC(=O)O" -c "C=CC(=O)O" -p /wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2/ -b /wynton/group/degradolab/skt/docking/databases/probe_output/ -o /wynton/group/degradolab/skt/docking/databases/frag_vdg_lib/ -m 1000 --symmetry-classes 0 1 2 3 3
 

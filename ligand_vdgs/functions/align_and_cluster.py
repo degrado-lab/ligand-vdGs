@@ -4,10 +4,10 @@ from itertools import permutations, combinations, product
 import numpy as np
 import multiprocessing
 import gc
-from scipy.cluster.hierarchy import linkage, fcluster
-from scipy.spatial.distance import squareform
 import prody as pr
 import time
+
+EPS = 1e-9   # strict-improvement epsilon for reassignment; tune to 1e-8 if needed
 
 def get_vdg_AA_permutations(reordered_AAs, _vdgs):
    permuted_indices = permute_AA_duplicates(reordered_AAs)
@@ -102,96 +102,155 @@ def flatten_vdg_bbs(_vdmbb):
          bbs.append(atom)
    return bbs
 
-def get_hierarchical_clusters(data_to_clus, threshold, AA_subset, size_subset, 
-   vdglib_dir):
-   '''
-   Returns dict where key = cluster number and value = indices of the list elements 
-   that belong in that cluster. This dict is not ordered by size.
-      -- `data_to_clus` describes what to cluster on; it's a zipped object of list_data, 
-         list_metrics, where list_data is either a list of coords, or a list of seqs.
-      -- dist_metrics is a list of strings, where each string can be 'flankseq', 
-         'cgvdmbb', or 'flankbb'.
-   How to use this function: 
-      -- for clustering on cgvdmbb only: 
-         get_hierarchical_clusters(zip([cgvdmbb_coords], ['cgvdmbb']))
-      -- for clustering on both flankseq and flankbb: 
-         get_hierarchical_clusters(zip([seq, flankbb_coords], ['flankseq', 'flankbb']))
-         
-   '''
-   matrices = []
-   for data, dist_metric in data_to_clus:
-      # If there's only 1 sample in `data`, then it's a singleton. Return a single cluster
-      # with only the same as its centroid. 
-      if len(data) == 1:
-         return {1: [0]}, {1: 0} 
+def get_leader_clusters(
+    data_to_clus, threshold, AA_subset, size_subset, vdglib_dir,
+    seq_weight=0.5,
+    refresh_medoid_every=64,                  # periodic refresh for big clusters
+    small_refresh_max=16,                     # robust for small clusters
+    final_exact_medoid_pass=True,             # polish small clusters cheaply
+    final_reassign_once=True                  # one refinement pass
+):
+    # ---- materialize inputs just like your hierarchical function ----
+    metrics, datasets = [], []
+    for data, metric in data_to_clus:
+        metrics.append(metric); datasets.append(data)
+    metric_to_data = {m: d for m, d in zip(metrics, datasets)}
+    n = len(datasets[0])
+    for d in datasets: assert len(d) == n
 
-      matrix = create_dist_matrix(data, dist_metric, AA_subset, size_subset, vdglib_dir)
-      if dist_metric == 'flankbb' or dist_metric == 'cgvdmbb':
-         matrices.append(matrix)
-      elif dist_metric == 'flankseq':
-         matrix = matrix / 2
-         matrices.append(matrix)
-   # Add the matrices and condense
-   if len(matrices) == 1:
-      dist_matrix = matrices[0]
-   elif len(matrices) == 2:
-      dist_matrix = matrices[0] + matrices[1]
-   condensed_dist_matrix = squareform(dist_matrix)
+    if n == 1:
+        return {1: [0]}, {1: 0}
 
-   #current, peak = tracemalloc.get_traced_memory()
-   #current_use = np.round(current / (1024 * 1024 * 1024),2)
-   #peak_use = np.round(peak / (1024 * 1024 * 1024),2)
-   #if peak_use > 10 or current_use > 10:
-   #   print(f"Current memory usage after dist matrix formation: {current_use} GB")
-   #   print(f"Peak memory usage after dist matrix formation: {peak_use} GB")
+    # ---- distance using your exact components (RMSD + seq dissim/2) ----
+    def _dist_idx_idx(i, j, early_stop=True, cap=None):
+        # cap: if provided, we early-exit once total > min(cap, threshold)
+        cutoff = threshold if cap is None else min(cap, threshold)
+        total = 0.0
 
-   Z = linkage(condensed_dist_matrix, method='complete')
-   clusters = fcluster(Z, threshold, criterion='distance')
-   cluster_assignments = {} # key = clusnum, value = indices of `coords` 
-                            # belonging to that cluster
-   for all_vdgs_index, clusnum in enumerate(clusters):
-      if clusnum not in cluster_assignments.keys():
-         cluster_assignments[clusnum] = []
-      cluster_assignments[clusnum].append(all_vdgs_index)
-   
-   # Identify and label centroids
-   centroids = {} # key = clusnum, val = index of `coords` corresponding
-              # to the centroid
-   for clusnum, indices in cluster_assignments.items():
-      cluster_data = [data[i] for i in indices]
-      cluster_dist_matrix = dist_matrix[np.ix_(indices, indices)]
-      centroid_index = np.argmin(cluster_dist_matrix.sum(axis=0))
-      centroids[clusnum] = indices[centroid_index]
-   
-   return cluster_assignments, centroids
+        if 'flankseq' in metric_to_data:
+            sim = calc_seq_similarity(metric_to_data['flankseq'][i],
+                                      metric_to_data['flankseq'][j])  # 0..100
+            total += ((100.0 - sim) / 100.0) * seq_weight
+            if early_stop and total > cutoff:
+                return total
 
-def create_dist_matrix(data, dist_metric, AA_subset, size_subset, vdglib_dir):
-   n = len(data)
-   distance_matrix = np.zeros((n, n), dtype=np.float32)
+        if 'flankbb' in metric_to_data:
+            total += _rmsd_pair(metric_to_data['flankbb'][i],
+                                metric_to_data['flankbb'][j],
+                                AA_subset, size_subset, vdglib_dir)
+            if early_stop and total > cutoff:
+                return total
 
-   if dist_metric == 'flankseq':
-      for i in range(n):
-         for j in range(i + 1, n):
-            # calc seq similarity
-            seq_sim = calc_seq_similarity(data[i], data[j])
-            value = (100 - seq_sim) / 100 # clustering is distance-based, so the 
-                                          # metric is DISsimilarity
-            distance_matrix[i][j] = value 
-            distance_matrix[j][i] = value   # Symmetric matrix
-   elif dist_metric == 'cgvdmbb' or dist_metric == 'flankbb':
-      n_atoms = len(data[0])
-      mobile, target = np.zeros((n * (n - 1) // 2, n_atoms, 3), dtype=np.float32), \
-                       np.zeros((n * (n - 1) // 2, n_atoms, 3), dtype=np.float32) 
-      triu_idxs = np.triu_indices(n, 1)
-      for k, (i, j) in enumerate(np.vstack(triu_idxs).T):
-         mobile[k] = data[i]
-         target[k] = data[j]
-      # calc rmsd
-      _, _, ssd = kabsch(mobile, target, AA_subset, size_subset, vdglib_dir)
-      rmsd = np.sqrt(ssd / n_atoms)
-      distance_matrix[np.triu_indices(n, 1)] = rmsd
-      distance_matrix += distance_matrix.T
-   return distance_matrix
+        if 'cgvdmbb' in metric_to_data:
+            total += _rmsd_pair(metric_to_data['cgvdmbb'][i],
+                                metric_to_data['cgvdmbb'][j],
+                                AA_subset, size_subset, vdglib_dir)
+            if early_stop and total > cutoff:
+                return total
+
+        return total
+
+    # ---- exact medoid (O(m^2), but m is small for small clusters) ----
+    def _exact_medoid(members):
+        if len(members) <= 2:
+            return members[0]
+        best, best_sum = members[0], float('inf')
+        for c in members:
+            s = 0.0
+            for o in members:
+                if o == c: continue
+                s += _dist_idx_idx(c, o, early_stop=False)  # <- full distance
+                if s >= best_sum:  # early break on the SUM, not on threshold
+                    break
+            if s < best_sum:
+                best_sum, best = s, c
+        return best
+
+    # ---- Leader pass ----
+    reps = [0]            # representative indices
+    members = [[0]]       # cluster memberships (lists of indices)
+
+    for i in range(1, n):
+        
+        best_j, best_d = -1, float('inf')
+        for j, r in enumerate(reps):
+            d = _dist_idx_idx(i, r, early_stop=True, cap=best_d) 
+            if d < best_d:
+                best_d, best_j = d, j
+        
+        if best_d <= threshold and best_j >= 0:
+            # assign to existing cluster
+            members[best_j].append(i)
+
+            # small-cluster refresh
+            size_now = len(members[best_j])
+            # robust for tiny clusters
+            if size_now <= small_refresh_max:
+                reps[best_j] = _exact_medoid(members[best_j])
+            # periodic refresh for big clusters
+            elif refresh_medoid_every and (size_now % refresh_medoid_every == 0):
+                reps[best_j] = _exact_medoid(members[best_j])
+            
+        else:
+            # start new cluster
+            reps.append(i)
+            members.append([i])
+
+    # ---- Final polish: exact medoid for every cluster ----
+    if final_exact_medoid_pass:
+        for j in range(len(reps)):
+            reps[j] = _exact_medoid(members[j])
+
+        if final_reassign_once:
+            # map each item -> its current cluster
+            item2clus = {}
+            for j, mem in enumerate(members):
+                for idx in mem:
+                    item2clus[idx] = j
+
+            # single reassignment step: move only if STRICTLY closer to another medoid and within threshold
+            moved_any = False
+            for i in range(n):
+                cur_j = item2clus[i]
+                d_cur = _dist_idx_idx(i, reps[cur_j], early_stop=True, cap=threshold)
+                # d_cur already computed
+                best_j, best_d = cur_j, d_cur
+                
+                # If nothing can beat ~0, skip quickly
+                if best_d <= EPS:
+                    continue
+                 
+                for j, r in enumerate(reps):
+                    if j == cur_j:
+                        continue
+                    strict_cap = min(best_d - EPS, threshold)  # if best_d==d_cur initially, this is d_cur-EPS
+                    if strict_cap <= 0.0:
+                        continue  # can't possibly beat current
+                    d = _dist_idx_idx(i, r, early_stop=True, cap=strict_cap)
+                    if d < best_d:
+                        best_d, best_j = d, j
+                
+                # Reassign only if strictly closer and within threshold
+                if best_j != cur_j and best_d <= threshold and best_d + EPS < d_cur:
+                    # move i
+                    members[cur_j].remove(i)
+                    members[best_j].append(i)
+                    item2clus[i] = best_j
+                    moved_any = True
+
+            # drop any empties and recompute medoids once more
+            if moved_any:
+                new_reps, new_members = [], []
+                for j, mem in enumerate(members):
+                    if len(mem) == 0: continue
+                    new_members.append(mem)
+                    new_reps.append(_exact_medoid(mem))
+                members, reps = new_members, new_reps
+
+    # ---- Build outputs compatible with your pipeline ----
+    clus_assignments = {cnum+1: mem for cnum, mem in enumerate(members)}
+    centroids        = {cnum+1: reps[cnum] for cnum in range(len(reps))}
+    return clus_assignments, centroids
 
 def kabsch(X, Y, AA_subset, size_subset, vdglib_dir, chunk_size=30000):
    """Rotate and translate X into Y to minimize the SSD between the two, 
@@ -228,8 +287,8 @@ def kabsch(X, Y, AA_subset, size_subset, vdglib_dir, chunk_size=30000):
       mask = np.logical_or(np.isnan(X[i*chunk_size:(i+1)*chunk_size]), 
                            np.isnan(Y[i*chunk_size:(i+1)*chunk_size]))
       N = np.sum(~mask, axis=1, keepdims=True)
-      X_nonan = np.zeros_like(X[i*chunk_size:(i+1)*chunk_size])
-      Y_nonan = np.zeros_like(Y[i*chunk_size:(i+1)*chunk_size])
+      X_nonan = np.zeros_like(X[i*chunk_size:(i+1)*chunk_size], dtype=np.float32)
+      Y_nonan = np.zeros_like(Y[i*chunk_size:(i+1)*chunk_size], dtype=np.float32)
       X_nonan[~mask], Y_nonan[~mask] = \
          X[i*chunk_size:(i+1)*chunk_size][~mask], \
          Y[i*chunk_size:(i+1)*chunk_size][~mask]
@@ -258,19 +317,17 @@ def kabsch(X, Y, AA_subset, size_subset, vdglib_dir, chunk_size=30000):
                np.concatenate(ssd_chunks)
    return R, t, ssd
 
-'''
-def get_overlapping_res_coords(list1, list2):
-    list1_overlap = []
-    list2_overlap = []
-    
-    # Loop over both lists and check if both elements at the same index are not None
-    for i in range(len(list1)):
-        if list1[i] is not None and list2[i] is not None:
-            list1_overlap.append(list1[i])
-            list2_overlap.append(list2[i])
-     
-    return np.array(list1_overlap), np.array(list2_overlap)
-'''
+def _rmsd_pair(X, Y, AA_subset, size_subset, vdglib_dir):
+    """RMSD between two coordinate arrays (N,3), using your existing Kabsch."""
+    X = np.asarray(X, dtype=np.float64)
+    Y = np.asarray(Y, dtype=np.float64)
+    if X.shape != Y.shape:
+        raise ValueError(f"RMSD pair got mismatched shapes: {X.shape} vs {Y.shape}")
+    # Reuse your vectorized Kabsch with a single pair (M=1)
+    _, _, ssd = kabsch(X[None, ...], Y[None, ...], AA_subset, size_subset, vdglib_dir, chunk_size=1)
+    n_atoms = X.shape[0]
+    return float(np.sqrt(ssd[0] / n_atoms))
+
 def calc_seq_similarity(list1, list2):
     # Count how many residues match
     list1 = [i for i in list1 if i != 'vdm']
@@ -446,8 +503,8 @@ def get_vdg_subsets(input_list):
     # Group by quadruples, triples, pairs, and singles.
     # Initialize an empty list to store all subsets
     all_subsets = []
-    # Loop through subset sizes 1 to 4, generate combos, then add to list
-    for r in range(1, 5):
+    # Loop through subset sizes 1 to 2, generate combos, then add to list
+    for r in [1, 2]:
         subsets = combinations(input_list, r)
         all_subsets.extend(subsets)
     return all_subsets
@@ -805,6 +862,8 @@ def get_transf_and_coords(mobile_coords, target_coords, weights, obj, scrrs,
    for perm in perms:
       # combing cg and vdmbb
       rearranged_coords = np.vstack([perm, mobile_coords[len(symmetry_classes):]])
+      assert weights.shape[0] == rearranged_coords.shape[0], \
+            "weights/coords length mismatch (rearranged)"
       moved_coords, transf = pr.superpose(rearranged_coords, target_coords, weights)
       rmsd = pr.calcRMSD(moved_coords, target_coords, weights)
       if lowest_rmsd is None or rmsd < lowest_rmsd:
@@ -1039,7 +1098,7 @@ def get_pr_obj_to_print(clusmem_pdbpath, vdg_scrr_cg_perm,
               break
           except Exception as e:  
               if attempt < 99:
-                  time.sleep(100)  # Wait before retrying
+                  time.sleep(10)  # Wait before retrying
               else:
                   print(f"align_and_cluster failed to parse {clusmem_pdbpath}: {e}")
                   return None
@@ -1229,5 +1288,9 @@ def reset_occs(pr_obj_copy, scrrs):
          sel = f'chain {chain} and {res_sel} and resname {resname}'
       else:
          sel = f'segname {seg} and chain {chain} and {res_sel} and resname {resname}'
-      pr_obj_copy.select(sel).setOccupancies(2.0)
+      
+      target = pr_obj_copy.select(sel)
+      if target is not None:
+          target.setOccupancies(2.0)
+
    return pr_obj_copy

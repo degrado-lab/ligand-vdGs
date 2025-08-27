@@ -4,8 +4,8 @@ from pprint import pprint
 ## didn't work: 
 ## 8rlp, 7h69
 
-#matches_dir = '/wynton/home/degradolab/skt/docking/vdg_matches/4eyr'
-matches_dir = '/wynton/home/degradolab/skt/docking/vdg_matches/7h69'
+matches_dir = '/wynton/home/degradolab/skt/docking/vdg_matches/4eyr'
+#matches_dir = '/wynton/home/degradolab/skt/docking/vdg_matches/7h69'
 #matches_dir = '/wynton/home/degradolab/skt/docking/vdg_matches/7hcg'
 #matches_dir = '/wynton/home/degradolab/skt/docking/vdg_matches/8rlp'
 #matches_dir = '/wynton/home/degradolab/skt/docking/vdg_matches/8sce'

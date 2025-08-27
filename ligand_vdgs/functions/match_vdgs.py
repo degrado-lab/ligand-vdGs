@@ -4,11 +4,9 @@ import prody as pr
 
 def subsets_of_query_residues(bindingsite_residues):
     query_res_sets = [[b] for b in bindingsite_residues] + list(
-        combinations(bindingsite_residues, 2))  + list(
-        combinations(bindingsite_residues, 3)) + list(
-        combinations(bindingsite_residues, 4))
+        combinations(bindingsite_residues, 2)) 
     return query_res_sets
-
+     
 def find_matching_permutations_indices(list1, list2):
     '''
     Find all permutations of elements in `list2` that match the elements of `list1`
@@ -164,9 +162,9 @@ def get_database_vdgs_for_spec_AAs(_vdgs_dir, AAs):
     AAs = ['bb' if i == 'GLY' else i for i in AAs]
     AA_str = '_'.join(sorted(AAs))
     aa_path = os.path.join(_vdgs_dir, AA_str)
-    print('aa_path', aa_path)
-    print(os.path.exists(aa_path))
     if not os.path.exists(aa_path):
+        print("Looking for these vdgs, but they don't exist:")
+        print(aa_path)
         return [], []
     
     database_vdg_names = os.listdir(aa_path)

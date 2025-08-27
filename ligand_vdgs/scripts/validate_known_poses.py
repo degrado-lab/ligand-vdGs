@@ -12,9 +12,9 @@ import os
 import yaml
 import numpy as np
 import prody as pr
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'functions'))
-import match_vdgs as match
-import utils
+sys.path.append("/wynton/home/degradolab/skt/docking/ligand-vdGs")
+from ligand_vdgs.functions import match_vdgs as match
+from ligand_vdgs.functions import utils
 
 script, yml_file = sys.argv
 
@@ -51,7 +51,6 @@ def main():
     
     # Get subsets of vdg residues in query struct.
     query_res_sets = match.subsets_of_query_residues(bindingsite_residues)
-    print('query_res_sets', query_res_sets)
     # Iterate over subsets of binding site residues and determine
     # whether any of the vdGs in the database match the "ground truth" binding 
     # site residues and CG positions of the query structure.

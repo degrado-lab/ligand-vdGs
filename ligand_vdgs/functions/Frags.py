@@ -14,7 +14,7 @@ def get_fragments(bond_radius, mol, min_frag_size=4, max_frag_size=7):
     # Update frag_dict by adding the new fragments; skip if all-carbon
     for orig_sub in substructs: # contains H's that need to be scrubbed.
         # will have duplicates b/c we didn't check for duplicates yet.
-        sub, sub_smiles = manually_remove_Hs(orig_sub, mol) 
+        sub, sub_smiles = manually_remove_Hs(orig_sub)
         # apply size threshold.
         frag_size = len([i for i in sub.GetAtoms() if i.GetSymbol() != 'H'])
         if frag_size < min_frag_size or frag_size > max_frag_size:
@@ -29,7 +29,7 @@ def get_fragments(bond_radius, mol, min_frag_size=4, max_frag_size=7):
 
     return filtered_frags
 
-def manually_remove_Hs(orig_substruct, orig_full_moll):
+def manually_remove_Hs(orig_substruct):
     # Remove hydrogens. Docs say that Chem.RemoveHs() implicit and explicit are removed, 
     # but this isn't true for [nH], [OH], [Ho], etc. so need to manually remove H's. 
     # Convert back to SMILES, without showing explicit hydrogens

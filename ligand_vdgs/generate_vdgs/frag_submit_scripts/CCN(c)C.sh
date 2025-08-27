@@ -14,7 +14,7 @@ date # start time
 
 hostname
 
-conda activate vdgs
+conda activate py3.10
 
 python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py -s "CCN(c)C" -c "CCN(c)C" -p /wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2/ -b /wynton/group/degradolab/skt/docking/databases/probe_output/ -o /wynton/group/degradolab/skt/docking/databases/frag_vdg_lib/ -m 1000 
 

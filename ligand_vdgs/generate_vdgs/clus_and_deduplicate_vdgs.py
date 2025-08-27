@@ -26,7 +26,6 @@ import argparse
 import time
 import tracemalloc
 import shutil
-import glob
 import numpy as np
 from numba import njit, prange, set_num_threads
 import prody as pr
@@ -155,7 +154,12 @@ def main():
    vdg_pdbs_in_dir = sorted(os.listdir(vdg_pdbs_dir))
    for pdbname in vdg_pdbs_in_dir:
       pdbpath = os.path.join(vdg_pdbs_dir, pdbname)
-      prody_obj = pr.parsePDB(pdbpath)
+      try:
+         prody_obj = pr.parsePDB(pdbpath)
+      except:
+         with open(logfile, 'a') as file:
+              file.write(f"Could not parse {pdbpath} \n")
+         continue
       if len(vdg_pdbs_in_dir) < 10000:
          atomgroup_dict[os.path.join(vdg_pdbs_dir, pdbname)] = prody_obj
       cg_coords = clust.get_cg_coords(prody_obj)
@@ -190,7 +194,8 @@ def main():
    for num_vdms_in_subset, _subsets in vdm_combos.items():
       if num_vdms_in_subset != size_subset:
          continue
-      for _reordered_AAs, _vdgs in _subsets.items():
+      sorted_subset_dict = {k: _subsets[k] for k in sorted(_subsets.keys())}
+      for _reordered_AAs, _vdgs in sorted_subset_dict.items():
          # vdG subsets that have identical vdm AA compositions may be redundant, so cluster 
          # them. If there are > max_num_to_clus samples, select only the top samples with 
          # highest PDB ID diversity. Note that the same PDB can have multiple vdgs, so the 
@@ -295,7 +300,7 @@ def copy_nr_to_outdir(vdglib_dir, nr_dir, reordered_AAs):
                        break
                    except Exception as e:  
                        if attempt < 99:
-                           time.sleep(100)  # Wait before retrying
+                           time.sleep(10)  # Wait before retrying
                        else:
                            print(f"clus_and_deduplicate failed to access "
                                  f"{os.path.join(flankseqandbbclusdir, pdb)}: {e}")
@@ -344,9 +349,9 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
    # in all_AA_cg_perm_cg_coords, all_AA_cg_perm_vdm_bbcoords, etc.).
    cgvdmbb_rmsd_cut = normalize_rmsd(num_cgvdmbb_atoms, 'cgvdmbb') 
    cgvdmbb_data_to_clus = zip([all_AA_cg_perm_cg_and_vdmbb_coords], ['cgvdmbb'])
-   cgvdmbb_clus_assignments, cgvdmbb_clus_centroids = clust.get_hierarchical_clusters(
+   cgvdmbb_clus_assignments, cgvdmbb_clus_centroids = clust.get_leader_clusters(
       cgvdmbb_data_to_clus, cgvdmbb_rmsd_cut, reordered_AAs_str, len(reordered_AAs), 
-      vdglib_dir)
+      vdglib_dir, final_exact_medoid_pass=True, final_reassign_once=True)
 
    # Output the cgvdmbb clusters
      
@@ -406,8 +411,9 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
       # Then, do secondary clustering on a metric and threshold that combines rmsd and seq
       flankseq_and_bb_thresh = flankbb_rmsd_cut + (1 - seq_sim_thresh) / 2
       flankingseq_and_bb_cluster_assignments, flankingseq_and_bb_clus_centroids \
-         = clust.get_hierarchical_clusters(flankseq_and_bb_to_clus, flankseq_and_bb_thresh, 
-         reordered_AAs_str, len(reordered_AAs), vdglib_dir)
+         = clust.get_leader_clusters(flankseq_and_bb_to_clus, flankseq_and_bb_thresh, 
+         reordered_AAs_str, len(reordered_AAs), vdglib_dir, 
+         final_exact_medoid_pass=True, final_reassign_once=True)
             
       # Output the flankseq+bb clusters
       flankseq_and_bb_clusdir_for_this_cgvdmbb_clus = os.path.join(vdglib_dir, 'clusters', 

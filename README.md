@@ -16,6 +16,6 @@ conda activate vdg_env
 ```
 You only need to create the environment once, but the environment needs to be active before running the scripts contained in this package. In most cases, that requires running the `conda activate` command whenever you open a new terminal/window.
 
-Install ligand-vdGs as a pip package by running either
-`python -m pip install -e .` for editable mode (debugging/developing), or
-`python -m pip install .` for general usage.
+pip install -r requirements.txt 
+
+**Note:** Certain dependencies in `requirements.txt` require Python 3.9 or later

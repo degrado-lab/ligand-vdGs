@@ -14,10 +14,8 @@ import numpy as np
 import prody as pr
 from rdkit import Chem
 from rdkit.Chem import AllChem
-import re
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'functions'))
 import match_vdgs as match
-import utils
 import Frags
 import dock
 import tempfile
@@ -33,7 +31,6 @@ solved_struct_path = config['solved_struct_path']
 lig_smiles = config['lig_smiles']
 vdg_lib_dir = config['vdg_lib_dir']
 outdir = config['outdir']
-query_lig_res = config['query_lig_res']  # (segment, chain, resnum
 frags_to_exclude = config['frags_to_exclude']  # list of SM
 frags_to_include = config['frags_to_include']  # list of SM
 query_pdbs = config.get('query_pdbs')  # value should be either 'all' 
@@ -46,7 +43,6 @@ print(f"solved_struct_path: {solved_struct_path}")
 print(f"lig_smiles: {lig_smiles}")
 print(f"vdg_lib_dir: {vdg_lib_dir}")
 print(f"outdir: {outdir}")
-print(f"query_lig_res: {query_lig_res}")
 print(f"frags_to_exclude: {frags_to_exclude}")
 print(f"frags_to_include: {frags_to_include}")
 print(f"query_pdbs: {query_pdbs}")
@@ -95,12 +91,11 @@ def get_frags_from_pdbfile(query_pdbs_dir, pdbfile):
     # correct valence and aromaticity 
     try:
         pdb_mol_assigned_bonds = AllChem.AssignBondOrdersFromTemplate(lig_template, pdb_mol)
-        pdb_mol_assigned_bonds_no_H, pdb_mol_smiles_no_H = Frags.manually_remove_Hs(pdb_mol_assigned_bonds, 
-                                                                                    pdb_mol_assigned_bonds)
+        pdb_mol_assigned_bonds_no_H, pdb_mol_smiles_no_H = Frags.manually_remove_Hs(pdb_mol_assigned_bonds)
         filtered_frags = Frags.get_fragments(2, pdb_mol_assigned_bonds_no_H, 4, 5)
         return filtered_frags, pdb_mol_assigned_bonds_no_H, query_struct
     except ValueError as e:
-        print(f"Error processing {pdbfile}: {e}")
+        print(f"Error processing {pdbfile}: {e}", flush=True)
         return [], None, query_struct
 
 def get_query_cg_coords(mol, sub):
@@ -115,13 +110,12 @@ def get_query_cg_coords(mol, sub):
         for atom_idx in query_match:
             atom = mol.GetAtomWithIdx(atom_idx)
             pos = conf.GetAtomPosition(atom_idx)  # returns an RDKit Point3D object
-            info = atom.GetPDBResidueInfo()
             xyz = (pos.x, pos.y, pos.z)
             perm_coords.append(xyz)
         q_cg_coord_perms.append(np.array(perm_coords))
     return q_cg_coord_perms
 
-def make_outdir(pdbfile, output_dir):
+def make_outdir(pdbfile, outdir):
     # Name the outdir for this pdb query
     pdbname = pdbfile.removesuffix('.pdb')
     pdb_id = pdbname[:4]
@@ -135,6 +129,48 @@ def smiles_equiv(existingfrag, sub_smiles):
                  mol2.HasSubstructMatch(mol1) and 
                  mol1.GetNumAtoms() == mol2.GetNumAtoms())
     return is_equivalent
+
+def check_vdg_job_status(sub_smiles):
+    # Check if the vdg generation job finished without issues
+    vdg_log_file = os.path.join(vdg_lib_dir, sub_smiles, 'logs', f'{sub_smiles}_log')
+    if not os.path.exists(vdg_log_file):
+        return False
+    with open(vdg_log_file, 'r') as f:
+        log_contents = f.read()
+    return 'Job completed.' in log_contents
+
+def summarize_frags(deduplicated_filtered_frags, frags_in_lib, frags_to_exclude, 
+                    frags_to_include):
+    groups = {
+        "Excluded": [],
+        "Not in include list": [],
+        "Not searched": [],
+        "Not in vdg lib or incomplete": [],
+        "In vdg lib": []}
+
+    for sub, sub_smiles in deduplicated_filtered_frags:
+        if any(smiles_equiv(f, sub_smiles) for f in frags_to_exclude):
+            groups["Excluded"].append(sub_smiles)
+        elif frags_to_include != 'all' and isinstance(frags_to_include, list) and sub_smiles not in frags_to_include:
+            groups["Not in include list"].append(sub_smiles)
+        elif sub_smiles not in frags_in_lib:
+            groups["Not searched"].append(sub_smiles)
+        elif not frags_in_lib[sub_smiles]:
+            groups["Not in vdg lib or incomplete"].append(sub_smiles)
+        else:
+            groups["In vdg lib"].append(sub_smiles)
+
+    print("\n=== Fragment summary ===", flush=True)
+    for category, frags in groups.items():
+        if frags:
+            print(f"{category}:", flush=True)
+            print("   ", ", ".join(frags), flush=True)
+
+def check_in_exclude_list(sub_smiles, frags_to_exclude):
+    for frag in frags_to_exclude:
+        if smiles_equiv(frag, sub_smiles):
+            return True
+    return False
 
 def main():
     
@@ -177,49 +213,56 @@ def main():
         # Remove duplicates of filtered_frags 
         deduplicated_filtered_frags = []
         for (sub, sub_smiles) in orig_filtered_frags:
-            # If sub_smiles already exists, then skip
+            # Step 0) is this frag named something else in the vdg lib?
+            for existingfrag in os.listdir(vdg_lib_dir):
+                if smiles_equiv(existingfrag, sub_smiles):
+                    sub_smiles = existingfrag
+                    break
+
+            # First of all, is it in frags_to_exclude?
+            if check_in_exclude_list(sub_smiles, frags_to_exclude): 
+                # means it's equiv to a frag in frags_to_exclude
+                continue
+
+            # If sub_smiles already exists, then skip. Otherwise, add
             if sub_smiles in [i[1] for i in deduplicated_filtered_frags]:
                 continue
-            # Even if not, it may be represented with a diff smiles str
-            degenerate = False
-            for _s in [i[1] for i in deduplicated_filtered_frags]:
-                if smiles_equiv(_s, sub_smiles):
-                    degenerate = True
-                    break
-            if degenerate:
-                continue
-            # Otherwise, add it to deduplicated_filtered_frags
             if sub_smiles not in [i[1] for i in deduplicated_filtered_frags]:
                 deduplicated_filtered_frags.append((sub, sub_smiles))
-            # Determine if this frag is in vdg lib
             if sub_smiles in frags_to_exclude: # Exclude specified frags 
                 continue
-            _degenerate = False
-            for _f in frags_to_exclude:
-                if smiles_equiv(_f, sub_smiles):
-                    degenerate = True
-                    break
-            if _degenerate:
+            
+            # Skip if it's in frags_to_exclude. Use a separate var (_degenerate) 
+            # to avoid confusion.
+            if check_in_exclude_list(sub_smiles, frags_to_exclude):
                 continue
-            # Check if the sub_smiles is in the vdg lib
+        
+            # Determine if this frag is in vdg lib (and the job didn't break)
             if sub_smiles not in frags_in_lib.keys():
+                # Is it in the vdg lib dir?
                 if sub_smiles in os.listdir(vdg_lib_dir):
-                    frags_in_lib[sub_smiles] = True
+                    # Did the job (to create the vdgs) finish w/o issue?
+                    if check_vdg_job_status(sub_smiles):
+                        frags_in_lib[sub_smiles] = True
+                    else:
+                        frags_in_lib[sub_smiles] = False 
                 else: 
                     # If the str isn't in os.listdir(), it's still possible that a 
-                    # degernate smiles is in vdg_lib_dir
+                    # degenerate smiles is in vdg_lib_dir
                     for existingfrag in os.listdir(vdg_lib_dir):
-                        # Is it equivalent to sub_smiles?
+                        # Is it equivalent to sub_smiles and was its job completed?
                         is_equivalent = smiles_equiv(existingfrag, sub_smiles)
-                        if is_equivalent:
+                        if is_equivalent: # rename the smiles to match what's in db
+                            sub_smiles = existingfrag
+                        if is_equivalent and check_vdg_job_status(existingfrag):
                             frags_in_lib[sub_smiles] = True
                             break
                     else:
                         frags_in_lib[sub_smiles] = False
+        # Log
+        summarize_frags(deduplicated_filtered_frags, frags_in_lib, frags_to_exclude, frags_to_include)
+
         # Iterate over frags that are in the vdg lib
-        print('Full list of ligand frags:')
-        print([sub_smiles for sub, sub_smiles in deduplicated_filtered_frags 
-               if sub_smiles in frags_in_lib and frags_in_lib[sub_smiles]])
         for sub, sub_smiles in deduplicated_filtered_frags:
             if frags_to_include == 'all':
                 pass
@@ -264,7 +307,7 @@ def main():
                     len(bsr_incl_bb_identities.split('_'))), bsr_incl_bb_identities)
                 if not os.path.exists(vdgs_path):
                     continue
-                vdg_paths = os.listdir(vdgs_path)
+                vdg_paths = [p for p in os.listdir(vdgs_path) if p.endswith(('.pdb', '.pdb.gz'))]
                 # Iterate over each vdg
                 for vdg_path in vdg_paths:
                     vdg_full_path = os.path.join(vdgs_path, vdg_path)
@@ -310,8 +353,8 @@ def main():
                                     'The query CG must have the same num. of atoms as the database CG.')
                             moved_db_vdg_bb_and_cg_coords, db_transf = pr.superpose(
                                 db_bb_and_cg_coords, q_bb_and_cg)
-                            db_to_query_rmsd = round(pr.calcRMSD(moved_db_vdg_bb_and_cg_coords, 
-                                                           q_bb_and_cg), 2)
+                            db_to_query_rmsd = pr.calcRMSD(moved_db_vdg_bb_and_cg_coords, 
+                                                           q_bb_and_cg)
                             if db_to_query_rmsd > rmsd_threshold:
                                 continue
                             # If this is the best rmsd so far, keep track of it
@@ -342,7 +385,7 @@ def main():
                         if not os.path.exists(subdir_path):
                             os.makedirs(subdir_path)
                         output_vdg_name = f'{pdbfile.removesuffix(".pdb")}_{sub_smiles}_' + vdg_path.rstrip('/').split(
-                            '/')[-1].removesuffix('.pdb.gz') + f'_{db_to_query_rmsd}'
+                            '/')[-1].removesuffix('.pdb.gz') + f'_{round(db_to_query_rmsd, 2):0.2f}'
                         output_vdg_path = os.path.join(subdir_path, output_vdg_name+'.pdb')
                         # check if a file in output_vdg_path already exists
                         if os.path.exists(output_vdg_path):
@@ -350,17 +393,12 @@ def main():
                         pr.writePDB(output_vdg_path, pr.applyTransformation(db_transf, 
                             vdg_prody_obj.copy()))
 
-    print('\nvdG files that could not be parsed:')
-    for failed_file in failed_vdg_files:
-        print(f" - {failed_file}")
+    if failed_vdg_files:
+        print('\nvdG files that could not be parsed:')
+        for failed_file in failed_vdg_files:
+            print(f" - {failed_file}")
 
-    print('\nFragment SMILES found in the vdg lib:', 
-                [smiles for smiles, in_lib in frags_in_lib.items() if in_lib])
-    print('\nFragment SMILES not found in the vdg lib:', 
-          [smiles for smiles, in_lib in frags_in_lib.items() if not in_lib])
     return
-
-    
 
 
 if __name__ == "__main__":

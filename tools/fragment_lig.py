@@ -1,11 +1,9 @@
 import os
 import sys
 from rdkit import Chem            
-import re
 import pickle as pkl
-sys.path.append(os.path.join(os.path.dirname(__file__), 'ligand_vdgs', 'functions'))
-#sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'functions'))
-import Frags 
+sys.path.append("/wynton/home/degradolab/skt/docking/ligand-vdGs")
+from ligand_vdgs.functions import Frags
 
 #smiles = 'C[C@]1([C@H]2C[C@H]2OC(=N1)N)c3cc(ccc3F)NC(=O)c4cnc(cn4)OC' # EJ7 (6c2i)
 #smiles = 'CCCCn1c(cn2c1nc3c2C(=O)NC(=O)N3C)c4ccccc4C' # L87 (4gk3)
@@ -57,12 +55,12 @@ import Frags
 ####### avB3 guanidines: #####
 #smiles = r'c1ccc2c(c1)nc(s2)C(=O)N[C@@H](CCNC(=O)CCCCc3ccc4cccnc4n3)C(=O)O' # JUY (6mk0)
 ####### Factor Xa proline-like/pyrrolidine: #####
-#smiles = r'COc1ccc(cc1)n2c3c(c(n2)C(=O)N)CCN(C3=O)c4ccc(cc4)N5CCCCC5=O' # GG2 (6w70_chainA, 6w70_chainB, 2p16)
+smiles = r'COc1ccc(cc1)n2c3c(c(n2)C(=O)N)CCN(C3=O)c4ccc(cc4)N5CCCCC5=O' # GG2 (6w70_chainA, 6w70_chainB, 2p16)
 #smiles = r'c1cc(ccc1N2CCOCC2=O)N3C[C@@H](OC3=O)CNC(=O)c4ccc(s4)Cl' # RIV (2w26)
 
-
+# idk what mols these are: 
 #smiles = r'CN(C1=CC=C(C(O2)=C1)C(C3=CC=CC=C3C([N-]S(=O)(N(C)C)=O)=O)=C(C=C/4)C2=CC4=[N+](C)/C)C'
-smiles = r'CN(C1=CC=C(C(O2)=C1)C(C3=CC=CC=C3C([N]S(=O)(N(C)C)=O)=O)=C(C=C/4)C2=CC4=[N](C)/C)C'
+#smiles = r'CN(C1=CC=C(C(O2)=C1)C(C3=CC=CC=C3C([N]S(=O)(N(C)C)=O)=O)=C(C=C/4)C2=CC4=[N](C)/C)C'
 
 database_frags_path = 'resources/database_frags_dict.pkl'
 bond_radius = 2
@@ -145,10 +143,10 @@ def is_in_database_frags(lig_frags):
     if not_database:
         print('SMILES NOT IN DATABASE:', not_database)
     
-    print('smiles in database:')
-    print_counts(was_not_run, db_frags, 'Smiles that I did not run yet:')
-    print_counts(ran_not_finished, db_frags, 'Smiles that I ran but did not finish yet:')
-    print_counts(ran_and_finished, db_frags, 'Smiles that I ran and finished:')
+    print('SMILES IN DATABASE:')
+    print_counts(was_not_run, db_frags, '> Smiles that I did not run yet:')
+    print_counts(ran_not_finished, db_frags, '> Smiles that I ran but did not finish yet:')
+    print_counts(ran_and_finished, db_frags, '> Smiles that I ran and finished:')
 
 def print_counts(_list, db_frags, str_to_print):
     print()

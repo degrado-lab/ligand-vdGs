@@ -210,7 +210,6 @@ dependencies:
   - re2=2022.02.01=h9c3ff4c_0
   - readline=8.1=h46c0cb4_0
   - reportlab=3.5.68=py39he59360d_1
-  - requests=2.27.1=pyhd8ed1ab_0
   - s2n=1.0.10=h9b69904_0
   - scikit-learn=1.0.2=py39h4dfa638_0
   - scipy=1.8.1=py39he49c0e8_0

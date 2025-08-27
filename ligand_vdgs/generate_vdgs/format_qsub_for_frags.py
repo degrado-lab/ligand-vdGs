@@ -1,7 +1,7 @@
 import os
 
 outfile = 'run_frags.sh'
-submit_scripts_dir = 'ligand_vdgs/generate_vdgs/lib_gen_frag_submit_scripts/'
+submit_scripts_dir = 'ligand_vdgs/generate_vdgs/frag_submit_scripts/'
 
 # ------------------------------------------------------------------------------------------
 

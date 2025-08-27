@@ -17,9 +17,12 @@ date # start time
 
 hostname
 
-conda activate vdgs
+conda activate py3.10
 
 python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py -s $SMILES -c $CG -p $PDB_DIR -b $PROBE_DIR -o $OUTPUT_DIR -m $MAX_NUM_CLUS 
+
+## End-of-job summary, if running as a job
+[[ -n "$JOB_ID" ]] && qstat -j "$JOB_ID"
 
 date # end time
 
