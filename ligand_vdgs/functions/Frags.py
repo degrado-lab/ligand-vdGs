@@ -1,5 +1,10 @@
-from rdkit import Chem
 import re
+import tempfile
+from rdkit import Chem
+from rdkit.Chem import AllChem
+import prody as pr
+import os
+import utils
 
 def get_fragments(bond_radius, mol, min_frag_size=4, max_frag_size=7):
     # Decompose the ligand into fragments and store the fragment SMILES. Use SMILES 
@@ -77,3 +82,68 @@ def is_organic(mol):
         False
     else:
         return True
+
+def get_frags_from_pdbfile(pdbfile, lig_smiles):
+    query_struct = pr.parsePDB(pdbfile)
+    # Identify ligand and fragment it
+    hetatms = query_struct.hetatm.select('not (ion or resname SEP or resname TPO or resname MSE)')
+    assert len(set(hetatms.getResindices())) == 1
+    # Convert from prody obj to rdkit Mol obj
+    with tempfile.NamedTemporaryFile(suffix=".pdb", delete=False) as tmp_pdb:
+        pr.writePDB(tmp_pdb.name, hetatms)
+    
+    pdb_mol = Chem.MolFromPDBFile(tmp_pdb.name, removeHs=True)
+    lig_template = Chem.MolFromSmiles(lig_smiles) 
+    # Assign bond orders (b/c rdkit doesn't calculate this from PDB coords) to detect 
+    # correct valence and aromaticity 
+    try:
+        pdb_mol_assigned_bonds = AllChem.AssignBondOrdersFromTemplate(lig_template, pdb_mol)
+        pdb_mol_assigned_bonds_no_H, pdb_mol_smiles_no_H = manually_remove_Hs(pdb_mol_assigned_bonds)
+        filtered_frags = get_fragments(2, pdb_mol_assigned_bonds_no_H, 4, 5)
+        return filtered_frags, pdb_mol_assigned_bonds_no_H
+    except ValueError as e:
+        print(f"Error processing {pdbfile}: {e}", flush=True)
+        return [], None
+
+def check_vdg_job_status(sub_smiles, vdg_lib_dir):
+    # Check if the vdg generation job finished without issues
+    vdg_log_file = os.path.join(vdg_lib_dir, sub_smiles, 'logs', f'{sub_smiles}_log')
+    if not os.path.exists(vdg_log_file):
+        return False
+    with open(vdg_log_file, 'r') as f:
+        log_contents = f.read()
+    return 'Job completed.' in log_contents
+
+def summarize_frags(deduplicated_filtered_frags, frags_in_lib, frags_to_exclude, 
+                    frags_to_include):
+    groups = {
+        "Excluded": [],
+        "Not in include list": [],
+        "Not searched": [],
+        "Not in vdg lib or incomplete": [],
+        "In vdg lib and in include list": []}
+
+    for sub, sub_smiles in deduplicated_filtered_frags:
+        if any(utils.smiles_equiv(f, sub_smiles) for f in frags_to_exclude):
+            groups["Excluded"].append(sub_smiles)
+        elif frags_to_include != 'all' and isinstance(frags_to_include, list) and sub_smiles not in frags_to_include:
+            groups["Not in include list"].append(sub_smiles)
+        elif sub_smiles not in frags_in_lib:
+            groups["Not searched"].append(sub_smiles)
+        elif not frags_in_lib[sub_smiles]:
+            groups["Not in vdg lib or incomplete"].append(sub_smiles)
+        else:
+            groups["In vdg lib and in include list"].append(sub_smiles)
+
+    print("\n=== Fragment summary ===", flush=True)
+    for category, frags in groups.items():
+        if frags:
+            print(f"{category}:", flush=True)
+            print("   ", ", ".join(frags), flush=True)
+    print("\n========================", flush=True)
+
+def check_in_exclude_list(sub_smiles, frags_to_exclude):
+    for frag in frags_to_exclude:
+        if utils.smiles_equiv(frag, sub_smiles):
+            return True
+    return False

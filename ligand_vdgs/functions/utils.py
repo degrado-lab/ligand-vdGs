@@ -1,6 +1,6 @@
 import os
-import sys
 import shutil
+from rdkit import Chem
 
 def handle_existing_files(out_dir):
    os.makedirs(out_dir, exist_ok=True)
@@ -8,17 +8,23 @@ def handle_existing_files(out_dir):
       raise ValueError(f'The output dir {out_dir} is not empty. Remove files or define a new '
             'output dir name to prevent accidental overwriting.')
 
-def set_up_outdir(outdir, overwrite):
-    '''Create outdir if it does not exist, and require the overwrite flag if it does,
+def set_up_outdir(outdir, overwrite=False):
+    '''Create outdir if it does not exist, and require overwrite_existing if it does, 
     so that there are no stale files.'''
 
     if os.path.exists(outdir):
         if not os.path.isdir(outdir):
-            raise ValueError(f'The filename you designated as the output directory, {outdir}, already '
-                             'exists and is not a directory.')
+            raise ValueError(f'The filename you designated as the output directory, {outdir}, '
+                             'already exists and is not a directory.')
         if overwrite: 
+            print(f'\nWarning: overwriting existing output directory {outdir} because '
+                  'overwrite_existing was set to True.\n')
             shutil.rmtree(outdir) # removes the dir and everything in it
             os.makedirs(outdir)
+        else: # check if there are already files. ignore if there are empty dirs.
+            if len(os.listdir(outdir)) > 0:
+                raise ValueError(f'The output directory {outdir} is not empty. Remove files or '
+                                'set overwrite_existing to True to prevent accidental overwriting.')
     
     else: # dir doesn't exist, so create it
         parent_dir = os.path.dirname(outdir)
@@ -87,3 +93,16 @@ def min_clash_dist(elem1, elem2, hbond_tol=0.6, general_tol=0.4):
         min_dist -= general_tol 
 
     return min_dist
+
+def get_atom_coords(prody_obj, atom_name):
+    atom = prody_obj.select(f'name {atom_name}')
+    coords = atom.getCoords()[0]
+    return coords
+
+def smiles_equiv(existingfrag, sub_smiles):
+    mol1 = Chem.MolFromSmarts(existingfrag)
+    mol2 = Chem.MolFromSmarts(sub_smiles)
+    is_equivalent = (mol1.HasSubstructMatch(mol2) and 
+                 mol2.HasSubstructMatch(mol1) and 
+                 mol1.GetNumAtoms() == mol2.GetNumAtoms())
+    return is_equivalent

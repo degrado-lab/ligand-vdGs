@@ -4,6 +4,7 @@ from pprint import pprint
 ## didn't work: 
 ## 8rlp, 7h69
 
+#matches_dir = '/wynton/home/degradolab/skt/docking/vdg_matches/1rm8'
 matches_dir = '/wynton/home/degradolab/skt/docking/vdg_matches/4eyr'
 #matches_dir = '/wynton/home/degradolab/skt/docking/vdg_matches/7h69'
 #matches_dir = '/wynton/home/degradolab/skt/docking/vdg_matches/7hcg'
@@ -13,8 +14,14 @@ rmsd_cut = 0.6
 
 scores_dict = {} # key = struct name, val = num of matches per frag
 
-for structure in sorted(os.listdir(matches_dir)):
+if len(os.listdir(matches_dir)) == 1:
+    structures = [matches_dir]
+else:
+    structures = sorted(os.listdir(matches_dir))
+
+for structure in structures:
     structure_path = os.path.join(matches_dir, structure)
+    structure = os.path.basename(structure_path)
     assert structure not in scores_dict.keys()
     scores_dict[structure] = {}
     for frag in os.listdir(structure_path):
