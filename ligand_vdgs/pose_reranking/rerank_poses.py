@@ -52,7 +52,15 @@ def main():
     solved_struct = pr.parsePDB(solved_struct_path)
 
     # Get binding site residues from the solved structure
-    ligname = set(solved_struct.hetatm.select('not (ion or resname SEP or resname TPO or resname MSE)').getResnames())
+    lig_obj = solved_struct.hetatm.select(
+        'not (ion or resname SEP or resname TPO or resname MSE)') 
+    # if lig_obj is None, then raise an error and note to the user that they may 
+    # have to reformat the resname in the PDB file
+    if lig_obj is None:
+        raise ValueError(
+            f'Prody could not find ligand atoms in {solved_struct_path}. You may need to '
+            f'reformat the lig resname in the PDB file.')
+    ligname = set(lig_obj.getResnames())
     assert len(ligname) == 1
     ligname = list(ligname)[0]
 
@@ -78,7 +86,7 @@ def main():
         else:
             raise ValueError("query_pdbs must be 'all' or a list of pdb files.")
         print('\n' + '='*10, pdbfile, '='*10)
-        output_dir = dock.name_outdir(pdbfile, outdir)
+        output_dir = dock.name_outdir(pdbfile, outdir, 2) # hardcoding to 2 is intentional
         utils.set_up_outdir(output_dir, overwrite=overwrite_existing)
 
         # Get all fragments. For every frag, iterate over the bsr combos and determine 
@@ -207,7 +215,7 @@ def main():
                         vdg_perm_bb_coords = []
                         for _r in resind_perm:
                             for atom_name in ['N', 'CA', 'C']: 
-                                _coords = dock.get_atom_coords(vdg_prody_obj.select(
+                                _coords = utils.get_atom_coords(vdg_prody_obj.select(
                                     f'resindex {_r}'), atom_name)
                                 vdg_perm_bb_coords.append(_coords)
                         vdg_perm_bb_coords = np.array(vdg_perm_bb_coords)

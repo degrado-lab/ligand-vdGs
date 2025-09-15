@@ -1,6 +1,6 @@
 rmsd_threshold: 0.75 
-query_pdb_paths: ['/wynton/home/degradolab/skt/docking/query_structs/1rm8.pdb']
-lig_smiles: 'CNC(=O)[C@H](Cc1ccccc1)NC(=O)[C@H](CC(C)C)[C@H](CSc2sccc2)C(=O)NO'
+query_pdb_paths: ['/wynton/home/degradolab/skt/docking/query_structs/7trk.pdb']
+lig_smiles: 'C[N+](C)(C)CC#CCOC1=NOCC1'
 vdg_lib_dir: '/wynton/group/degradolab/skt/docking/databases/frag_vdg_lib'
 outdir: '/wynton/home/degradolab/skt/docking/vdg_matches'
 frags_to_exclude: [] 

@@ -4,17 +4,19 @@ from pprint import pprint
 ## didn't work: 
 ## 8rlp, 7h69
 
-#matches_dir = '/wynton/home/degradolab/skt/docking/vdg_matches/1rm8'
-matches_dir = '/wynton/home/degradolab/skt/docking/vdg_matches/4eyr'
+#matches_dir = '/wynton/home/degradolab/skt/docking/vdg_matches/save_singleproc_1rm8_frags'
+matches_dir = '/wynton/home/degradolab/skt/docking/vdg_matches/1fax_frags'
+#matches_dir = '/wynton/home/degradolab/skt/docking/vdg_matches/1g2m_frags'
+#matches_dir = '/wynton/home/degradolab/skt/docking/vdg_matches/4eyr'
 #matches_dir = '/wynton/home/degradolab/skt/docking/vdg_matches/7h69'
 #matches_dir = '/wynton/home/degradolab/skt/docking/vdg_matches/7hcg'
 #matches_dir = '/wynton/home/degradolab/skt/docking/vdg_matches/8rlp'
 #matches_dir = '/wynton/home/degradolab/skt/docking/vdg_matches/8sce'
-rmsd_cut = 0.6
+rmsd_cut = 0.75
 
 scores_dict = {} # key = struct name, val = num of matches per frag
 
-if len(os.listdir(matches_dir)) == 1:
+if matches_dir.endswith('_frags'):
     structures = [matches_dir]
 else:
     structures = sorted(os.listdir(matches_dir))

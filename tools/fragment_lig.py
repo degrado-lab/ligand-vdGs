@@ -2,8 +2,8 @@ import os
 import sys
 from rdkit import Chem            
 import pickle as pkl
-sys.path.append("/wynton/home/degradolab/skt/docking/ligand-vdGs")
-from ligand_vdgs.functions import Frags
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'ligand_vdgs', 'functions'))
+import Frags
 
 #smiles = 'C[C@]1([C@H]2C[C@H]2OC(=N1)N)c3cc(ccc3F)NC(=O)c4cnc(cn4)OC' # EJ7 (6c2i)
 #smiles = 'CCCCn1c(cn2c1nc3c2C(=O)NC(=O)N3C)c4ccccc4C' # L87 (4gk3)
@@ -11,6 +11,7 @@ from ligand_vdgs.functions import Frags
 #smiles = 'c1ccc2c(c1)C(=O)c3ccc(cc3S2(=O)=O)c4[nH]nnn4' # 91X (5yva)
 #smiles = 'N=C(N)N[C@H]1C[C@H](O[C@H]([C@@H]1NC(=O)C)[C@@H]([C@@H](CO)O)O)S(=O)(=O)O' # GYG (6br5) 
 #smiles = 'CC(=O)N1C[C@@H](C[C@H]1C(=O)N[C@@H](CCCNC(=N)N)C(=O)c2nc3ccccc3s2)O' # AAB (1NC6) 
+
 ###### Metalloproteins w/ hydroxamic acids: #####
 #smiles = 'CC(C)C[C@H]([C@H](CSc1cccs1)C(=O)NO)C(=O)N[C@@H](Cc2ccccc2)C(=O)NC' # BAT (1rm8)
 #smiles = 'CC(C)C[C@H]([C@@H](C(=O)NO)O)C(=O)N[C@H](C(=O)NC)C(C)(C)C ' # 097 (3hy7)
@@ -20,16 +21,17 @@ from ligand_vdgs.functions import Frags
 #smiles = 'CC(C)(C)c1cc(no1)NC(=O)Nc2ccc(cc2)Oc3ccncc3' # SR8 (2oh4)
 # * smiles = 'COC(=O)Nc1[nH]c2ccc(cc2n1)Oc3ccc(cc3)NC(=O)Nc4cc(ccc4F)C(F)(F)F' # GIG (2oh4)
 #smiles = 'Cc1cc(ccn1)c2c3cnc(cc3[nH]n2)NC(=O)NCc4ccccc4' # S69 (5ke0)
-# * smiles = 'CC1=CN(C(=O)NC1=O)[C@@H]2C[C@@H]([C@H](O2)CNC(=O)Nc3ccc(cc3)[N+](=O)[O-])O' # WMJ (2yoh)
+# * 
+smiles = 'CC1=CN(C(=O)NC1=O)[C@@H]2C[C@@H]([C@H](O2)CNC(=O)Nc3ccc(cc3)[N+](=O)[O-])O' # WMJ (2yoh)
 #smiles = 'C[C@H](c1c(cncc1Cl)Cl)Oc2cc(ncc2C#N)NC(=O)Nc3c(cc(c(n3)C=O)CN4CCN(CC4=O)C)OCCN5CCOCC5' # VVW (8kh7)
 # * smiles = 'CC1=CN(C(=O)NC1=O)[C@H]2C[C@@H]([C@H](O2)CNC(=S)Nc3ccc(c(c3)C(F)(F)F)Cl)O' # 74W (2yof)
 # * smiles = 'CCN(CC)S(=O)(=O)c1cc(ccc1Cl)Nc2nccc(n2)c3ccnc(c3)c4ccc(cc4)NC(=O)NC' # 88C (7pw7)
 # * smiles = 'c1cc2c(cc1CN3CCOCC3)nc([nH]2)c4c(c[nH]n4)NC(=O)NC5CC5' # 35R (5n23)
 ###### Factor Xa or thrombin inhibitors: #####
-# * smiles = r'[H]/N=C(/c1ccc(cc1)NCc2nc3cc(ccc3n2C)Cn4c(nc5c4cccc5)C)\N' # R11 (1g2m)
+# * smiles = r'Cn1c(CNc2ccc(cc2)C(N)=N)nc3cc(Cn4c(C)nc5ccccc45)ccc13' # R11 (1g2m)
 # * smiles = 'C[C@@H](C(=O)N1CCOCC1)N2CC[C@@H](C2=O)NS(=O)(=O)\C=C(/C)\c3ccc(s3)Cl' # 701 (2uwo)
 # smiles = 'CCc1c(cccc1S(=O)(=O)N[C@@H](Cc2cc(on2)c3ccc(s3)Cl)C(=O)N4CCC(CC4)OC)N5CCOCC5=O' # VYR (4btt) # there's an insertion code res 61 that prody processes incorrectly
-#smiles = '[H]/N=C(\C)/N1CC[C@@H](C1)Oc2ccc(cc2)[C@H](Cc3ccc4ccc(cc4c3)/C(=N/[H])/N)C(=O)O' # DX9 (1fax)
+#smiles = 'CC(=N)N1CC[C@@H](C1)Oc2ccc(cc2)[C@H](Cc3ccc4ccc(cc4c3)C(N)=N)C(O)=O' # DX9 (1fax)
 #smiles = 'CC(=N)N1CCC(CC1)Oc2ccc(cc2)[C@H](Cc3ccc4ccc(cc4c3)C(=N)N)C(=O)O' # BX3 (1mtu)
 #smiles = 'c1ccc(c(c1)Cc2nc3c(o2)ccnc3NCC([C@H]4CCCCN4)(F)F)n5cncn5' # 382 (1zgi) # insertion code that prody does wrong
 #smiles = 'CN(C)[C@H]1CCN(C1)C(=O)[C@H](CNC(=O)c2ccc(s2)Cl)NS(=O)(=O)c3cccc(c3OC(F)F)N4CCCCC4=O' # 7R9 (4lxb) # insertion code
@@ -55,12 +57,16 @@ from ligand_vdgs.functions import Frags
 ####### avB3 guanidines: #####
 #smiles = r'c1ccc2c(c1)nc(s2)C(=O)N[C@@H](CCNC(=O)CCCCc3ccc4cccnc4n3)C(=O)O' # JUY (6mk0)
 ####### Factor Xa proline-like/pyrrolidine: #####
-smiles = r'COc1ccc(cc1)n2c3c(c(n2)C(=O)N)CCN(C3=O)c4ccc(cc4)N5CCCCC5=O' # GG2 (6w70_chainA, 6w70_chainB, 2p16)
+# DO ALL APIXABAN
+#smiles = r'COc1ccc(cc1)n2c3c(c(n2)C(=O)N)CCN(C3=O)c4ccc(cc4)N5CCCCC5=O' # GG2 (6w70_chainA, 6w70_chainB, 2p16, 8vfq)
 #smiles = r'c1cc(ccc1N2CCOCC2=O)N3C[C@@H](OC3=O)CNC(=O)c4ccc(s4)Cl' # RIV (2w26)
 
 # idk what mols these are: 
 #smiles = r'CN(C1=CC=C(C(O2)=C1)C(C3=CC=CC=C3C([N-]S(=O)(N(C)C)=O)=O)=C(C=C/4)C2=CC4=[N+](C)/C)C'
 #smiles = r'CN(C1=CC=C(C(O2)=C1)C(C3=CC=CC=C3C([N]S(=O)(N(C)C)=O)=O)=C(C=C/4)C2=CC4=[N](C)/C)C'
+
+
+
 
 database_frags_path = 'resources/database_frags_dict.pkl'
 bond_radius = 2

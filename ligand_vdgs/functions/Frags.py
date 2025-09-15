@@ -34,35 +34,65 @@ def get_fragments(bond_radius, mol, min_frag_size=4, max_frag_size=7):
 
     return filtered_frags
 
+def _remove_bracket_hydrogens_in_smiles(smiles: str) -> str:
+    """
+    Strip explicit hydrogens from bracket atoms in a SMILES string (string-only).
+    - [CH3] -> C
+    - [NH2] -> N
+    - [NH3+] -> [N+]
+    - [H]   -> '' (remove the token)
+    Brackets are dropped only if the remaining content is a plain element/atom symbol
+    (letters only, e.g., C, N, n). If charge/chirality/isotope/class remains,
+    brackets are kept.
+    """
+    # 1) Remove standalone [H]
+    s = re.sub(r'\[H\]', '', smiles)
+
+    # 2) Rewrite every bracket atom content
+    def _rewrite(m):
+        inner = m.group(1)
+
+        # Remove explicit H or H<number> that is not part of an element symbol like Hg/He
+        cleaned = re.sub(r'H(?![a-z])\d*', '', inner)
+
+        # If anything special remains (charge '+/-', chirality '@', isotope/class digits,
+        # colon, or any non-letter), we must keep the brackets (e.g., [N+], [C@H], [13C])
+        if re.search(r'[\+\-\@\:\d]', cleaned) or re.search(r'[^A-Za-z]', cleaned):
+            return f'[{cleaned}]'
+
+        # Otherwise if it's only letters (e.g., C, N, n), drop brackets:
+        # [CH3] -> C, [NH2] -> N, [nH] -> n
+        return cleaned
+
+    s = re.sub(r'\[([^\]]+)\]', _rewrite, s)
+    return s
+
+
 def manually_remove_Hs(orig_substruct):
     # Remove hydrogens. Docs say that Chem.RemoveHs() implicit and explicit are removed, 
     # but this isn't true for [nH], [OH], [Ho], etc. so need to manually remove H's. 
     # Convert back to SMILES, without showing explicit hydrogens
-    smiles_w_H = Chem.MolToSmiles(orig_substruct, allHsExplicit=False, 
-                              isomericSmiles=False) # still has H's though unfortunately
-    
-    # Remove standalone [H] completely
-    smiles_no_Hs = re.sub(r'\[H\]', '', smiles_w_H)
-    # Remove all 'H' except when part of '[Hg]'
-    smiles_no_Hs = re.sub(r'H(?!g\])', '', smiles_no_Hs)
+
+    # First, export SMILES *with explicit Hs shown* so that patterns like [NH3+] are present, 
+    # then regex-strip bracket hydrogens while keeping charge and other annotations.
+    smiles_w_H = Chem.MolToSmiles(orig_substruct, allHsExplicit=True, 
+                              isomericSmiles=False) # shows [NH3+], [CH3], etc.
+
+    # Remove standalone [H], remove H/Hn within brackets, keep charges (e.g., [NH3+] -> [N+])
+    smiles_no_Hs = _remove_bracket_hydrogens_in_smiles(smiles_w_H)
+
     # Is there exactly one standalone character inside brackets? (i.e. the result of H 
     # stripping for [nH], [OH], etc.). If so, remove the brackets. (e.g. [n] -> n) 
-    smiles_no_Hs = re.sub(r'\[([^\[\]])\]', r'\1', smiles_no_Hs)
-    
+    # NOTE: This may already be handled by the helper; this line is safe as a final pass.
+    smiles_no_Hs = re.sub(r'\[([A-Za-z])\]', r'\1', smiles_no_Hs)
+
     # Complication: after converting the Mol obj to smiles, the Mol obj won't have the same 
     # atom order as the original Mol obj, which is important when extract CG coords. 
     # We need to rearrange the atom order of orig_substruct by getting the atom indices in 
     # the orig full molecule.
-    # -- Parse the SMILES back into a new molecule
-    mol_from_smarts = Chem.MolFromSmarts(smiles_no_Hs)
-    # -- Map original atoms to new atom order using substructure matching
-    matches_to_map_to_sub = orig_substruct.GetSubstructMatches(mol_from_smarts, 
-        uniquify=False) # returns all permutations of order of atom inds
-    # -- Reorder atoms in the original mol. matches_to_map_to_sub is a list of perms, so 
-    #    we just need to use the first one
-    renumbered_substruct = Chem.RenumberAtoms(orig_substruct, list(matches_to_map_to_sub[0]))
-    
-    return renumbered_substruct, smiles_no_Hs
+    # Parse the SMILES back into a new molecule: return the original substructure (Mol 
+    # unchanged) and the H-stripped SMILES string
+    return orig_substruct, smiles_no_Hs
 
 def fragment_on_bond_d(mol, radius):
     # Code from https://iwatobipen.wordpress.com/2020/08/12/get-and-draw-molecular-fragment-with-user-defined-path-rdkit-memo/
@@ -84,7 +114,8 @@ def is_organic(mol):
         return True
 
 def get_frags_from_pdbfile(pdbfile, lig_smiles):
-    query_struct = pr.parsePDB(pdbfile)
+    if pdbfile.endswith('.pdb') or pdbfile.endswith('.pdb.gz'):
+        query_struct = pr.parsePDB(pdbfile)
     # Identify ligand and fragment it
     hetatms = query_struct.hetatm.select('not (ion or resname SEP or resname TPO or resname MSE)')
     assert len(set(hetatms.getResindices())) == 1
