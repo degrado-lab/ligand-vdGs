@@ -102,7 +102,22 @@ def get_atom_coords(prody_obj, atom_name):
 def smiles_equiv(existingfrag, sub_smiles):
     mol1 = Chem.MolFromSmarts(existingfrag)
     mol2 = Chem.MolFromSmarts(sub_smiles)
-    is_equivalent = (mol1.HasSubstructMatch(mol2) and 
-                 mol2.HasSubstructMatch(mol1) and 
-                 mol1.GetNumAtoms() == mol2.GetNumAtoms())
+    mol1_has_mol2 = mol1.HasSubstructMatch(mol2) 
+    mol2_has_mol1 = mol2.HasSubstructMatch(mol1)
+
+    # sometimes, the smarts strings are equiv even if rdkit doesn't consider mol1 
+    # to contain mol2 or mol2 to contain mol1. only one of those statements has to 
+    # be true (along w/ having the same # of atoms). both statements needed to be 
+    # true when finding equivalent fragments for fragmenting the pdb ligand 
+    # database, but when finding matches to frags for scoring and validation, 
+    # it misses frags if both statements have to be true.
+    is_equivalent = (mol1.GetNumAtoms() == mol2.GetNumAtoms() and 
+            mol1_has_mol2 or mol2_has_mol1)
+
+    # give warning if mol1 has mol2 but mol2 doesn't have mol1, or vice versa
+    if (mol1_has_mol2 != mol2_has_mol1 and mol1.GetNumAtoms() == mol2.GetNumAtoms()):
+        print(f'WARNING: rdkit determined that "{existingfrag} containing {sub_smiles}" '
+              f'is {mol1_has_mol2} but "{sub_smiles} containing {existingfrag}" is '
+              f'{mol2_has_mol1}. Proceeding as if they are equivalent.')
+
     return is_equivalent

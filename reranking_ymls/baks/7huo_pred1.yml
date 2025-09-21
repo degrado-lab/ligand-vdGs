@@ -1,0 +1,9 @@
+rmsd_threshold: 0.75 
+query_pdbs_dir: '/wynton/home/degradolab/skt/docking/query_structs/7huo_preds/'
+solved_struct_path:  '/wynton/home/degradolab/skt/docking/target_structs/7huo.pdb' # ground truth
+lig_smiles: 'c1cc(c2ccoc2c1)CC(=O)N3CCC[C@@H](C3)C(=O)N'
+vdg_lib_dir: '/wynton/group/degradolab/skt/docking/databases/frag_vdg_lib'
+outdir: '/wynton/home/degradolab/skt/docking/vdg_matches'
+frags_to_exclude: []
+frags_to_include: 'all'
+query_pdbs: ['7huo_1.pdb']

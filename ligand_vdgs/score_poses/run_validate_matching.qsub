@@ -1,0 +1,23 @@
+#!/bin/bash
+
+#$ -S /bin/bash
+#$ -o /wynton/home/degradolab/skt/logs/reranking_logs
+#$ -cwd
+#$ -j y               # tells system STDERR and STDOUT should be joined
+####$ -pe smp 10
+#$ -R yes             #-- SGE host reservation
+
+date
+hostname
+
+conda activate py3.10
+
+echo
+echo "The config file is: $YMLFILE"
+echo
+
+python /wynton/home/degradolab/skt/docking/ligand-vdGs/ligand_vdgs/score_poses/score_poses.py $YMLFILE
+
+echo
+echo DONE
+date
