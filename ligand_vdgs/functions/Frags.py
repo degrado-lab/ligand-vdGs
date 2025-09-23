@@ -166,12 +166,13 @@ def summarize_frags(deduplicated_filtered_frags, frags_in_lib, frags_to_exclude,
         else:
             groups["In vdg lib and in include list"].append(sub_smiles)
 
-    print("\n=== Fragment summary ===", flush=True)
-    for category, frags in groups.items():
-        if frags:
-            print(f"{category}:", flush=True)
-            print("   ", ", ".join(frags), flush=True)
-    print("\n========================", flush=True)
+    if groups:
+        print("\n=== Fragment summary ===", flush=True)
+        for category, frags in groups.items():
+            if frags:
+                print(f"{category}:", flush=True)
+                print("   ", ", ".join(frags), flush=True)
+        print("\n========================", flush=True)
 
 def check_in_exclude_list(sub_smiles, frags_to_exclude):
     for frag in frags_to_exclude:
