@@ -1,3 +1,4 @@
+
 from itertools import combinations, product
 import numpy as np
 import os
@@ -5,7 +6,7 @@ import utils
 
 def get_bsr_combinations(solved_struct, ligname):
     bindingsite_residues = get_bindingsite_residues(solved_struct,
-        [], ligname, dist_from_lig=4.5, CA_only=False)
+        [], ligname, dist_from_lig=4.5, CA_only=False, quiet=True)
     bsr_combos = get_vdg_subsets(bindingsite_residues)
     all_bsr_combos = []
     for bsr_combo in bsr_combos:
@@ -32,7 +33,7 @@ def get_bsr_combinations(solved_struct, ligname):
     return all_bsr_combos
 
 def get_bindingsite_residues(prody_obj, addl_residues, ligname, dist_from_lig=8,
-                             CA_only=True):
+                             CA_only=True, quiet=True):
     res = []
     # Use CA_only when you're doing blind docking and don't want to use sc info
     # Use CA_only=False when you want to use sc positions to define interactions
@@ -51,9 +52,11 @@ def get_bindingsite_residues(prody_obj, addl_residues, ligname, dist_from_lig=8,
     for r in res:
         if not isinstance(r, tuple) or len(r) != 3:
             print(f"Invalid residue tuple: {r}")
-    print('\nbinding site residues for pymol selection:\n')
-    print('select bindingsite, ' + ' or '.join(
-    f'(seg {seg} and chain {chain} and resi {resnum})' for seg, chain, resnum in res) + '\n')
+    # Only print the pymol selection once (caller controls this via quiet)
+    if not quiet:
+        print('\nBinding site residues for pymol selection:\n')
+        print('select bindingsite, ' + ' or '.join(
+            f'(seg {seg} and chain {chain} and resi {resnum})' for seg, chain, resnum in res) + '\n')
     return res
 
 def get_vdg_subsets(input_list):
