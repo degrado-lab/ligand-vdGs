@@ -105,6 +105,13 @@ def smiles_equiv(existingfrag, sub_smiles):
     mol1_has_mol2 = mol1.HasSubstructMatch(mol2) 
     mol2_has_mol1 = mol2.HasSubstructMatch(mol1)
 
+    mol1_charge = Chem.GetFormalCharge(mol1)
+    mol2_charge = Chem.GetFormalCharge(mol2)
+
+    # is the element order correct?
+    mol1_elements = [atom.GetSymbol() for atom in mol1.GetAtoms()]
+    mol2_elements = [atom.GetSymbol() for atom in mol2.GetAtoms()]
+
     # sometimes, the smarts strings are equiv even if rdkit doesn't consider mol1 
     # to contain mol2 or mol2 to contain mol1. only one of those statements has to 
     # be true (along w/ having the same # of atoms). both statements needed to be 
@@ -112,10 +119,13 @@ def smiles_equiv(existingfrag, sub_smiles):
     # database, but when finding matches to frags for scoring and validation, 
     # it misses frags if both statements have to be true.
     is_equivalent = (mol1.GetNumAtoms() == mol2.GetNumAtoms() and 
-            mol1_has_mol2 or mol2_has_mol1)
+                        (mol1_has_mol2 or mol2_has_mol1) and 
+                        mol1_charge == mol2_charge and 
+                        mol1_elements == mol2_elements)
 
     # give warning if mol1 has mol2 but mol2 doesn't have mol1, or vice versa
-    if (mol1_has_mol2 != mol2_has_mol1 and mol1.GetNumAtoms() == mol2.GetNumAtoms()):
+    if (mol1_has_mol2 != mol2_has_mol1 and mol1.GetNumAtoms() == mol2.GetNumAtoms() and 
+        mol1_charge == mol2_charge and mol1_elements == mol2_elements):
         print(f'WARNING: rdkit determined that "{existingfrag} containing {sub_smiles}" '
               f'is {mol1_has_mol2} but "{sub_smiles} containing {existingfrag}" is '
               f'{mol2_has_mol1}. Proceeding as if they are equivalent.')

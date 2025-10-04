@@ -1,4 +1,4 @@
-rmsd_threshold: 0.75 
+rmsd_threshold: 0.7 
 query_pdbs_dir: '/wynton/home/degradolab/skt/docking/query_structs/7h69_preds/'
 solved_struct_path:  '/wynton/home/degradolab/skt/docking/target_structs/7h69.pdb' # ground truth
 lig_smiles: 'c1ccc2c(c1)cc(n2Cc3cccc4c3cc(cc4)F)C(=O)O' 

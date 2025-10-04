@@ -1,4 +1,4 @@
-rmsd_threshold: 0.75 
+rmsd_threshold: 0.7 
 query_pdbs_dir: '/wynton/home/degradolab/skt/docking/query_structs/4eyr_preds/'
 solved_struct_path:  '/wynton/home/degradolab/skt/docking/target_structs/4eyr.pdb' # ground truth
 lig_smiles: 'CC(C)c1nc(cs1)CN(C)C(=O)N[C@@H](C(C)C)C(=O)N[C@@H](Cc2ccccc2)C[C@@H]([C@H](Cc3ccccc3)NC(=O)OCc4cncs4)O'

@@ -5,6 +5,7 @@ from rdkit.Chem import AllChem
 import prody as pr
 import os
 import utils
+from collections import defaultdict
 
 def get_fragments(bond_radius, mol, min_frag_size=4, max_frag_size=7):
     # Decompose the ligand into fragments and store the fragment SMILES. Use SMILES 
@@ -12,27 +13,96 @@ def get_fragments(bond_radius, mol, min_frag_size=4, max_frag_size=7):
     # aryl (C,c vs. [#6]). Fragment on bond radii `bond_radius` AND the postive 
     # integers less than `bond_radius`, because for example, drugs containing 
     # sulfonamide might produce only 6-atom sulfonamides and not CS(N)(=O)=O. 
-    filtered_frags = []
+    filtered_frags = {} # key=sub_smiles, value = list of Mol objs
     substructs = []
     for rad in list(range(1, bond_radius + 1)):
         substructs += fragment_on_bond_d(mol, rad)
-    # Update frag_dict by adding the new fragments; skip if all-carbon
-    for orig_sub in substructs: # contains H's that need to be scrubbed.
-        # will have duplicates b/c we didn't check for duplicates yet.
-        sub, sub_smiles = manually_remove_Hs(orig_sub)
-        # apply size threshold.
-        frag_size = len([i for i in sub.GetAtoms() if i.GetSymbol() != 'H'])
-        if frag_size < min_frag_size or frag_size > max_frag_size:
-            continue
-        # skip if the elements are all carbons
-        frag_elements = "".join(sorted([a.GetSymbol() for a in sub.GetAtoms() if 
-                    a.GetSymbol() != 'H'])) # b/c rdkit will add implicit H's
-        frag_num_carbons = len([i for i in frag_elements if i == 'C' or i == 'c'])
-        if len(frag_elements) == frag_num_carbons:
-            continue
-        filtered_frags.append((sub, sub_smiles))
+    # Add substructs to `filtered_frags`.
+    for orig_sub, orig_mol_inds in substructs: # contains H's that need to be scrubbed.
+        sub_perms_mols_inds, sub_smiles = manually_remove_Hs(orig_sub, return_single_mol_or_perms='perms')
+        for sub, perm_inds in sub_perms_mols_inds: 
+            # apply size threshold.
+            frag_size = len([i for i in sub.GetAtoms() if i.GetSymbol() != 'H'])
+            if frag_size < min_frag_size or frag_size > max_frag_size:
+                continue
+            # skip if the elements are all carbons
+            frag_elements = "".join(sorted([a.GetSymbol() for a in sub.GetAtoms() if 
+                        a.GetSymbol() != 'H'])) # b/c rdkit will add implicit H's
+            frag_num_carbons = len([i for i in frag_elements if i == 'C' or i == 'c'])
+            if len(frag_elements) == frag_num_carbons:
+                continue
+            # add to dict
+            substruct_data = (sub, perm_inds, orig_mol_inds)
+            # get elements list based on perm_inds
+            if sub_smiles not in filtered_frags:
+                filtered_frags[sub_smiles] = [substruct_data]
+            else:
+                # check if this exact substructure (w/ same atom order) is already present.
+                # not sure why, but there are duplicates within the same lig obj.
+                already_present = False
+                for existing_sub, existing_sub_inds, existing_orig_mol_inds in filtered_frags[sub_smiles]:
+                    if (perm_inds, orig_mol_inds) == (existing_sub_inds, existing_orig_mol_inds):
+                        already_present = True
+                        break
+                if not already_present:
+                    filtered_frags[sub_smiles].append(substruct_data)
 
-    return filtered_frags
+    # Group substructs by instances (sites) in the ligand. For example, if a substruct has
+    # orig_mol_inds [14, 15, 16, 17] and another has [16, 17, 18, 19], they are the same 
+    # site. The purpose of grouping is to prevent overcounting of matches when there are diff 
+    # permutations of the same atoms or slight overlap of sites.
+    grouped_frags = {}
+    for sub_smiles, substruct_data in filtered_frags.items():
+        groups = group_lig_sites_by_overlap(substruct_data)
+        grouped_frags[sub_smiles] = groups
+        print(f"Fragment: {sub_smiles}, #perms: {len(substruct_data)}, "
+              f"#sites: {len(groups)}", flush=True)
+    return grouped_frags 
+
+def group_lig_sites_by_overlap(data, key_index=2, threshold=0.5):
+    '''Input: list of tuples (substruct Mol obj, perm_inds, orig_mol_inds) that describe 
+        instances of a frag in a lig. Determine whether each site has >1 instances, as 
+        determined by sharing (overlapping) >=1/2 of the atoms b/n one frag instance and 
+        another. For example, if one instance has orig_mol_inds [14, 15, 16, 17] and 
+        another has [16, 17, 18, 19], they are the considered the same site on the lig.
+        This avoids overcounting of matches when there are diff permutations of the CG.
+    Output: list of groups.
+    Method: Two frag instances are related if |A ∩ B| > threshold * max(|A|, |B|).
+    '''
+    sets = [set(item[key_index]) for item in data]
+    n = len(data)
+    # Union–find
+    parent = list(range(n))
+    rank = [0]*n
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra == rb: 
+            return
+        if rank[ra] < rank[rb]:
+            parent[ra] = rb
+        elif rank[ra] > rank[rb]:
+            parent[rb] = ra
+        else:
+            parent[rb] = ra
+            rank[ra] += 1
+    # Connect pairs that overlap 
+    for i in range(n):
+        for j in range(i+1, n):
+            inter = len(sets[i] & sets[j])
+            denom = max(len(sets[i]), len(sets[j])) # >= half
+            if inter >= threshold * denom:
+                union(i, j)
+    # Collect groups
+    groups = defaultdict(list)
+    for i in range(n):
+        groups[find(i)].append(data[i])
+
+    return list(groups.values())
 
 def _remove_bracket_hydrogens_in_smiles(smiles: str) -> str:
     """
@@ -67,12 +137,38 @@ def _remove_bracket_hydrogens_in_smiles(smiles: str) -> str:
     s = re.sub(r'\[([^\]]+)\]', _rewrite, s)
     return s
 
+def reorder_substruct_based_on_smiles(orig_substruct):
+    # Convert the Mol obj (`sub`) to SMILES, and then use the SMILES to reorder 
+    # the atoms in the Mol obj. This seems roundabout, but MolToSmiles() doesn't 
+    # cleanly map atom orders, and we want this sane SMILES that correctly 
+    # describes branching.
 
-def manually_remove_Hs(orig_substruct):
-    # Remove hydrogens. Docs say that Chem.RemoveHs() implicit and explicit are removed, 
+    # 0. Get initial SMILES
+    smiles_w_H = Chem.MolToSmiles(orig_substruct, allHsExplicit=True, 
+                              isomericSmiles=False) # shows [NH3+], [CH3], etc.
+    # 1. Parse the SMILES into a Mol
+    mol = Chem.MolFromSmiles(smiles_w_H)
+    # 2. Annotate atoms with their SMILES position
+    for i, atom in enumerate(mol.GetAtoms()):
+        atom.SetAtomMapNum(i)
+    # 3. Re-parse the SMILES so that GetAtoms() order = SMILES order
+    mol2 = Chem.MolFromSmiles(
+        Chem.MolToSmiles(mol, canonical=False, allHsExplicit=True, isomericSmiles=False))
+    # 4. Build permutation: new index -> original index
+    order = [a.GetAtomMapNum() for a in mol2.GetAtoms()]
+    # 5. Renumber the molecule to that order
+    reordered_sub = Chem.RenumberAtoms(mol, order)
+    return smiles_w_H, reordered_sub
+
+def manually_remove_Hs(orig_substruct, return_single_mol_or_perms):
+    '''return_single_mol_or_perms must be 'single' (for processing a whole ligand) or 
+    'perms' (when processing frags). '''
+    # Remove hydrogens. RDKit docs say that Chem.RemoveHs() implicit and explicit are removed, 
     # but this isn't true for [nH], [OH], [Ho], etc. so need to manually remove H's. 
     # Convert back to SMILES, without showing explicit hydrogens
-
+    smiles_w_H = Chem.MolToSmiles(orig_substruct, allHsExplicit=False, 
+                              isomericSmiles=False) # still has H's though unfortunately
+    
     # First, export SMILES *with explicit Hs shown* so that patterns like [NH3+] are present, 
     # then regex-strip bracket hydrogens while keeping charge and other annotations.
     smiles_w_H = Chem.MolToSmiles(orig_substruct, allHsExplicit=True, 
@@ -84,15 +180,30 @@ def manually_remove_Hs(orig_substruct):
     # Is there exactly one standalone character inside brackets? (i.e. the result of H 
     # stripping for [nH], [OH], etc.). If so, remove the brackets. (e.g. [n] -> n) 
     # NOTE: This may already be handled by the helper; this line is safe as a final pass.
-    smiles_no_Hs = re.sub(r'\[([A-Za-z])\]', r'\1', smiles_no_Hs)
-
+    smiles_no_Hs = re.sub(r'\[([A-Za-z])\]', r'\1', smiles_no_Hs) 
+    
     # Complication: after converting the Mol obj to smiles, the Mol obj won't have the same 
     # atom order as the original Mol obj, which is important when extract CG coords. 
     # We need to rearrange the atom order of orig_substruct by getting the atom indices in 
     # the orig full molecule.
-    # Parse the SMILES back into a new molecule: return the original substructure (Mol 
-    # unchanged) and the H-stripped SMILES string
-    return orig_substruct, smiles_no_Hs
+    # -- Parse the SMILES back into a new molecule
+    mol_from_smarts = Chem.MolFromSmarts(smiles_no_Hs)
+    # -- Map original atoms to new atom order using substructure matching
+    matches_to_map_to_sub = orig_substruct.GetSubstructMatches(mol_from_smarts, 
+        uniquify=False) # returns all permutations of order of atom inds
+    # -- Reorder atoms in the original mol. matches_to_map_to_sub is a list of perms, so 
+    #    we just need to use the first one
+    cg_atom_perms = []
+    for perm_inds in list(matches_to_map_to_sub):
+        mol_copy = Chem.Mol(orig_substruct) # for immutable deep copy; don't use copy.deepcopy()
+        renumbered_substruct = Chem.RenumberAtoms(mol_copy, perm_inds)
+        cg_atom_perms.append((renumbered_substruct, perm_inds))
+        elements_list = [atom.GetSymbol() for atom in renumbered_substruct.GetAtoms()]
+    if return_single_mol_or_perms == 'single':
+        return cg_atom_perms[0], smiles_no_Hs # return the first permutation only
+    elif return_single_mol_or_perms == 'perms':
+        return cg_atom_perms, smiles_no_Hs # return all permutations. `cg_atom_perms` is a 
+                                           # list of (substructure Mol objs, perm_inds)
 
 def fragment_on_bond_d(mol, radius):
     # Code from https://iwatobipen.wordpress.com/2020/08/12/get-and-draw-molecular-fragment-with-user-defined-path-rdkit-memo/
@@ -103,7 +214,10 @@ def fragment_on_bond_d(mol, radius):
             enforceSize=False) # don't enforce size to also get frags that are < radius away
         amap = {}
         submol = Chem.PathToSubmol(mol, env, atomMap=amap)
-        submols.append(submol)
+        # Store the submol and its atom indices in the original mol to ensure that if there 
+        # are >1 instances of a frag in a single ligand, they won't get skipped
+        orig_inds = sorted(amap.keys())
+        submols.append((submol, orig_inds))
     return submols
 
 def is_organic(mol):
@@ -129,12 +243,14 @@ def get_frags_from_pdbfile(pdbfile, lig_smiles):
     # correct valence and aromaticity 
     try:
         pdb_mol_assigned_bonds = AllChem.AssignBondOrdersFromTemplate(lig_template, pdb_mol)
-        pdb_mol_assigned_bonds_no_H, pdb_mol_smiles_no_H = manually_remove_Hs(pdb_mol_assigned_bonds)
+        pdb_mol_assigned_bonds_no_H_perm_inds, pdb_mol_smiles_no_H = manually_remove_Hs(
+            pdb_mol_assigned_bonds, return_single_mol_or_perms='single')
+        pdb_mol_assigned_bonds_no_H, pdb_mol_perm_inds = pdb_mol_assigned_bonds_no_H_perm_inds
         filtered_frags = get_fragments(2, pdb_mol_assigned_bonds_no_H, 4, 5)
         return filtered_frags, pdb_mol_assigned_bonds_no_H
     except ValueError as e:
         print(f"Error processing {pdbfile}: {e}", flush=True)
-        return [], None
+        return {}, None
 
 def check_vdg_job_status(sub_smiles, vdg_lib_dir):
     # Check if the vdg generation job finished without issues
@@ -145,8 +261,7 @@ def check_vdg_job_status(sub_smiles, vdg_lib_dir):
         log_contents = f.read()
     return 'Job completed.' in log_contents
 
-def summarize_frags(deduplicated_filtered_frags, frags_in_lib, frags_to_exclude, 
-                    frags_to_include):
+def summarize_frags(frags_in_lib, frags_to_exclude, frags_to_include):
     groups = {
         "Excluded": [],
         "Not in include list": [],
@@ -154,10 +269,11 @@ def summarize_frags(deduplicated_filtered_frags, frags_in_lib, frags_to_exclude,
         "Not in vdg lib or incomplete": [],
         "In vdg lib and in include list": []}
 
-    for sub, sub_smiles in deduplicated_filtered_frags:
+    for sub_smiles in frags_in_lib:
         if any(utils.smiles_equiv(f, sub_smiles) for f in frags_to_exclude):
             groups["Excluded"].append(sub_smiles)
-        elif frags_to_include != 'all' and isinstance(frags_to_include, list) and sub_smiles not in frags_to_include:
+        elif (frags_to_include != 'all' and isinstance(frags_to_include, list) and 
+              sub_smiles not in frags_to_include):
             groups["Not in include list"].append(sub_smiles)
         elif sub_smiles not in frags_in_lib:
             groups["Not searched"].append(sub_smiles)
@@ -167,7 +283,7 @@ def summarize_frags(deduplicated_filtered_frags, frags_in_lib, frags_to_exclude,
             groups["In vdg lib and in include list"].append(sub_smiles)
 
     if groups:
-        print("Fragment summary:", flush=True)
+        print("\nFragment summary:", flush=True)
         for category, frags in groups.items():
             if frags:
                 print(f"{category}:", flush=True)

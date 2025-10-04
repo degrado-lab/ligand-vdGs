@@ -3,6 +3,7 @@ from itertools import combinations, product
 import numpy as np
 import os
 import utils
+import re
 
 def get_bsr_combinations(solved_struct, ligname):
     bindingsite_residues = get_bindingsite_residues(solved_struct,
@@ -23,13 +24,14 @@ def get_bsr_combinations(solved_struct, ligname):
             input_bsr_bb_coords.append(res_bb_coords)
             AA = get_res_AA_identity(res_obj)
             bsr_AA_identities.append(AA)
-        bsr_AA_identities = [AA if AA != 'GLY' else 'bb' for AA in bsr_AA_identities]
+        bsr_AA_identities_conv_bb = [AA if AA != 'GLY' else 'bb' for AA in bsr_AA_identities]
         # All of the AAs have potential to provide bb contacts, so sample "bb" vdms
-        options = [(x,) if x == 'bb' else (x, 'bb') for x in bsr_AA_identities]
+        options = [(x,) if x == 'bb' else (x, 'bb') for x in bsr_AA_identities_conv_bb]
         combo_variants = list(product(*options))
         for c in combo_variants:
-            if c not in all_bsr_combos:
-                all_bsr_combos.append((c, input_bsr_bb_coords.copy())) 
+            bsr_aas_coords = (c, bsr_combo, bsr_AA_identities, input_bsr_bb_coords.copy())
+            if bsr_aas_coords not in all_bsr_combos:
+                all_bsr_combos.append(bsr_aas_coords)
     return all_bsr_combos
 
 def get_bindingsite_residues(prody_obj, addl_residues, ligname, dist_from_lig=8,
@@ -82,28 +84,43 @@ def get_res_AA_identity(res_obj):
     AA = res_obj.getResnames()[0]
     return AA
 
-def get_query_cg_coords(mol, sub):
-    query_matches = mol.GetSubstructMatches(sub, uniquify=False) # tuple of atom inds
-    q_cg_coord_perms = [] # each element is a permutation
-    for query_match in query_matches: # each permutation
-        perm_coords = []
-        # Get atom names, etc.
-        conf = mol.GetConformer()  # Get the 3D conformer to get coords 
-        assert len(query_match) == sub.GetNumAtoms()
-        
-        for atom_idx in query_match:
-            atom = mol.GetAtomWithIdx(atom_idx)
-            pos = conf.GetAtomPosition(atom_idx)  # returns an RDKit Point3D object
-            xyz = (pos.x, pos.y, pos.z)
-            perm_coords.append(xyz)
-        q_cg_coord_perms.append(np.array(perm_coords))
-    return q_cg_coord_perms
+def extract_elements(smiles: str):
+    # Return a list of elements in the order they appear in the SMILES string.
+    # Match:
+    # - Two-letter uppercase elements (Cl, Br, Si, Na, Li)
+    # - Single uppercase element (C, N, O, S, etc.)
+    # - Single lowercase aromatic atom (c, n, o, s, p)
+    pattern = r"(Cl|Br|Si|Na|Li|[A-Z]|[cnosp])"
+    return re.findall(pattern, smiles)
 
-def name_outdir(pdbfile, outdir, num_query_structs):
-    # Name the outdir for this pdb query
+def get_query_cg_coords(sub, sub_smiles):
+    coords_list = []
+    Mol_elements_list = []
+    # Get atom names, etc.
+    conf = sub.GetConformer()  # Get the 3D conformer to get coords
+    for atom in sub.GetAtoms():
+        pos = conf.GetAtomPosition(atom.GetIdx())  # returns an RDKit Point3D object
+        xyz = (pos.x, pos.y, pos.z)
+        coords_list.append(xyz)
+        Mol_elements_list.append(atom.GetSymbol())
+    
+    # Check that the atom orders are actually correct by checking the element names
+    smiles_elements = extract_elements(sub_smiles)
+    smiles_elements = [e.capitalize() for e in smiles_elements] # capital to match Mol elements
+    if smiles_elements != Mol_elements_list:
+        # Raise error
+        raise ValueError(f"Element order mismatch between SMILES and RDKit Mol:\n"
+                         f"SMILES elements: {smiles_elements}\n"
+                         f"Mol elements: {Mol_elements_list}")
+    return coords_list
+
+def name_outdir(pdbfile, outdir, make_pdb_subfolder):
+    # Name the outdir for this pdb query.
+    # `make_pdb_subfolder` indicates whether to make a subfolder for each pdb within 
+    # the outdir (e.g. for multiple predictions of the same PDB).
     pdbname = pdbfile.split('/')[-1].removesuffix('.pdb')
     pdb_id = pdbname[:4]
-    if num_query_structs > 1:
+    if make_pdb_subfolder:
         output_dir = os.path.join(outdir, pdb_id, pdbname)
     else:
         output_dir = os.path.join(outdir, pdbname)

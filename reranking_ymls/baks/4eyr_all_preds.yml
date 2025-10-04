@@ -6,5 +6,4 @@ vdg_lib_dir: '/wynton/group/degradolab/skt/docking/databases/frag_vdg_lib'
 outdir: '/wynton/home/degradolab/skt/docking/vdg_matches'
 frags_to_exclude: [] 
 frags_to_include: 'all'
-#frags_to_include: ['Cc(n)s', 'cc(C)n', 'NC(N)=O', 'CC(C)N', 'CC(N)=O', 'CC(C)O', 'NC(=O)O', 'cc(C)s', 'cncsc'] 
-query_pdbs: ['4eyr_4.pdb']
+query_pdbs: ['4eyr_1.pdb', '4eyr_2.pdb', '4eyr_3.pdb', '4eyr_4.pdb', '4eyr_5.pdb', '4eyr_6.pdb', '4eyr_7.pdb', '4eyr_8.pdb', '4eyr_9.pdb', '4eyr_10.pdb', '4eyr_true_pos.pdb']

@@ -4,6 +4,7 @@ solved_struct_path:  '/wynton/home/degradolab/skt/docking/target_structs/4eyr.pd
 lig_smiles: 'CC(C)c1nc(cs1)CN(C)C(=O)N[C@@H](C(C)C)C(=O)N[C@@H](Cc2ccccc2)C[C@@H]([C@H](Cc3ccccc3)NC(=O)OCc4cncs4)O'
 vdg_lib_dir: '/wynton/group/degradolab/skt/docking/databases/frag_vdg_lib'
 outdir: '/wynton/home/degradolab/skt/docking/vdg_matches'
-frags_to_exclude: ['CN(C)C'] 
-frags_to_include: ['Cc(n)s', 'cc(C)n', 'NC(N)=O', 'CC(C)N', 'CC(N)=O', 'CC(C)O', 'NC(=O)O', 'cc(C)s', 'cncsc'] 
+frags_to_exclude: [] 
+frags_to_include: 'all'
+#frags_to_include: ['Cc(n)s', 'cc(C)n', 'NC(N)=O', 'CC(C)N', 'CC(N)=O', 'CC(C)O', 'NC(=O)O', 'cc(C)s', 'cncsc'] 
 query_pdbs: ['4eyr_7.pdb']
