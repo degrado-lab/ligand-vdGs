@@ -1,5 +1,5 @@
-
 from itertools import combinations, product
+from functools import lru_cache
 import numpy as np
 import os
 import utils
@@ -126,15 +126,10 @@ def name_outdir(pdbfile, outdir, make_pdb_subfolder):
         output_dir = os.path.join(outdir, pdbname)
     return output_dir
 
-def map_aa_identities_to_vdg_resinds(vdg_AAs, target_list, wildcard='bb'):
-    '''
-    Given a list of amino acids in the prody obj (`vdg_AAs`) and a list of AAs to 
-    select for (`target_list`), find all permutations of indices (i.e., resindices) in the 
-    vdg (`vdg_AAs`) that match the target list elements in order. The amino acid `bb` 
-    is treated as a wildcard.
-    '''
-
-    # Find all indices (resindices)for each unique element (AA) in the target list
+@lru_cache(maxsize=8192)
+def _map_aa_identities_to_vdg_resinds_cached(vdg_AAs_tuple, target_list_tuple, wildcard='bb'):
+    vdg_AAs = list(vdg_AAs_tuple)
+    target_list = list(target_list_tuple)
     AA_indices = {}
 
     # Handle regular AAs (non-wildcards, i.e. not `bb`)
@@ -147,18 +142,16 @@ def map_aa_identities_to_vdg_resinds(vdg_AAs, target_list, wildcard='bb'):
                 'HIS', 'ILE', 'LEU', 'LYS', 'MET', 'PHE', 'PRO', 'SER',
                 'THR', 'TRP', 'TYR', 'VAL']
     if wildcard in target_list:
-        AA_indices[wildcard] = list(range(len(vdg_AAs)))
         AA_indices[wildcard] = [i for i, x in enumerate(vdg_AAs) if x in AA_codes]
     
     # Generate all permutations of indices
     result = []
-
     def backtrack(current_indices, target_position):
         # If we've matched all target elements, add the current permutation to result
         if target_position == len(target_list):
             result.append(current_indices.copy())
             return
-        
+
         # Get the next element to match
         current_element = target_list[target_position]
         
@@ -171,3 +164,12 @@ def map_aa_identities_to_vdg_resinds(vdg_AAs, target_list, wildcard='bb'):
                 current_indices.pop()  # Backtrack
     backtrack([], 0)
     return result
+
+def map_aa_identities_to_vdg_resinds(vdg_AAs, target_list, wildcard='bb'):
+    '''
+    Given a list of amino acids in the prody obj (`vdg_AAs`) and a list of AAs to 
+    select for (`target_list`), find all permutations of indices (i.e., resindices) in the 
+    vdg (`vdg_AAs`) that match the target list elements in order. The amino acid `bb` 
+    is treated as a wildcard.
+    '''
+    return _map_aa_identities_to_vdg_resinds_cached(tuple(vdg_AAs), tuple(target_list), wildcard)
