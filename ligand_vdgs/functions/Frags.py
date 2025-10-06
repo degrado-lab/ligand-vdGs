@@ -7,7 +7,7 @@ import os
 import utils
 from collections import defaultdict
 
-def get_fragments(bond_radius, mol, min_frag_size=4, max_frag_size=7):
+def get_fragments(bond_radius, mol, min_frag_size=4, max_frag_size=7, quiet=False): 
     # Decompose the ligand into fragments and store the fragment SMILES. Use SMILES 
     # instead of SMARTS b/c only SMILES (from rdkit) differentiates aliphatic and 
     # aryl (C,c vs. [#6]). Fragment on bond radii `bond_radius` AND the postive 
@@ -55,9 +55,10 @@ def get_fragments(bond_radius, mol, min_frag_size=4, max_frag_size=7):
     for sub_smiles, substruct_data in filtered_frags.items():
         groups = group_lig_sites_by_overlap(substruct_data)
         grouped_frags[sub_smiles] = groups
-        print(f"Fragment: {sub_smiles}, #perms: {len(substruct_data)}, "
-              f"#sites: {len(groups)}", flush=True)
-    return grouped_frags 
+        if not quiet: 
+            print(f"Fragment: {sub_smiles}, # perms: {len(substruct_data)}, "
+                  f"# sites: {len(groups)}", flush=True)
+    return grouped_frags
 
 def group_lig_sites_by_overlap(data, key_index=2, threshold=0.5):
     '''Input: list of tuples (substruct Mol obj, perm_inds, orig_mol_inds) that describe 
@@ -227,7 +228,7 @@ def is_organic(mol):
     else:
         return True
 
-def get_frags_from_pdbfile(pdbfile, lig_smiles):
+def get_frags_from_pdbfile(pdbfile, lig_smiles, quiet=False): 
     if pdbfile.endswith('.pdb') or pdbfile.endswith('.pdb.gz'):
         query_struct = pr.parsePDB(pdbfile)
     # Identify ligand and fragment it
@@ -246,7 +247,7 @@ def get_frags_from_pdbfile(pdbfile, lig_smiles):
         pdb_mol_assigned_bonds_no_H_perm_inds, pdb_mol_smiles_no_H = manually_remove_Hs(
             pdb_mol_assigned_bonds, return_single_mol_or_perms='single')
         pdb_mol_assigned_bonds_no_H, pdb_mol_perm_inds = pdb_mol_assigned_bonds_no_H_perm_inds
-        filtered_frags = get_fragments(2, pdb_mol_assigned_bonds_no_H, 4, 5)
+        filtered_frags = get_fragments(2, pdb_mol_assigned_bonds_no_H, 4, 5, quiet=quiet)
         return filtered_frags, pdb_mol_assigned_bonds_no_H
     except ValueError as e:
         print(f"Error processing {pdbfile}: {e}", flush=True)

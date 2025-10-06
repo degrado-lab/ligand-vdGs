@@ -7,7 +7,7 @@ import re
 
 def get_bsr_combinations(solved_struct, ligname):
     bindingsite_residues = get_bindingsite_residues(solved_struct,
-        [], ligname, dist_from_lig=4.5, CA_only=False, quiet=True)
+        [], ligname, dist_from_lig=4.5, CA_only=False, quiet=False)
     bsr_combos = get_vdg_subsets(bindingsite_residues)
     all_bsr_combos = []
     for bsr_combo in bsr_combos:
@@ -35,7 +35,7 @@ def get_bsr_combinations(solved_struct, ligname):
     return all_bsr_combos
 
 def get_bindingsite_residues(prody_obj, addl_residues, ligname, dist_from_lig=8,
-                             CA_only=True, quiet=True):
+                             CA_only=True, quiet=False):
     res = []
     # Use CA_only when you're doing blind docking and don't want to use sc info
     # Use CA_only=False when you want to use sc positions to define interactions

@@ -9,29 +9,31 @@ def handle_existing_files(out_dir):
             'output dir name to prevent accidental overwriting.')
 
 def set_up_outdir(outdir, overwrite=False):
-    '''Create outdir if it does not exist, and require overwrite_existing if it does, 
+    '''Create outdir if it does not exist, and require overwrite_existing if it does,
     so that there are no stale files.'''
-
     if os.path.exists(outdir):
         if not os.path.isdir(outdir):
             raise ValueError(f'The filename you designated as the output directory, {outdir}, '
                              'already exists and is not a directory.')
-        if overwrite: 
+        if overwrite:
             print(f'\nWarning: overwriting existing output directory {outdir} because '
                   'overwrite_existing was set to True.\n')
-            shutil.rmtree(outdir) # removes the dir and everything in it
-            os.makedirs(outdir)
-        else: # check if there are already files. ignore if there are empty dirs.
-            if len(os.listdir(outdir)) > 0:
+            # Another process might remove/create concurrently; guard with try/except.
+            try:
+                shutil.rmtree(outdir)
+            except FileNotFoundError:
+                pass
+            os.makedirs(outdir, exist_ok=True)
+        else:
+            # Allow empty dirs; error only if files are present.
+            if any(os.scandir(outdir)):
                 raise ValueError(f'The output directory {outdir} is not empty. Remove files or '
-                                'set overwrite_existing to True to prevent accidental overwriting.')
-    
-    else: # dir doesn't exist, so create it
+                                 'set overwrite_existing to True to prevent accidental overwriting.')
+    else:
         parent_dir = os.path.dirname(outdir)
-        if parent_dir: # skip cases where parent_dir is "" for the current working dir.
-            if not os.path.exists(parent_dir):
-                os.makedirs(parent_dir) 
-            os.makedirs(outdir)
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
+        os.makedirs(outdir, exist_ok=True)
 
 def valid_database_subdir_format(input_dir):
     ''' Ensure that the pdb database dir has subdirs formatted similarly to the RCSB
