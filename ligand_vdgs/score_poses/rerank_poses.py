@@ -130,14 +130,18 @@ def _process_one_pdb(pdbfile):
         # Get all fragments. For every frag, iterate over the bsr combos and determine 
         # vdg matches.
         frags_in_lib = {}
+        dbname_smiles_map = {} # map original -> dbname name used in vdg lib
             
         orig_filtered_frags, pdb_mol_reassigned = Frags.get_frags_from_pdbfile(
             os.path.join(query_pdbs_dir, pdbfile), lig_smiles, quiet=True)
         filtered_frags = {}
         for sub_smiles, substruct_perm_grouped_by_site in orig_filtered_frags.items():
-            frags_in_lib = check_frag_in_vdg_lib(sub_smiles, frags_in_lib, vdg_lib_dir)
-            if frags_in_lib.get(sub_smiles, False): 
-                filtered_frags[sub_smiles] = substruct_perm_grouped_by_site
+            frags_in_lib, db_name = check_frag_in_vdg_lib(sub_smiles, frags_in_lib, vdg_lib_dir)
+            dbname_smiles_map[sub_smiles] = db_name
+            if frags_in_lib.get(db_name, False):
+                # store under db_name key so downstream lookups are consistent
+                filtered_frags[db_name] = substruct_perm_grouped_by_site
+
 
         # For every frag that's in the vdg lib, iterate over the bsr combos and determine 
         # vdg matches.
@@ -277,40 +281,42 @@ def check_frag_in_vdg_lib(sub_smiles, frags_in_lib, vdg_lib_dir):
     '''Determine whether this sub_smiles has been processed and completed in the 
     vdg_lib_dir and mark its status in the frags_in_lib dict.'''
     # Step 0) is this frag named something else in the vdg lib?
+    db_name = sub_smiles
+
     for existingfrag in _listdir_cached(vdg_lib_dir):
         if utils.smiles_equiv(existingfrag, sub_smiles):
-            sub_smiles = existingfrag
+            db_name = existingfrag
             break
 
     # Is it in frags_to_exclude?
-    if Frags.check_in_exclude_list(sub_smiles, frags_to_exclude): 
+    if Frags.check_in_exclude_list(db_name, frags_to_exclude):
         # does internal check for smiles equivalence. 
-        return frags_in_lib
+        return frags_in_lib, db_name
 
     # Is it in vdg lib and the job didn't break?
-    if sub_smiles not in frags_in_lib:
+    if db_name not in frags_in_lib:
         # Is it in the vdg lib dir?
-        if sub_smiles in _listdir_cached(vdg_lib_dir): 
+        if db_name in _listdir_cached(vdg_lib_dir):
             # Did the job (to create the vdgs) finish w/o issue?
-            if Frags.check_vdg_job_status(sub_smiles, vdg_lib_dir):
-                frags_in_lib[sub_smiles] = True
+            if Frags.check_vdg_job_status(db_name, vdg_lib_dir):
+                frags_in_lib[db_name] = True
             else:
-                frags_in_lib[sub_smiles] = False 
-        else: 
+                frags_in_lib[db_name] = False
+        else:
             # If the str isn't in os.listdir(), it's still possible that a 
             # degenerate smiles is in vdg_lib_dir
             for existingfrag in _listdir_cached(vdg_lib_dir):
                 # Is it equivalent to sub_smiles and was its job completed?
-                is_equivalent = utils.smiles_equiv(existingfrag, sub_smiles)
-                if is_equivalent: # rename the smiles to match what's in db
-                    sub_smiles = existingfrag
+                is_equivalent = utils.smiles_equiv(existingfrag, db_name)
+                if is_equivalent:  # rename the smiles to match what's in db
+                    db_name = existingfrag
                 if is_equivalent and Frags.check_vdg_job_status(existingfrag, vdg_lib_dir):
-                    frags_in_lib[sub_smiles] = True
+                    frags_in_lib[db_name] = True
                     break
             else:
-                frags_in_lib[sub_smiles] = False
+                frags_in_lib[db_name] = False
 
-    return frags_in_lib
+    return frags_in_lib, db_name
 
 def should_run_frag(sub_smiles, frags_to_include, frags_in_lib):
     ''' Determine whether to sample this frag or not based on the yml inputs. 
@@ -319,11 +325,11 @@ def should_run_frag(sub_smiles, frags_to_include, frags_in_lib):
     if frags_to_include == 'all':
         pass
     elif isinstance(frags_to_include, list):
-        # If frags_to_include is a list, check if sub_smiles is in the list
-        if sub_smiles not in frags_to_include:
+        if not any(utils.smiles_equiv(sub_smiles, inc) for inc in frags_to_include):
             return False
     else:
         raise ValueError("frags_to_include must be 'all' or a list of SMILES.")
+
     # Now, check if this frag is in the vdg lib and its job is completed
     if sub_smiles not in frags_in_lib:
         # Meaning: not being searched for (possibly being excluded in yml file)
@@ -385,9 +391,11 @@ def main():
 
         # compute the same frags_in_lib mapping we do per-PDB, then summarize once
         frags_in_lib_once = {}
+        dbname_keys_once = {}
         for sub_smiles in orig_filtered_frags_once.keys():
-            frags_in_lib_once = check_frag_in_vdg_lib(sub_smiles, frags_in_lib_once, 
-                                                      vdg_lib_dir)
+            frags_in_lib_once, db_name = check_frag_in_vdg_lib(sub_smiles, frags_in_lib_once, 
+                                                                 vdg_lib_dir)
+            dbname_keys_once[sub_smiles] = db_name
 
         Frags.summarize_frags(frags_in_lib_once, frags_to_exclude, frags_to_include)
 

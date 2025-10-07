@@ -128,7 +128,7 @@ def smiles_equiv(existingfrag, sub_smiles):
     # give warning if mol1 has mol2 but mol2 doesn't have mol1, or vice versa
     if (mol1_has_mol2 != mol2_has_mol1 and mol1.GetNumAtoms() == mol2.GetNumAtoms() and 
         mol1_charge == mol2_charge and mol1_elements == mol2_elements):
-        print(f'WARNING: rdkit determined that "{existingfrag} containing {sub_smiles}" '
+        print(f'\nWARNING: rdkit determined that "{existingfrag} containing {sub_smiles}" '
               f'is {mol1_has_mol2} but "{sub_smiles} containing {existingfrag}" is '
               f'{mol2_has_mol1}. Proceeding as if they are equivalent.')
 

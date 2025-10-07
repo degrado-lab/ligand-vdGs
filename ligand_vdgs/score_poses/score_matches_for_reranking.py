@@ -4,15 +4,14 @@ from pprint import pprint
 ## didn't work: 
 ## 8rlp, 7h69
 
-#matches_dir = '/wynton/home/degradolab/skt/docking/vdg_matches/save_singleproc_1rm8_frags'
-matches_dir = '/wynton/home/degradolab/skt/docking/vdg_matches/1fax_frags'
-#matches_dir = '/wynton/home/degradolab/skt/docking/vdg_matches/1g2m_frags'
 #matches_dir = '/wynton/home/degradolab/skt/docking/vdg_matches/4eyr'
 #matches_dir = '/wynton/home/degradolab/skt/docking/vdg_matches/7h69'
-#matches_dir = '/wynton/home/degradolab/skt/docking/vdg_matches/7hcg'
+matches_dir = '/wynton/home/degradolab/skt/docking/vdg_matches/7hcg'
 #matches_dir = '/wynton/home/degradolab/skt/docking/vdg_matches/8rlp'
 #matches_dir = '/wynton/home/degradolab/skt/docking/vdg_matches/8sce'
-rmsd_cut = 0.75
+rmsd_cut = 0.6
+
+ignore_frags = ['CC(C)N', 'CN(C)C', 'Cn(c)c']
 
 scores_dict = {} # key = struct name, val = num of matches per frag
 
@@ -24,9 +23,12 @@ else:
 for structure in structures:
     structure_path = os.path.join(matches_dir, structure)
     structure = os.path.basename(structure_path)
+    pdbname = structure[:4]
     assert structure not in scores_dict.keys()
     scores_dict[structure] = {}
     for frag in os.listdir(structure_path):
+        if frag in ignore_frags:
+            continue
         frag_path = os.path.join(structure_path, frag)
         num_frag_matches = 0
         for bsr_combo in os.listdir(frag_path):
@@ -34,8 +36,14 @@ for structure in structures:
             for match in os.listdir(bsr_combo_path):
                 # does this vdg match meet the rmsd cutoff?
                 match_rmsd = float(match.split('_')[-1].removesuffix('.pdb'))
-                if match_rmsd <= rmsd_cut:
-                    num_frag_matches += 1
+                if match_rmsd > rmsd_cut:
+                    continue
+                match_pdb = match.split('_')[-12]
+                if match_pdb in pdbname:
+                    print(f'Excluding {match}')
+                    continue
+                num_frag_matches += 1
+
         assert frag not in scores_dict[structure].keys()
         scores_dict[structure][frag] = num_frag_matches
 
@@ -61,8 +69,7 @@ for sample, frags in scores_dict.items():
 total_samples = len(scores_dict)
 frag_avgs = {
     k: sum(scores_dict[sample][k] for sample in scores_dict) / total_samples
-    for k in all_keys
-}
+    for k in all_keys}
 
 # Step 1: Collect total scores
 sample_totals = {}
