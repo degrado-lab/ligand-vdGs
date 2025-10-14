@@ -1,4 +1,4 @@
-rmsd_threshold: 0.7 
+rmsd_threshold: 0.8 
 query_pdbs_dir: '/wynton/home/degradolab/skt/docking/query_structs/7hc7_preds/'
 solved_struct_path:  '/wynton/home/degradolab/skt/docking/target_structs/7hc7.pdb' # ground truth
 lig_smiles: 'O=C(NC1CC1)Nc2cccc3c2[nH]c4ncnc(NN5CCCC5=O)c34'

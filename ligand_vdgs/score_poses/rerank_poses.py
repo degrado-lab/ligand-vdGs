@@ -73,14 +73,20 @@ def _precompute_vdg(vdg_full_path):
         return _VDG_PARSE_CACHE[vdg_full_path]
     vdg_prody_obj = pr.parsePDB(vdg_full_path)
     resindices = sorted(set(vdg_prody_obj.getResindices()))
+    num_vdms = int(vdg_full_path.split('/')[-3])
     # Not sure why, but some vdg pdbs have duplicate residues. Resindex 0 is always 
     # the lig, and the 1st and 2nd resindices are the bsrs. Select just those indices 
     # and ignore the duplicated residues.
-    resindices = resindices[:3] # first 3 residues are always lig + 2 bsrs. 
+    if num_vdms == 2:
+        resindices = resindices[:3] # first 3 residues are always lig + 2 bsrs.
+        bb_resinds = [1, 2] 
+    elif num_vdms == 1:
+        resindices = resindices[:2]
+        bb_resinds = [1]
     vdg_AAs = [vdg_prody_obj.select(f'resindex {_r}').getResnames()[0] for _r in resindices]
     # Precompute backbone atom coords per residue once
     bb_cache = {}
-    for _r in [1, 2]: # resindex 0 = lig
+    for _r in bb_resinds: # resindex 0 = lig
         sel = vdg_prody_obj.select(f'resindex {_r}')
         bb_cache[_r] = {
             'N':  utils.get_atom_coords(sel, 'N'),
@@ -169,9 +175,6 @@ def _process_one_pdb(pdbfile):
             # (incl. the CG) onto it, keeping track of the vdGs that have low rmsd to the 
             # known bb+CG.
             for combo, bsrlabel, bsrAAs, coords in _ALL_BSR_COMBOS:
-                # Retain pairs only
-                if len(combo) != 2:
-                    continue
                 bsr_incl_bb_identities = combo
                 input_bsr_bb_coords = coords
                 # Reorder the bb coords and bsr_AA_identities in alphabetic order

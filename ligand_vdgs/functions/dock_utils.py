@@ -13,8 +13,6 @@ def get_bsr_combinations(solved_struct, ligname):
     for bsr_combo in bsr_combos:
         bsr_AA_identities = []
         input_bsr_bb_coords = []
-        if len(bsr_combo) != 2:
-            continue
         for bsr in bsr_combo: 
             bsr_seg, bsr_chain, bsr_resnum = bsr
             res_obj = select_residue(solved_struct, bsr_seg, bsr_chain, bsr_resnum)
@@ -64,8 +62,8 @@ def get_bindingsite_residues(prody_obj, addl_residues, ligname, dist_from_lig=8,
 def get_vdg_subsets(input_list):
     # Initialize an empty list to store all subsets
     all_subsets = []
-    # Loop through subset sizes 2 to 3, generate combos, then add to list
-    for r in range(2, 4): # exclude subset size 1
+    # Loop through subset sizes 1& 2, generate combos, then add to list
+    for r in range(1, 3):
         subsets = combinations(input_list, r)
         all_subsets.extend(subsets)
     return all_subsets
