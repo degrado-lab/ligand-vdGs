@@ -1,0 +1,9 @@
+rmsd_threshold: 0.7
+query_pdbs_dir: '/wynton/home/degradolab/skt/docking/query_structs/9d9i_dimer_preds/'
+solved_struct_path:  '/wynton/home/degradolab/skt/docking/target_structs/9d9i_dimer.pdb' # ground truth
+lig_smiles: 'NC1=Nc2sc(CNC3CCN(CC3)C[C@@](O)(Cn4cncn4)c5ccc(F)cc5F)cc2N(C1=O)c6ccc7OCCN(c8ccccc8)c7c6'
+vdg_lib_dir: '/wynton/group/degradolab/skt/docking/databases/frag_vdg_lib'
+outdir: '/wynton/home/degradolab/skt/docking/vdg_matches'
+frags_to_exclude: [] 
+frags_to_include: 'all'
+query_pdbs: 'all'

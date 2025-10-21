@@ -1,4 +1,4 @@
-rmsd_threshold: 0.8
+rmsd_threshold: 0.7
 query_pdbs_dir: '/wynton/home/degradolab/skt/docking/query_structs/9foe_preds/'
 solved_struct_path:  '/wynton/home/degradolab/skt/docking/target_structs/9foe.pdb' # ground truth
 lig_smiles: 'CCN(Cc1ccncc1)c2cc(C)nc(n2)N3CCC[C@H]3CNC(N)=O'

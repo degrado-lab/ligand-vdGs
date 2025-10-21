@@ -1,4 +1,4 @@
-rmsd_threshold: 0.8 
+rmsd_threshold: 0.7
 query_pdbs_dir: '/wynton/home/degradolab/skt/docking/query_structs/8sce_preds/'
 solved_struct_path:  '/wynton/home/degradolab/skt/docking/target_structs/8sce.pdb' # ground truth
 lig_smiles: 'CC(C)Nc1cc(Nc2ncncc2F)ncc1C(=O)NC[C@@H](F)C(C)(C)O'

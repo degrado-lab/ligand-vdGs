@@ -20,9 +20,10 @@ import utils
 import multiprocessing as mp
 from contextlib import redirect_stdout, redirect_stderr
 import logging
-from rdkit import rdBase
-from rdkit import RDLogger
+from rdkit import Chem, RDLogger, rdBase
+from rdkit.Chem import AllChem, rdMolAlign as MA
 import io
+import tempfile
 
 with open(sys.argv[1], 'r') as f:
     config = yaml.safe_load(f)
@@ -58,6 +59,7 @@ _VDG_PARSE_CACHE = {}           # path -> (vdg_prody_obj, vdg_AAs,
                                 # bb_cache{resindex:{'N':arr,'CA':arr,'C':arr}})
 _SOLVED_STRUCT = None           # for caching across workers
 _ALL_BSR_COMBOS = None          # for caching across workers
+_REF_LIG_MOL = None             # ref ligand cache
 
 def _listdir_cached(path):
     # cache os.listdir to avoid repeated disk scans.
@@ -112,7 +114,10 @@ def _init_rdkit_logging(stream_like):
 def _process_one_pdb(pdbfile):
     # Run vdg matching. Capture stdout/stderr to an in-memory buffer so that messages 
     # won't be interleaved when using multiple processes.
-    global _SOLVED_STRUCT, _ALL_BSR_COMBOS
+    lig_rmsd_value = None
+    global _SOLVED_STRUCT, _ALL_BSR_COMBOS, _REF_LIG_MOL
+
+    # Ensure solved struct / combos are ready
     if _SOLVED_STRUCT is None or _ALL_BSR_COMBOS is None:
         _SOLVED_STRUCT = pr.parsePDB(solved_struct_path)
         lig_obj = _SOLVED_STRUCT.hetatm.select(
@@ -123,6 +128,28 @@ def _process_one_pdb(pdbfile):
                 f'to reformat the lig resname in the PDB file.')
         ligname = list(set(lig_obj.getResnames()))[0]
         _ALL_BSR_COMBOS = dock.get_bsr_combinations(_SOLVED_STRUCT, ligname)
+
+    # Define reference lig
+    if _REF_LIG_MOL is None:
+        # use existing _SOLVED_STRUCT if available
+        _solved = _SOLVED_STRUCT or pr.parsePDB(solved_struct_path)
+        lig_obj = _solved.hetatm.select('not (ion or resname SEP or resname TPO or resname MSE)')
+        if lig_obj is None:
+            raise ValueError(
+                f'Prody could not find ligand atoms in {solved_struct_path}. You may need '
+                f'to reformat the lig resname in the PDB file.')
+
+        with tempfile.NamedTemporaryFile(suffix=".pdb", delete=False) as _tmp_ref_pdb:
+            pr.writePDB(_tmp_ref_pdb.name, lig_obj)
+
+        _ref_pdb_mol = Chem.MolFromPDBFile(_tmp_ref_pdb.name, removeHs=True)
+        _ref_template = Chem.MolFromSmiles(lig_smiles)
+        if _ref_pdb_mol is None or _ref_template is None:
+            raise ValueError("Failed to build RDKit molecules for target ligand RMSD.")
+
+        _ref_assigned = AllChem.AssignBondOrdersFromTemplate(_ref_template, _ref_pdb_mol)
+        (_REF_LIG_MOL, _ref_perm_inds), _ref_smiles_no_H = Frags.manually_remove_Hs(
+            _ref_assigned, return_single_mol_or_perms='single')
 
     failed_vdg_files = []
     buf = io.StringIO()
@@ -140,6 +167,22 @@ def _process_one_pdb(pdbfile):
             
         orig_filtered_frags, pdb_mol_reassigned = Frags.get_frags_from_pdbfile(
             os.path.join(query_pdbs_dir, pdbfile), lig_smiles, quiet=True)
+        
+        # Symmetry-aware heavy-atom ligand -> target RMSD using RDKit
+        if pdb_mol_reassigned is not None and _REF_LIG_MOL is not None:
+            try:
+                if pdb_mol_reassigned.GetNumAtoms() != _REF_LIG_MOL.GetNumAtoms():
+                    print(
+                        f'WARNING: ligand atom count mismatch; skipping RMSD for {pdbfile}. '
+                        f'query={pdb_mol_reassigned.GetNumAtoms()} '
+                        f'ref={_REF_LIG_MOL.GetNumAtoms()}'
+                    )
+                else:
+                    lig_rmsd_value = MA.CalcRMS(pdb_mol_reassigned, _REF_LIG_MOL)
+                    print(f'Ligand→target RMSD (heavy-atom, symmetry-corrected): {lig_rmsd_value:.3f} Å')
+            except Exception as e:
+                print(f'WARNING: failed to compute ligand RMSD for {pdbfile}: {e}')
+
         filtered_frags = {}
         for sub_smiles, substruct_perm_grouped_by_site in orig_filtered_frags.items():
             frags_in_lib, db_name = check_frag_in_vdg_lib(sub_smiles, frags_in_lib, vdg_lib_dir)
@@ -271,53 +314,50 @@ def _process_one_pdb(pdbfile):
                             f"{sub_smiles}_"
                             f"{vdg_path.rstrip('/').split('/')[-1].removesuffix('.pdb.gz')}_"
                             f"{db_to_query_rmsd:.2f}")
-                        output_vdg_path = os.path.join(subdir_path, output_vdg_name+'.pdb')
+                        output_vdg_path = os.path.join(subdir_path, output_vdg_name+'.pdb.gz')
                         if os.path.exists(output_vdg_path):
                             print('WARNING: overwriting existing file', output_vdg_path)
                         pr.writePDB(output_vdg_path, pr.applyTransformation(db_transf, 
                                                                     vdg_prody_obj.copy()))
 
     log_text = buf.getvalue()
-    return (pdbfile, log_text, failed_vdg_files)
+    return (pdbfile, log_text, failed_vdg_files, lig_rmsd_value)
 
 def check_frag_in_vdg_lib(sub_smiles, frags_in_lib, vdg_lib_dir):
     '''Determine whether this sub_smiles has been processed and completed in the 
     vdg_lib_dir and mark its status in the frags_in_lib dict.'''
     # Step 0) is this frag named something else in the vdg lib?
-    db_name = sub_smiles
-
-    for existingfrag in _listdir_cached(vdg_lib_dir):
-        if utils.smiles_equiv(existingfrag, sub_smiles):
-            db_name = existingfrag
-            break
-
+    found_db_name = False
+    if sub_smiles in _listdir_cached(vdg_lib_dir):
+        db_name = sub_smiles
+        found_db_name = True
+    else:
+        for existingfrag in _listdir_cached(vdg_lib_dir):
+            if utils.smiles_equiv(existingfrag, sub_smiles):
+                db_name = existingfrag # replace db_name
+                found_db_name = True
+                break
+    if not found_db_name:
+        db_name = sub_smiles
+    
     # Is it in frags_to_exclude?
     if Frags.check_in_exclude_list(db_name, frags_to_exclude):
         # does internal check for smiles equivalence. 
         return frags_in_lib, db_name
 
     # Is it in vdg lib and the job didn't break?
-    if db_name not in frags_in_lib:
-        # Is it in the vdg lib dir?
+    if db_name in frags_in_lib:
+        pass # don't have to do anything; already in frags_in_lib
+    elif db_name not in frags_in_lib:
+        # Is it in the vdg lib dir at all?
         if db_name in _listdir_cached(vdg_lib_dir):
             # Did the job (to create the vdgs) finish w/o issue?
             if Frags.check_vdg_job_status(db_name, vdg_lib_dir):
                 frags_in_lib[db_name] = True
             else:
                 frags_in_lib[db_name] = False
-        else:
-            # If the str isn't in os.listdir(), it's still possible that a 
-            # degenerate smiles is in vdg_lib_dir
-            for existingfrag in _listdir_cached(vdg_lib_dir):
-                # Is it equivalent to sub_smiles and was its job completed?
-                is_equivalent = utils.smiles_equiv(existingfrag, db_name)
-                if is_equivalent:  # rename the smiles to match what's in db
-                    db_name = existingfrag
-                if is_equivalent and Frags.check_vdg_job_status(existingfrag, vdg_lib_dir):
-                    frags_in_lib[db_name] = True
-                    break
-            else:
-                frags_in_lib[db_name] = False
+        else: # Not in vdg lib at all
+            frags_in_lib[db_name] = False
 
     return frags_in_lib, db_name
 
@@ -328,17 +368,16 @@ def should_run_frag(sub_smiles, frags_to_include, frags_in_lib):
     if frags_to_include == 'all':
         pass
     elif isinstance(frags_to_include, list):
-        if not any(utils.smiles_equiv(sub_smiles, inc) for inc in frags_to_include):
+        if not sub_smiles in frags_to_include:
             return False
     else:
         raise ValueError("frags_to_include must be 'all' or a list of SMILES.")
 
     # Now, check if this frag is in the vdg lib and its job is completed
     if sub_smiles not in frags_in_lib:
-        # Meaning: not being searched for (possibly being excluded in yml file)
         return False
     if not frags_in_lib[sub_smiles]:
-        # Meaning: not in vdg lib
+        # Meaning: not in vdg lib, or job incomplete
         return False
     return True
 
@@ -412,7 +451,9 @@ def main():
     with mp.Pool(processes=n_workers) as pool:
         results = pool.map(_process_one_pdb, pdb_list)  # preserves order of pdb_list
 
-    for pdbfile, log_text, _failed in results:
+    rmsd_records = []
+    for pdbfile, log_text, _failed, lig_rmsd_value in results:
+
         sep = f"\n==================== {pdbfile} ====================\n"
         sys.stdout.write(sep)
         if log_text:
@@ -421,9 +462,12 @@ def main():
                 sys.stdout.write("\n")
         sys.stdout.flush()
 
+        if lig_rmsd_value is not None:
+            rmsd_records.append((pdbfile, lig_rmsd_value))
+
     # Union failures across workers
     all_failed = set()
-    for _pdbfile, _log_text, _failed in results:
+    for _pdbfile, _log_text, _failed, _ in results:  # ignore last element
         all_failed.update(_failed)
 
     if all_failed:
@@ -431,6 +475,15 @@ def main():
         for f in sorted(all_failed):
             print(f" - {f}")
         print("", flush=True)
+
+    # Write RMSD summary file
+    pdbname = pdbfile[:4]
+    rmsd_outfile = os.path.join(outdir, pdbname, "ligand_rmsd_summary.txt")
+    with open(rmsd_outfile, "w") as f:
+        f.write("pdbfile\tligand_target_RMSD(Å)\n")
+        for pdb, rmsd in sorted(rmsd_records):
+            f.write(f"{pdb}\t{rmsd:.3f}\n")
+    print(f"\nWrote RMSD summary to: {rmsd_outfile}\n", flush=True)
 
     return
 

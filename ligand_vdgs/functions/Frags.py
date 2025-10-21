@@ -271,16 +271,15 @@ def summarize_frags(frags_in_lib, frags_to_exclude, frags_to_include):
         "In vdg lib and in include list": []}
 
     for sub_smiles in frags_in_lib:
-        if any(utils.smiles_equiv(f, sub_smiles) for f in frags_to_exclude):
+        if sub_smiles in frags_to_exclude:
             groups["Excluded"].append(sub_smiles)
         elif (frags_to_include != 'all' and isinstance(frags_to_include, list) and 
-              not any(utils.smiles_equiv(sub_smiles, inc) for inc in frags_to_include)):
+              sub_smiles not in frags_to_include):
             groups["Not in include list"].append(sub_smiles)
         elif not frags_in_lib[sub_smiles]:
             groups["Not in vdg lib or incomplete"].append(sub_smiles)
         else:
             groups["In vdg lib and in include list"].append(sub_smiles)
-
 
     if groups:
         print("\nFragment summary:", flush=True)
