@@ -499,15 +499,11 @@ def get_bb_coords(obj):
       bb_coords.append(coord)
    return bb_coords
 
-def get_vdg_subsets(input_list):
-    # Group by quadruples, triples, pairs, and singles.
-    # Initialize an empty list to store all subsets
-    all_subsets = []
-    # Loop through subset sizes 1 to 2, generate combos, then add to list
-    for r in [1, 2]:
-        subsets = combinations(input_list, r)
-        all_subsets.extend(subsets)
-    return all_subsets
+def get_vdg_subsets(input_list, target_size):
+    # Generate combos of residues containing `target_size` elements.
+   if len(input_list) < target_size:
+        return []  
+   return list(combinations(input_list, target_size)) 
 
 def add_vdgs_to_dict(vdm_combos, vdg_subset, re_ordered_aas, re_ordered_bbcoords, 
                      re_ordered_flankingseqs, re_ordered_CAs, re_ordered_scrr, 

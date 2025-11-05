@@ -51,12 +51,12 @@ def parse_args():
                         "when superposing output vdGs. Not weights for clustering. "
                         "Example: 0.5 means 1/2 of weight is assigned to CG atoms and "
                         "the remaining 1/2 goes to the vdM backbone atoms. Defaults to 0.99.")
-    parser.add_argument('-q', "--seq", default=0.40,
+    parser.add_argument('-q', "--seq", default=0.40, type=float, 
                         help="Sequence similarity threshold for clustering sequences "
                         "flanking the vdM to determine redundancy. This should be a "
                         "value between 0 and 1. Values > seq will be considered "
                         "redundant. Defaults to 0.4.")
-    parser.add_argument('-f', "--flank", default=2,
+    parser.add_argument('-f', "--flank", default=2, type=int, 
                         help="Number of residues +/- the vdms for which to "
                         "calculate sequence similarity and backbone similarity. Defaults "
                         "to 2.")
@@ -174,7 +174,7 @@ def main():
       vdms_dict = clust.get_vdm_res_features(prody_obj, pdbpath, num_flanking)
       # Determine the vdM combinations, up to 4 residues
       vdm_resinds = list(vdms_dict.keys())
-      vdg_subsets = clust.get_vdg_subsets(vdm_resinds)
+      vdg_subsets = clust.get_vdg_subsets(vdm_resinds, size_subset)
       # Iterate over subsets of resinds
       for vdg_subset in vdg_subsets:
          # Record these features in the same order as in vdg_subset. Then, sort all 
