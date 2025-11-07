@@ -1,3 +1,5 @@
+# align_and_cluster.py
+
 import os
 import gzip
 from itertools import permutations, combinations, product
@@ -6,6 +8,10 @@ import multiprocessing
 import gc
 import prody as pr
 import time
+from functools import lru_cache
+
+_RMSD_MAXSIZE = 3_000_000   # ~0.75 GiB target RAM
+_SEQ_MAXSIZE  = 1_000_000   # ~0.25 GiB target RAM
 
 EPS = 1e-9   # strict-improvement epsilon for reassignment; tune to 1e-8 if needed
 
@@ -110,7 +116,6 @@ def get_leader_clusters(
     final_exact_medoid_pass=True,             # polish small clusters cheaply
     final_reassign_once=True                  # one refinement pass
 ):
-    # ---- materialize inputs just like your hierarchical function ----
     metrics, datasets = [], []
     for data, metric in data_to_clus:
         metrics.append(metric); datasets.append(data)
@@ -121,32 +126,84 @@ def get_leader_clusters(
     if n == 1:
         return {1: [0]}, {1: 0}
 
-    # ---- distance using your exact components (RMSD + seq dissim/2) ----
+    # Implement persistent LRU memoization to reuse distances across leader pass, 
+    # exact-medoid, and reassignment without per-call sizing or cache resets.
+    
+    # Initialize once per process; keep references on the function object
+    if not hasattr(get_leader_clusters, "_seqsim_cached"):
+        # small global registries mapping dataset ids -> actual arrays
+        get_leader_clusters._SEQ_DATASETS  = {}
+        get_leader_clusters._RMSD_DATASETS = {}
+
+        # cache sequence similarity (0..100). key: (id(seq_dataset), i, j)
+        @lru_cache(maxsize=_SEQ_MAXSIZE)  # defined at module scope
+        def _seqsim_cached(ds_id, i, j):
+            # use the function's registries to avoid late-binding issues
+            seq = get_leader_clusters._SEQ_DATASETS[ds_id]
+            return calc_seq_similarity(seq[i], seq[j])
+
+        # cache RMSD by metric and dataset identity.
+        # key: (metric_name, id(dataset), i, j, AA_subset, size_subset, vdglib_dir)
+        @lru_cache(maxsize=_RMSD_MAXSIZE)  # defined at module scope
+        def _rmsd_cached(metric_name, ds_id, i, j, AA_subset, size_subset, vdglib_dir):
+            data = get_leader_clusters._RMSD_DATASETS[(metric_name, ds_id)]
+            X = data[i]; Y = data[j]
+            return _rmsd_pair(X, Y, AA_subset, size_subset, vdglib_dir)
+
+        # stash them on the function so they persist across calls
+        get_leader_clusters._seqsim_cached = _seqsim_cached
+        get_leader_clusters._rmsd_cached   = _rmsd_cached
+
+    # aliases
+    _seqsim_cached = get_leader_clusters._seqsim_cached
+    _rmsd_cached   = get_leader_clusters._rmsd_cached
+    _SEQ_DATASETS  = get_leader_clusters._SEQ_DATASETS
+    _RMSD_DATASETS = get_leader_clusters._RMSD_DATASETS
+
+    # register the current datasets by identity for caching 
+    dsid_seq     = id(metric_to_data['flankseq']) if 'flankseq' in metric_to_data else None
+    dsid_flankbb = id(metric_to_data['flankbb'])  if 'flankbb'  in metric_to_data else None
+    dsid_cgvdmbb = id(metric_to_data['cgvdmbb'])  if 'cgvdmbb'  in metric_to_data else None
+
+    if dsid_seq is not None and dsid_seq not in _SEQ_DATASETS:
+        _SEQ_DATASETS[dsid_seq] = metric_to_data['flankseq']
+    if dsid_flankbb is not None and ('flankbb', dsid_flankbb) not in _RMSD_DATASETS:
+        _RMSD_DATASETS[('flankbb', dsid_flankbb)] = metric_to_data['flankbb']
+    if dsid_cgvdmbb is not None and ('cgvdmbb', dsid_cgvdmbb) not in _RMSD_DATASETS:
+        _RMSD_DATASETS[('cgvdmbb', dsid_cgvdmbb)] = metric_to_data['cgvdmbb']
+
+    def _ord_pair(i, j):
+        # Order indices so (i, j) and (j, i) share the same cache entry.
+        return (i, j) if i <= j else (j, i)
+
+    # ---- distance using (RMSD + seq dissim/2) ----
     def _dist_idx_idx(i, j, early_stop=True, cap=None):
         # cap: if provided, we early-exit once total > min(cap, threshold)
         cutoff = threshold if cap is None else min(cap, threshold)
         total = 0.0
 
-        if 'flankseq' in metric_to_data:
-            sim = calc_seq_similarity(metric_to_data['flankseq'][i],
-                                      metric_to_data['flankseq'][j])  # 0..100
+        if dsid_seq is not None:
+            # pull seq sim from persistent cache instead of recomputing
+            a, b = _ord_pair(i, j)
+            sim = _seqsim_cached(dsid_seq, a, b)  # 0..100
             total += ((100.0 - sim) / 100.0) * seq_weight
             if early_stop and total > cutoff:
                 return total
 
-        if 'flankbb' in metric_to_data:
-            total += _rmsd_pair(metric_to_data['flankbb'][i],
-                                metric_to_data['flankbb'][j],
-                                AA_subset, size_subset, vdglib_dir)
+        if dsid_flankbb is not None:
+            # cached RMSD for 'flankbb'
+            a, b = _ord_pair(i, j)
+            total += _rmsd_cached('flankbb', dsid_flankbb, a, b,
+                                  AA_subset, size_subset, vdglib_dir)
             if early_stop and total > cutoff:
                 return total
 
-        if 'cgvdmbb' in metric_to_data:
-            total += _rmsd_pair(metric_to_data['cgvdmbb'][i],
-                                metric_to_data['cgvdmbb'][j],
-                                AA_subset, size_subset, vdglib_dir)
-            if early_stop and total > cutoff:
-                return total
+        if dsid_cgvdmbb is not None:
+            # cached RMSD for 'cgvdmbb'
+            a, b = _ord_pair(i, j)
+            total += _rmsd_cached('cgvdmbb', dsid_cgvdmbb, a, b,
+                                  AA_subset, size_subset, vdglib_dir)
+            # no need to early return; we're done
 
         return total
 
@@ -159,6 +216,7 @@ def get_leader_clusters(
             s = 0.0
             for o in members:
                 if o == c: continue
+                # same distance, hits persistent caches
                 s += _dist_idx_idx(c, o, early_stop=False)  # <- full distance
                 if s >= best_sum:  # early break on the SUM, not on threshold
                     break
@@ -171,13 +229,13 @@ def get_leader_clusters(
     members = [[0]]       # cluster memberships (lists of indices)
 
     for i in range(1, n):
-        
         best_j, best_d = -1, float('inf')
         for j, r in enumerate(reps):
-            d = _dist_idx_idx(i, r, early_stop=True, cap=best_d) 
+            # Use persistent caches for distance calls
+            d = _dist_idx_idx(i, r, early_stop=True, cap=best_d)
             if d < best_d:
                 best_d, best_j = d, j
-        
+
         if best_d <= threshold and best_j >= 0:
             # assign to existing cluster
             members[best_j].append(i)
@@ -190,7 +248,7 @@ def get_leader_clusters(
             # periodic refresh for big clusters
             elif refresh_medoid_every and (size_now % refresh_medoid_every == 0):
                 reps[best_j] = _exact_medoid(members[best_j])
-            
+
         else:
             # start new cluster
             reps.append(i)
@@ -212,14 +270,14 @@ def get_leader_clusters(
             moved_any = False
             for i in range(n):
                 cur_j = item2clus[i]
+                # Distances to medoids hit persistent caches
                 d_cur = _dist_idx_idx(i, reps[cur_j], early_stop=True, cap=threshold)
-                # d_cur already computed
                 best_j, best_d = cur_j, d_cur
-                
+
                 # If nothing can beat ~0, skip quickly
                 if best_d <= EPS:
                     continue
-                 
+
                 for j, r in enumerate(reps):
                     if j == cur_j:
                         continue
@@ -229,7 +287,7 @@ def get_leader_clusters(
                     d = _dist_idx_idx(i, r, early_stop=True, cap=strict_cap)
                     if d < best_d:
                         best_d, best_j = d, j
-                
+
                 # Reassign only if strictly closer and within threshold
                 if best_j != cur_j and best_d <= threshold and best_d + EPS < d_cur:
                     # move i
@@ -247,12 +305,11 @@ def get_leader_clusters(
                     new_reps.append(_exact_medoid(mem))
                 members, reps = new_members, new_reps
 
-    # ---- Build outputs compatible with your pipeline ----
     clus_assignments = {cnum+1: mem for cnum, mem in enumerate(members)}
     centroids        = {cnum+1: reps[cnum] for cnum in range(len(reps))}
     return clus_assignments, centroids
 
-def kabsch(X, Y, AA_subset, size_subset, vdglib_dir, chunk_size=30000):
+def kabsch(X, Y, chunk_size=30000):
    """Rotate and translate X into Y to minimize the SSD between the two, 
       and find the derivatives of the SSD with respect to the entries of Y. 
       
@@ -318,13 +375,13 @@ def kabsch(X, Y, AA_subset, size_subset, vdglib_dir, chunk_size=30000):
    return R, t, ssd
 
 def _rmsd_pair(X, Y, AA_subset, size_subset, vdglib_dir):
-    """RMSD between two coordinate arrays (N,3), using your existing Kabsch."""
+    '''RMSD between two coordinate arrays (N,3)'''
     X = np.asarray(X, dtype=np.float64)
     Y = np.asarray(Y, dtype=np.float64)
     if X.shape != Y.shape:
         raise ValueError(f"RMSD pair got mismatched shapes: {X.shape} vs {Y.shape}")
-    # Reuse your vectorized Kabsch with a single pair (M=1)
-    _, _, ssd = kabsch(X[None, ...], Y[None, ...], AA_subset, size_subset, vdglib_dir, chunk_size=1)
+    # Use vectorized Kabsch with a single pair (M=1)
+    _, _, ssd = kabsch(X[None, ...], Y[None, ...], chunk_size=1)
     n_atoms = X.shape[0]
     return float(np.sqrt(ssd[0] / n_atoms))
 
@@ -353,8 +410,7 @@ def get_vdm_res_features(prody_obj, pdbpath, num_flanking):
    # Identify the vdM residues (occ == 2). To be safe, select > 1.5 and < 2.5.
    vdm_residues = prody_obj.select('(occupancy) > 1.5 and (occupancy < 2.5)')
    vdm_resinds = set(vdm_residues.getResindices())
-   # Record features of the vdm residues (bb coords, flanking residues, pdb paths, 
-   # etc.)
+   # Record features of the vdm residues (bb coords, flanking residues, pdb paths, etc.)
    vdms_dict = {}
    for vdm_resind in vdm_resinds:
       vdm_obj = vdm_residues.select(f'resindex {vdm_resind}')
@@ -528,7 +584,6 @@ def add_vdgs_to_dict(vdm_combos, vdg_subset, re_ordered_aas, re_ordered_bbcoords
 
 def reorder_vdg_subset(vdg_subset, vdms_dict, cg_obj, prody_obj):
    '''Reorders vdms alphabetically.'''
-   # First, record
    aas_of_vdms_in_order = []
    bb_coords_of_vdms_in_order = []
    flankingseqs_of_vdms_in_order = []
@@ -856,7 +911,7 @@ def get_transf_and_coords(mobile_coords, target_coords, weights, obj, scrrs,
    lowest_rmsd, best_transf, best_moved_coords = None, None, None 
    # Iterate through each permutation
    for perm in perms:
-      # combing cg and vdmbb
+      # combining cg and vdmbb
       rearranged_coords = np.vstack([perm, mobile_coords[len(symmetry_classes):]])
       assert weights.shape[0] == rearranged_coords.shape[0], \
             "weights/coords length mismatch (rearranged)"
@@ -957,7 +1012,7 @@ def rewrite_temp_clusters(clusdir, clean_dir, size_subset, subset_AAs):
       reassigned_clusdir = os.path.join(clean_dir, f'clus_{new_cgvdmbb_clusnum}')
       os.makedirs(reassigned_clusdir)
 
-      # Copy over the vdgs
+      # Move the vdgs.
       for vdg in vdgs:
          pdbbase, vdmscrrs, ix, vdgpath = vdg
          renumbered_clusters[new_cgvdmbb_clusnum].append(int(ix))

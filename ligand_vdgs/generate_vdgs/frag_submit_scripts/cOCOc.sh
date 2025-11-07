@@ -16,7 +16,7 @@ hostname
 
 conda activate py3.10
 
-python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py -s "cOCOc" -c "cOCOc" -p /wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2/ -b /wynton/group/degradolab/skt/docking/databases/probe_output/ -o /wynton/group/degradolab/skt/docking/databases/frag_vdg_lib/ -m 1000 
+python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py -s "cOCOc" -c "cOCOc" -p /wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2/ -b /wynton/group/degradolab/skt/docking/databases/probe_output/ -o /wynton/group/degradolab/skt/docking/databases/frag_vdg_lib/ -m 1000 --symmetry-classes 0 1 2 1 0
 
 date # end time
 

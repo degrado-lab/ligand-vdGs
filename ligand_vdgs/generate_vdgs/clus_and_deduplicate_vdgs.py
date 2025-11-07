@@ -139,12 +139,6 @@ def main():
    vdglib_dir = args.vdglib_dir
    vdg_pdbs_dir = os.path.join(vdglib_dir, 'vdg_pdbs')
    out_dir = os.path.join(vdglib_dir, 'nr_vdgs')
-
-   # Comment out bc will print out once for each thread
-   '''
-   with open(logfile, 'a') as file:
-        file.write(f"{'='*20} Starting deduplicate_reun_vdgs.py run {'='*20} \n")
-   '''
    
    # Initialize vdm_combos dict to store the subsets of vdMs within a vdG
    vdm_combos = {}
@@ -167,7 +161,7 @@ def main():
          with open(logfile, 'a') as file:
             file.write(f'\tIncorrect number of occ >= 3 atoms in vdg_pdbs/{pdbname}.\n')
          continue
-      # define symmetry class if it's None so it's compatible with pdb output naming
+      # Define symmetry class if it's None so it's compatible with pdb output naming
       if symmetry_classes is None:
          symmetry_classes = [i for i in range(len(cg_coords))]
       # Characterize the vdM residues (bb coords, flanking residues, pdb paths, etc.)
@@ -308,8 +302,8 @@ def copy_nr_to_outdir(vdglib_dir, nr_dir, reordered_AAs):
             break # identified the centroid, so break out of loop
 
 def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs, 
-      symmetry_classes, vdglib_dir, align_cg_weight, num_flanking, num_threads,  
-      atomgroup_dict, print_flankbb, logfile):
+   symmetry_classes, vdglib_dir, align_cg_weight, num_flanking, num_threads,  
+   atomgroup_dict, print_flankbb, logfile):
    # vdG subsets that have identical vdm AA compositions may be redudant.
    # First, get all AA permutations for identical AAs. For example, if the vdms are 
    # [Ala1, Ala2, Glu], then we need to sample [Ala1, Ala2, Glu] and [Ala2, Ala1, 
@@ -358,7 +352,6 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
    # Define dir to output "temp" files (temp bc clusters need to be reassigned
    # later to handle degenerate binding sites for different AA and CG 
    # permutations of the same PDB).
-
    temp_cgvdmbb_clusdir = os.path.join(vdglib_dir, 'clusters', 'temp', 'cgvdmbb', 
       str(len(reordered_AAs)), reordered_AAs_str) 
    utils.handle_existing_files(temp_cgvdmbb_clusdir)
