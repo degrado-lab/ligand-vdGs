@@ -75,7 +75,7 @@ def min_clash_dist(elem1, elem2, hbond_tol=0.6, general_tol=0.4):
     can_hbond = {frozenset(['N', 'O']), frozenset(['O', 'O']), frozenset(['N', 'N'])}
 
     if elem1 not in vdw_radii:
-        print('Undefined vdw radius for elemen:', elem1)
+        print('Undefined vdw radius for element:', elem1)
         vdw1 = max(vdw_radii.values())
     else:
         vdw1 = vdw_radii[elem1]
@@ -114,12 +114,6 @@ def smiles_equiv(existingfrag, sub_smiles):
     mol1_elements = [atom.GetSymbol() for atom in mol1.GetAtoms()]
     mol2_elements = [atom.GetSymbol() for atom in mol2.GetAtoms()]
 
-    # sometimes, the smarts strings are equiv even if rdkit doesn't consider mol1 
-    # to contain mol2 or mol2 to contain mol1. only one of those statements has to 
-    # be true (along w/ having the same # of atoms). both statements needed to be 
-    # true when finding equivalent fragments for fragmenting the pdb ligand 
-    # database, but when finding matches to frags for scoring and validation, 
-    # it misses frags if both statements have to be true.
     is_equivalent = (mol1.GetNumAtoms() == mol2.GetNumAtoms() and 
                         mol1_has_mol2 and mol2_has_mol1 and 
                         mol1_charge == mol2_charge and 

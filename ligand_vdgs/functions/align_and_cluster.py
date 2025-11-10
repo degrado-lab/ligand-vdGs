@@ -4,14 +4,15 @@ import os
 import gzip
 from itertools import permutations, combinations, product
 import numpy as np
-import multiprocessing
 import gc
 import prody as pr
 import time
 from functools import lru_cache
+import shutil
 
-_RMSD_MAXSIZE = 3_000_000   # ~0.75 GiB target RAM
-_SEQ_MAXSIZE  = 1_000_000   # ~0.25 GiB target RAM
+_RMSD_CACHE_MAXSIZE = 100_000
+_SEQ_CACHE_MAXSIZE  = 50_000
+_ATOMGROUP_CACHE_MAXSIZE = 1000
 
 EPS = 1e-9   # strict-improvement epsilon for reassignment; tune to 1e-8 if needed
 
@@ -136,19 +137,20 @@ def get_leader_clusters(
         get_leader_clusters._RMSD_DATASETS = {}
 
         # cache sequence similarity (0..100). key: (id(seq_dataset), i, j)
-        @lru_cache(maxsize=_SEQ_MAXSIZE)  # defined at module scope
+        @lru_cache(maxsize=_SEQ_CACHE_MAXSIZE)  # defined at module scope
         def _seqsim_cached(ds_id, i, j):
             # use the function's registries to avoid late-binding issues
             seq = get_leader_clusters._SEQ_DATASETS[ds_id]
             return calc_seq_similarity(seq[i], seq[j])
 
         # cache RMSD by metric and dataset identity.
-        # key: (metric_name, id(dataset), i, j, AA_subset, size_subset, vdglib_dir)
-        @lru_cache(maxsize=_RMSD_MAXSIZE)  # defined at module scope
-        def _rmsd_cached(metric_name, ds_id, i, j, AA_subset, size_subset, vdglib_dir):
+        # key: (metric_name, id(dataset), i, j
+        @lru_cache(maxsize=_RMSD_CACHE_MAXSIZE)
+        def _rmsd_cached(metric_name, ds_id, i, j):
+            a, b = _ord_pair(i, j)
             data = get_leader_clusters._RMSD_DATASETS[(metric_name, ds_id)]
-            X = data[i]; Y = data[j]
-            return _rmsd_pair(X, Y, AA_subset, size_subset, vdglib_dir)
+            X = data[a]; Y = data[b]
+            return _rmsd_pair(X, Y)
 
         # stash them on the function so they persist across calls
         get_leader_clusters._seqsim_cached = _seqsim_cached
@@ -193,18 +195,14 @@ def get_leader_clusters(
         if dsid_flankbb is not None:
             # cached RMSD for 'flankbb'
             a, b = _ord_pair(i, j)
-            total += _rmsd_cached('flankbb', dsid_flankbb, a, b,
-                                  AA_subset, size_subset, vdglib_dir)
+            total += _rmsd_cached('flankbb', dsid_flankbb, i, j)
             if early_stop and total > cutoff:
                 return total
 
         if dsid_cgvdmbb is not None:
             # cached RMSD for 'cgvdmbb'
             a, b = _ord_pair(i, j)
-            total += _rmsd_cached('cgvdmbb', dsid_cgvdmbb, a, b,
-                                  AA_subset, size_subset, vdglib_dir)
-            # no need to early return; we're done
-
+            total += _rmsd_cached('cgvdmbb', dsid_cgvdmbb, i, j)
         return total
 
     # ---- exact medoid (O(m^2), but m is small for small clusters) ----
@@ -310,71 +308,70 @@ def get_leader_clusters(
     return clus_assignments, centroids
 
 def kabsch(X, Y, chunk_size=30000):
-   """Rotate and translate X into Y to minimize the SSD between the two, 
-      and find the derivatives of the SSD with respect to the entries of Y. 
-      
-      Implements the SVD method by Kabsch et al. (Acta Crystallogr. 1976, 
-      A32, 922).
+    """
+    Rotate and translate X into Y to minimize SSD (Kabsch, 1976).
+    X, Y: arrays of shape [M, N, 3]
+    Returns:
+        R:   [M, 3, 3]
+        t:   [M, 3]
+        ssd: [M]
+    """
+    R_chunks, t_chunks, ssd_chunks = [], [], []
+    M = len(X)
 
-   Parameters
-   ----------
-   X : np.array [M x N x 3]
-      Array of M sets of mobile coordinates (N x 3) to be transformed by a 
-      proper rotation to minimize sum squared displacement (SSD) from Y.
-   Y : np.array [M x N x 3]
-      Array of M sets of stationary coordinates relative to which to 
-      transform X.
+    for start in range(0, M, chunk_size):
+        stop = min(start + chunk_size, M)
+        Xc_in = X[start:stop]
+        Yc_in = Y[start:stop]
 
-   Returns
-   -------
-   R : np.array [M x 3 x 3]
-      Proper rotation matrices required to transform each set of coordinates 
-      in X such that its SSD with the corresponding coordinates in Y is 
-      minimized.
-   t : np.array [M x 3]
-      Translation matrix required to transform X such that its SSD with Y 
-      is minimized.
-   ssd : np.array [M]
-      Sum squared displacement after alignment for each pair of coordinates.
-   """
-   n_chunks = len(X) // chunk_size + 1
-   R_chunks, t_chunks, ssd_chunks = [], [], []
-   for i in range(n_chunks):
-      # compute R using the Kabsch algorithm
-      mask = np.logical_or(np.isnan(X[i*chunk_size:(i+1)*chunk_size]), 
-                           np.isnan(Y[i*chunk_size:(i+1)*chunk_size]))
-      N = np.sum(~mask, axis=1, keepdims=True)
-      X_nonan = np.zeros_like(X[i*chunk_size:(i+1)*chunk_size], dtype=np.float32)
-      Y_nonan = np.zeros_like(Y[i*chunk_size:(i+1)*chunk_size], dtype=np.float32)
-      X_nonan[~mask], Y_nonan[~mask] = \
-         X[i*chunk_size:(i+1)*chunk_size][~mask], \
-         Y[i*chunk_size:(i+1)*chunk_size][~mask]
-      Xbar = np.sum(X_nonan, axis=1, keepdims=True) / N
-      Ybar = np.sum(Y_nonan, axis=1, keepdims=True) / N
-      Xc = X_nonan - Xbar
-      Yc = Y_nonan - Ybar
-      Xc[mask] = 0.0
-      Yc[mask] = 0.0
-      H = np.matmul(np.transpose(Xc, (0, 2, 1)), Yc)
-      U, S, Vt = np.linalg.svd(H)
-      d = np.sign(np.linalg.det(np.matmul(U, Vt)))
+        mask = np.logical_or(np.isnan(Xc_in), np.isnan(Yc_in))
+        valid_atom = ~np.any(mask, axis=2)
+        N_atoms = np.sum(valid_atom, axis=1, keepdims=True)
+        zero_rows = (N_atoms == 0).squeeze(-1)
+        safeN = np.where(N_atoms == 0, 1, N_atoms)
 
-      D = np.zeros((Xc.shape[0], 3, 3), dtype=np.float32)
-      D[:, 0, 0] = 1.
-      D[:, 1, 1] = 1.
-      D[:, 2, 2] = d
-      R = np.matmul(U, np.matmul(D, Vt))
-      t = (Ybar - np.matmul(Xbar, R)).reshape((-1, 3))
-      # compute SSD from aligned coordinates XR
-      XRmY = np.matmul(Xc, R) - Yc
-      ssd = np.sum(XRmY ** 2, axis=(1, 2))
-      R_chunks.append(R), t_chunks.append(t), ssd_chunks.append(ssd)
-   R, t, ssd = np.concatenate(R_chunks), \
-               np.concatenate(t_chunks), \
-               np.concatenate(ssd_chunks)
-   return R, t, ssd
+        X_nonan = np.where(mask, 0.0, Xc_in).astype(np.float32)
+        Y_nonan = np.where(mask, 0.0, Yc_in).astype(np.float32)
 
-def _rmsd_pair(X, Y, AA_subset, size_subset, vdglib_dir):
+        valid_coords = np.repeat(valid_atom[:, :, None], 3, axis=2)
+        Xbar = (np.sum(X_nonan * valid_coords, axis=1, keepdims=True) /
+                safeN[:, None, :].astype(np.float32))
+        Ybar = (np.sum(Y_nonan * valid_coords, axis=1, keepdims=True) /
+                safeN[:, None, :].astype(np.float32))
+
+        Xc = X_nonan - Xbar
+        Yc = Y_nonan - Ybar
+        Xc[mask] = 0.0
+        Yc[mask] = 0.0
+
+        H = np.matmul(np.transpose(Xc, (0, 2, 1)), Yc)
+        U, S, Vt = np.linalg.svd(H, full_matrices=False)
+        d = np.sign(np.linalg.det(np.matmul(U, Vt))).astype(np.float32)
+
+        D = np.zeros((H.shape[0], 3, 3), dtype=np.float32)
+        D[:, 0, 0] = 1.0
+        D[:, 1, 1] = 1.0
+        D[:, 2, 2] = d
+
+        R = np.matmul(U.astype(np.float32), np.matmul(D, Vt.astype(np.float32)))
+        t = (Ybar - np.matmul(Xbar, R)).reshape(-1, 3)
+
+        XRmY = np.matmul(Xc, R) - Yc
+        ssd = np.sum(XRmY ** 2, axis=(1, 2)).astype(np.float64)
+
+        if np.any(zero_rows):
+            ssd[zero_rows] = np.inf
+
+        R_chunks.append(R)
+        t_chunks.append(t.astype(np.float32))
+        ssd_chunks.append(ssd)
+
+    R = np.concatenate(R_chunks) if R_chunks else np.empty((0, 3, 3), np.float32)
+    t = np.concatenate(t_chunks) if t_chunks else np.empty((0, 3), np.float32)
+    ssd = np.concatenate(ssd_chunks) if ssd_chunks else np.empty((0,), np.float64)
+    return R, t, ssd
+
+def _rmsd_pair(X, Y,):
     '''RMSD between two coordinate arrays (N,3)'''
     X = np.asarray(X, dtype=np.float64)
     Y = np.asarray(Y, dtype=np.float64)
@@ -386,7 +383,8 @@ def _rmsd_pair(X, Y, AA_subset, size_subset, vdglib_dir):
     return float(np.sqrt(ssd[0] / n_atoms))
 
 def calc_seq_similarity(list1, list2):
-    # Count how many residues match
+   # Percent identity of flanking residue names after dropping positions labeled 'vdm' 
+   # or 'X'. Returns identity=0 (max dissimilarity) if all positions drop.
     list1 = [i for i in list1 if i != 'vdm']
     list2 = [i for i in list2 if i != 'vdm']
     assert len(list1) == len(list2)
@@ -399,7 +397,8 @@ def calc_seq_similarity(list1, list2):
     list2 = [item for idx, item in enumerate(list2) if idx not in indices_to_exclude]
     matches = sum(1 for a, b in zip(list1, list2) if a == b)
 
-    # Calculate the percentage of matches
+    # Calculate the percentage of matches. If all residues were dropped out, 
+    # it should be treated as max dissimilarity.
     if len(list1) == 0:
         match_percentage = 0
     else:
@@ -495,41 +494,59 @@ def found_chain_break(flanking_seq_dict, chain_break_ind):
    return flanking_seq_dict
 
 def get_AA_and_CA_coords(prody_obj, current_resindex):
+   '''
+   Return (AA, CA_coords) for a residue index.
+   If residue is missing/non-protein, returns AA='X' and CA_coords = [nan, nan, nan].
+   '''
+   # Build selection for this residue index
    if current_resindex < 0: 
       sel_str = f'resindex `{current_resindex}`'
    else:
       sel_str = f'resindex {current_resindex}'
 
    curr_resindex_obj = prody_obj.select(sel_str)
-   if curr_resindex_obj is None:
-      AA = 'X'
-      CA_coords = np.array([np.nan, np.nan, np.nan]) # None
-   elif curr_resindex_obj.protein is None: # not a residue
-      AA = 'X'
-      CA_coords = np.array([np.nan, np.nan, np.nan]) # None
-   else:
-      curr_res_AA = list(set(curr_resindex_obj.getResnames()))
-      assert len(curr_res_AA) == 1
-      AA = curr_res_AA[0]
-      CA_obj = curr_resindex_obj.select(sel_str + ' and name CA')
-      assert len(CA_obj) == 1
-      CA_coords = CA_obj.getCoords()[0]
+   if curr_resindex_obj is None or curr_resindex_obj.protein is None:
+      return 'X', np.array([np.nan, np.nan, np.nan])
+
+   # Resolve residue name
+   curr_res_AA = list(set(curr_resindex_obj.getResnames()))
+   if len(curr_res_AA) != 1:
+      print(f'[WARNING] get_AA_and_CA_coords: \nResindex {current_resindex} in '
+            f'{prody_obj.getTitle()} contains >1 AA: {curr_res_AA}. Defaulting to AA="X".')
+      return 'X', np.array([np.nan, np.nan, np.nan])
+   AA = curr_res_AA[0]
+
+   # Select CA(s)
+   CA_sel = curr_resindex_obj.select(sel_str + ' and name CA')
+   if CA_sel is None or len(CA_sel) == 0:
+      return 'X', np.array([np.nan, np.nan, np.nan])
+
+   try:
+      ca_atom = _pick_single_ca(CA_sel, prev_ca=None)
+      CA_coords = ca_atom.getCoords()
+      # Ensure shape is (3,)
+      CA_coords = np.asarray(CA_coords, dtype=float).reshape(3,)
+   except Exception:
+      # print warning and be specific about error
+      print(f'[WARNING] Could not resolve CA for resindex {current_resindex} in '
+            f'{prody_obj.getTitle()}. Defaulting to AA="X".')
+      return 'X', np.array([np.nan, np.nan, np.nan])
+
    return AA, CA_coords
 
-def get_cg_coords(prody_obj):
+def get_cg_coords(prody_obj, pdbpath):
    # The CG atoms have their occupancies set to >= 3.0, with unique values (e.g., 
    # 3.0, 3.1, 3.2, etc.) to allow a 1:1 correspondence of equivalent atoms between 
    # different ligands.
-   cg = prody_obj.select('occupancy >= 2.9')
+   cg = prody_obj.select('occupancy > 2.9')
    num_atoms = len(cg)
    cg_coords = []
    for ind in range(num_atoms):
       occ = f'3.{ind}'
       atom = cg.select(f'occupancy == {occ}')
       if len(atom) != 1:
-         print(f'get_cg_coords: {len(atom)} atoms are occupancy {occ}.')
+         print(f'[WARNING] get_cg_coords: {len(atom)} atoms are occupancy {occ} in {pdbpath}.')
          return None
-      assert len(atom) == 1
       atom_coords = atom.getCoords()[0]
       cg_coords.append(atom_coords)
 
@@ -583,7 +600,9 @@ def add_vdgs_to_dict(vdm_combos, vdg_subset, re_ordered_aas, re_ordered_bbcoords
    return vdm_combos
 
 def reorder_vdg_subset(vdg_subset, vdms_dict, cg_obj, prody_obj):
-   '''Reorders vdms alphabetically.'''
+   ''' Return per-vdG features reordered by alphabetical AA name, after assigning each 
+   vdM as 'bb' (backbone contact) or its sidechain AA. 
+   '''
    aas_of_vdms_in_order = []
    bb_coords_of_vdms_in_order = []
    flankingseqs_of_vdms_in_order = []
@@ -778,59 +797,21 @@ def elements_in_clusters(indices_of_elements_in_cluster, cg_coords, vdm_bbcoords
    return clus_cg_coords, clus_vdmbb_coords, clus_cgvdmbb_coords, clus_flankingseqs, \
       clus_flankingCAs, clus_pdbpaths, clus_vdm_scrr_cg_perms
 
-def process_cluster_member(ind, clusnum, clusnum_dir, centroid_ind, moved_cent_coords, 
-                           all_cg_coords, all_cg_and_vdmbb_coords, all_flankbb_coords, 
-                           all_pdbpaths, all_scrr_cg_perm, num_flanking, atomgroup_dict, 
-                           weights, first_pdb_cg_vdmbb_coords, symmetry_classes, 
-                           print_flankbb):
-
-    try:
-        data = get_clus_mem_data(ind, all_cg_coords, all_cg_and_vdmbb_coords, 
-               all_flankbb_coords, all_pdbpaths, all_scrr_cg_perm, num_flanking, 
-               atomgroup_dict)
-        if data is None:
-            return (None, all_pdbpaths[ind])  # Return None to mark failure
-        (clusmem_cg_coords, clusmem_cg_vdmbb_coords, clusmem_flankbb_coords, 
-         clusmem_pdbpath, clusmem_scrr_cg_perm, clusmem_pr_obj) = data
-        clusmem_pdb_outpath = get_clus_pdb_outpath(clusnum, clusnum_dir, clusmem_pdbpath, 
-                                             clusmem_scrr_cg_perm, ind, is_centroid=False)
-
-        # Align clus mem to the centroid and write out the pdb
-        if clusnum == 1: # the centroid to align onto _is_ the first pdb instead of a 
-           # cluster cent that's aligned onto the first pdb.
-           moved_cent_coords = first_pdb_cg_vdmbb_coords
-        
-        transf, moved_coords = get_transf_and_coords(clusmem_cg_vdmbb_coords, 
-           moved_cent_coords, weights, clusmem_pr_obj, clusmem_scrr_cg_perm, 
-           symmetry_classes)
-        write_out_subsequent_clus_pdbs(clusmem_pr_obj, clusmem_pdb_outpath, 
-           clusmem_scrr_cg_perm, print_flankbb, transf)
-        gc.collect()     # file handles may linger b/c inside process pool 
-
-        return (clusmem_pdb_outpath, None)  # Successful completion
-
-    except Exception as e:
-        print(f"Error processing cluster member {ind} of clusnum {clusnum}: {e}")
-        return (None, all_pdbpaths[ind])  # Return failure if exception occurs
-
 def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_coords, 
-                       all_pdbpaths, all_scrr_cg_perm, all_cg_and_vdmbb_coords, 
-                       all_flankbb_coords, num_flanking, num_threads, first_pdb_out, 
-                       first_pdb_cg_vdmbb_coords, weights, atomgroup_dict, print_flankbb, 
-                       symmetry_classes, clusterlabel=None):
+   all_pdbpaths, all_scrr_cg_perm, all_cg_and_vdmbb_coords, all_flankbb_coords, 
+   num_flanking, first_pdb_out, first_pdb_cg_vdmbb_coords, weights, atomgroup_dict, 
+   print_flankbb, symmetry_classes, reordered_AAs, clusterlabel=None):
     
     assert len(all_pdbpaths) == len(all_cg_and_vdmbb_coords)
     ref = np.array([[0, 0, 0], [-1, 0, 1], [1, -1, 0]])  # reference for aligning CG
 
     failed = []
-    all_tasks = []  
-    #Collect all tasks for multiprocessing
     for clusnum, clus_mem_indices in sorted(clus_assignments.items()):
         subdir = f'{clusterlabel}clus_{clusnum}' if clusterlabel else f'clus_{clusnum}'
         clusnum_dir = os.path.join(clusdir, subdir)
-        os.makedirs(clusnum_dir)
+        os.makedirs(clusnum_dir, exist_ok=False)  # Intentionally fail if it's a re-run
         centroid_ind = centroid_assignments[clusnum]
-        # First, output the centroid before its cluster members.
+        # Output the centroid first
         data = get_clus_mem_data(centroid_ind, all_cg_coords, all_cg_and_vdmbb_coords, 
             all_flankbb_coords, all_pdbpaths, all_scrr_cg_perm, num_flanking, 
             atomgroup_dict)
@@ -843,61 +824,76 @@ def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_c
                                     cent_scrr_cg_perm, centroid_ind, is_centroid=True)
 
         if first_pdb_out is None:
-            # If no pdb has been written out yet, align the first 3 CG atoms to the
-            # reference 3 atoms and output the pdb.
+           # Write the very first PDB aligned to the 3-atom reference
             try:
                 first_pdb_out, first_pdb_cg_vdmbb_coords = print_out_first_pdb_of_clus(
                     cent_pdb_outpath, cent_cg_coords, cent_cg_vdmbb_coords, cent_pr_obj, 
                     ref, cent_scrr_cg_perm, print_flankbb)
-                target_coords = first_pdb_cg_vdmbb_coords
-            except:
-                first_pdb_out, first_pdb_cg_vdmbb_coords, target_coords = None, None, None
-                continue
+                # For the first cluster, the "moved centroid coords" are the first-PDB coords
+                moved_cent_coords = first_pdb_cg_vdmbb_coords
+            except Exception as e:
+               print(f'[ERROR] {reordered_AAs} cluster {clusnum} centroid, the first '
+                     f'PDB, failed ({cent_pdbpath}): \n{e}\n'
+                     f'Skipping entire AA bucket; must troubleshoot.')
+               first_pdb_out, first_pdb_cg_vdmbb_coords = None, None
+               continue
         else:
-            # If a pdb has already been written out, align this vdg's cg+vdmbb onto that 
-            # first pdb. "target_coords" to align to is cg+vdmbb of the first PDB (which 
-            # itself is a centroid). 
-            # Note that target_coords has to be re-ordered to match the atom order in the 
-            # first PDB, because for CGs with symmetry, cluster members are aligned within a 
-            # a cluster, but often not to the first PDB. For example, the order of a phenyl 
-            # CG might be CG-CD1-CE1-CZ-CE2-CD2, but in another cluster, it might be CG-CD1-
-            # CE2-CZ-CE1-CD2, and there are I believe 3 configurations that minimize that RMSD.             
-
-            target_coords = first_pdb_cg_vdmbb_coords
+           # Align this cluster's centroid to the very first PDB’s coords (target_coords). 
+           # `get_transf_and_coords` handles symmetry permutations.
             try:
                 moved_cent_transf, moved_cent_coords = get_transf_and_coords(
-                        cent_cg_vdmbb_coords, target_coords, weights, cent_pr_obj, 
+                        cent_cg_vdmbb_coords, first_pdb_cg_vdmbb_coords, weights, cent_pr_obj,
                         cent_scrr_cg_perm, symmetry_classes)
-            except Exception as e:
-                # Sometimes there's an error, though very rare. Skip this cluster.
-                print(f"Error: {e}")
-                print(f'Error: failed to write out centroid {cent_pdb_outpath}. '
-                      f'Need to skip entire cluster of size {len(clus_mem_indices)}.')
-                continue
-            # Apply transformation and write out the moved centroid.
-            write_out_subsequent_clus_pdbs(cent_pr_obj, cent_pdb_outpath, cent_scrr_cg_perm, 
-                                           print_flankbb, moved_cent_transf)
+            except Exception as e: # Sometimes errors out, though rare.
+              print(f'[WARNING] {reordered_AAs} cluster {clusnum}: \n{e}\n'
+                    f'Failed to align centroid ({cent_pdbpath}) to the first PDB '
+                    f'({first_pdb_out}). Need to skip entire cluster, which has '
+                    f'{len(clus_mem_indices)} members.')
 
-            #Prepare all cluster member jobs
-            for ind in clus_mem_indices:
-                if ind == centroid_ind:
-                    continue
-                args = (
-                    ind, clusnum, clusnum_dir, centroid_ind, moved_cent_coords,
-                    all_cg_coords, all_cg_and_vdmbb_coords, all_flankbb_coords,
-                    all_pdbpaths, all_scrr_cg_perm, num_flanking, atomgroup_dict,
-                    weights, first_pdb_cg_vdmbb_coords, symmetry_classes, print_flankbb
-                )
-                all_tasks.append(args)
+              failed.append(cent_pdbpath)
+              continue
 
-    #Run pool ONCE after loop
-    with multiprocessing.Pool(num_threads) as pool:
-        results = pool.starmap(process_cluster_member, all_tasks)
+            write_out_subsequent_clus_pdbs(cent_pr_obj, cent_pdb_outpath, 
+                                cent_scrr_cg_perm, print_flankbb, moved_cent_transf)
 
-    for result in results:
-        pdb_outpath, failed_member = result
-        if failed_member:
-            failed.append(failed_member)
+        # Now, process non-centroid members
+        for ind in clus_mem_indices:
+           if ind == centroid_ind:
+              continue
+
+           try:
+              mem_data = get_clus_mem_data(
+                  ind, all_cg_coords, all_cg_and_vdmbb_coords, all_flankbb_coords,
+                  all_pdbpaths, all_scrr_cg_perm, num_flanking, atomgroup_dict)
+              if mem_data is None:
+                  failed.append(all_pdbpaths[ind])
+                  continue
+
+              (clusmem_cg_coords, clusmem_cg_vdmbb_coords, clusmem_flankbb_coords,
+               clusmem_pdbpath, clusmem_scrr_cg_perm, clusmem_pr_obj) = mem_data
+
+              clusmem_pdb_outpath = get_clus_pdb_outpath(
+                  clusnum, clusnum_dir, clusmem_pdbpath, clusmem_scrr_cg_perm, ind, 
+                  is_centroid=False)
+
+              if clusnum == 1: # the centroid to align onto _is_ the first pdb instead of a 
+                 # cluster cent that's aligned onto the first pdb.
+                 target_coords = first_pdb_cg_vdmbb_coords
+              else:
+                 target_coords = moved_cent_coords
+
+              moved_transf, _ = get_transf_and_coords(
+                  clusmem_cg_vdmbb_coords, target_coords, weights, clusmem_pr_obj,
+                  clusmem_scrr_cg_perm, symmetry_classes)
+
+              write_out_subsequent_clus_pdbs(
+                  clusmem_pr_obj, clusmem_pdb_outpath, clusmem_scrr_cg_perm,
+                  print_flankbb, moved_transf)
+
+           except Exception as e:
+              print(f"[WARNING] {reordered_AAs} cluster member {ind} of clusnum "
+                    f"{clusnum} ({all_pdbpaths[ind]}): {e}")
+              failed.append(all_pdbpaths[ind])
 
     return first_pdb_out, first_pdb_cg_vdmbb_coords, failed
 
@@ -915,8 +911,8 @@ def get_transf_and_coords(mobile_coords, target_coords, weights, obj, scrrs,
       rearranged_coords = np.vstack([perm, mobile_coords[len(symmetry_classes):]])
       assert weights.shape[0] == rearranged_coords.shape[0], \
             "weights/coords length mismatch (rearranged)"
-      moved_coords, transf = pr.superpose(rearranged_coords, target_coords, weights)
-      rmsd = pr.calcRMSD(moved_coords, target_coords, weights)
+      moved_coords, transf = pr.superpose(rearranged_coords, target_coords, weights.ravel())
+      rmsd = pr.calcRMSD(moved_coords, target_coords, weights.ravel())
       if lowest_rmsd is None or rmsd < lowest_rmsd:
          lowest_rmsd = rmsd
          best_transf = transf
@@ -933,7 +929,7 @@ def write_out_subsequent_clus_pdbs(pr_obj, pdb_outpath, scrrs, print_flankbb, tr
    pr_obj_copy = reset_occs(pr_obj_copy, scrrs)
    # Write out PDB
    if not print_flankbb: 
-      manually_write_pdb(pdb_outpath, pr_obj_copy.select('occupancy > 1.5')) # selects occ>=2.0
+      manually_write_pdb(pdb_outpath, pr_obj_copy.select('occupancy > 1.9')) # selects occ>=2.0
    else:
       manually_write_pdb(pdb_outpath, pr_obj_copy)
    
@@ -970,7 +966,7 @@ def write_out_first_pdb(mobile, target, pr_obj, outpath, clusmem_cg_vdmbb_coords
    pr_obj_copy = reset_occs(pr_obj_copy, scrrs)
    # Write out PDB
    if not print_flankbb: 
-      manually_write_pdb(outpath, pr_obj_copy.select('occupancy > 1.5')) # selects occ=2.0
+      manually_write_pdb(outpath, pr_obj_copy.select('occupancy > 1.9')) # selects occ=2.0
    else:
       manually_write_pdb(outpath, pr_obj_copy)
    
@@ -980,13 +976,11 @@ def write_out_first_pdb(mobile, target, pr_obj, outpath, clusmem_cg_vdmbb_coords
    return moved_cg_vdmbb_coords
 
 def rewrite_temp_clusters(clusdir, clean_dir, size_subset, subset_AAs):
-   # Clean up the cluster directory by merging degenerate vdGs (based on diff
-   # AA perms and CG perms of the same PDB), deleting degenerate pdbs/clusters, 
-   # reassigning cluster nums (and sort by cluster size, and removing the temp dir
-   # when everything is done (outside this function). 
-   # Must merge before deleting duplicates b/c need the duplicate names to determine 
-   # which clusters are equivalent.
-   
+   # Clean up the cluster directory by merging degenerate vdGs (based on diff AA perms 
+   # and CG perms of the same PDB), deleting degenerate pdbs/clusters, and 
+   # renumbering/sorting by cluster size. Must merge before deleting duplicates b/c 
+   # need the duplicate names to determine which clusters are equivalent.
+
    temp_clus_assignments = {}
    ''' Structure:
    temp_clus_assignments[tuple([clusnum])] = ALL vdgs w/ sorted scrrs. 
@@ -1023,7 +1017,7 @@ def rewrite_temp_clusters(clusdir, clean_dir, size_subset, subset_AAs):
          else:
             new_pdbname = f'{pdbbase}_{scrr_str}.pdb.gz'
          assert not os.path.exists(new_pdbname)
-         os.rename(vdgpath, os.path.join(reassigned_clusdir, new_pdbname))
+         shutil.move(vdgpath, os.path.join(reassigned_clusdir, new_pdbname))
    
    return renumbered_clusters 
          
@@ -1136,34 +1130,51 @@ def reassign_temp_clusters(pruned_clusters):
    return reassigned_cgvdmbb_clusters
 
 def get_pr_obj_to_print(clusmem_pdbpath, vdg_scrr_cg_perm,
-                                  num_flanking, atomgroup_dict):
+                       num_flanking, atomgroup_dict):
    try:
-      if clusmem_pdbpath in atomgroup_dict.keys():
+      # Use cache only if enabled AND the key is present
+      if _ATOMGROUP_CACHE_MAXSIZE > 0 and clusmem_pdbpath in atomgroup_dict:
          par = atomgroup_dict[clusmem_pdbpath]
       else:
          par = pr.parsePDB(clusmem_pdbpath)
-   except: # retry
+         if _ATOMGROUP_CACHE_MAXSIZE > 0:
+            # Evict oldest (FIFO) if at capacity
+            if len(atomgroup_dict) >= _ATOMGROUP_CACHE_MAXSIZE:
+               try:
+                   atomgroup_dict.pop(next(iter(atomgroup_dict)))
+               except StopIteration:
+                   pass
+            atomgroup_dict[clusmem_pdbpath] = par
+
+   except:  # retry
       for attempt in range(100):
-          try:
-              par = pr.parsePDB(clusmem_pdbpath)
-              break
-          except Exception as e:  
-              if attempt < 99:
-                  time.sleep(10)  # Wait before retrying
-              else:
-                  print(f"align_and_cluster failed to parse {clusmem_pdbpath}: {e}")
-                  return None
+         try:
+            par = pr.parsePDB(clusmem_pdbpath)
+            if _ATOMGROUP_CACHE_MAXSIZE > 0:
+               if len(atomgroup_dict) >= _ATOMGROUP_CACHE_MAXSIZE:
+                  try:
+                      atomgroup_dict.pop(next(iter(atomgroup_dict)))
+                  except StopIteration:
+                      pass
+               atomgroup_dict[clusmem_pdbpath] = par
+            break
+         except Exception as e:
+            if attempt < 99:
+               time.sleep(10)
+            else:
+               print(f"[WARNING] get_pr_obj_to_print failed on {clusmem_pdbpath}: {e}")
+               return None
 
    # Add CG to pr obj
-   pr_obj = par.select('occupancy > 2.8') # occ >= 3 is CG
+   pr_obj = par.select('occupancy > 2.9')  # occ >= 3 is CG
    vdg_scrrs, cg_perm = vdg_scrr_cg_perm
-   # Iterate over vdms
    for vdm_scrr in vdg_scrrs:
       try:
          flank_obj = add_flank_obj_for_cluslevel_flank(par, vdm_scrr, num_flanking,
                                                        clusmem_pdbpath)
          pr_obj += flank_obj
-      except:
+      except Exception as e:
+         print(f"[WARNING] flanking residues could not be added on {clusmem_pdbpath}: {e}")
          pass
 
    return pr_obj.copy()
@@ -1204,7 +1215,7 @@ def add_flank_obj_for_cluslevel_flank(par, vdm_scrr, num_flanking, pdbpath):
    flank_obj = par.select(selstr)
    num_flank_obj_resindices = len(set(flank_obj.getResindices()))
    if num_flank_obj_resindices != num_resnums_to_print:
-      print(f'PDB {pdbpath} flank_obj {resname} has {num_flank_obj_resindices} '
+      print(f'[WARNING] {pdbpath} flank_obj {resname} has {num_flank_obj_resindices} '
             f'resindices, but resnums_to_print is {resnums_to_print}: '
             f'num_resnums_to_print = ({num_resnums_to_print}).')
    return flank_obj
@@ -1234,9 +1245,6 @@ def print_out_first_pdb_of_clus(pdb_outpath, cg_coords, cg_vdmbb_coords, pr_obj,
    first_pdb_out = pdb_outpath
    if len(cg_coords) >= 3:
       mobile, target = cg_coords[:3], ref
-   # Sometimes the CG only has 2 atoms
-   elif len(cg_coords)  == 2:
-      mobile, target = cg_coords[:2], ref[:2]
    moved_cg_vdmbb_coords = write_out_first_pdb(
       mobile, target, pr_obj, pdb_outpath, cg_vdmbb_coords, scrrs, print_flankbb)
    first_pdb_cg_vdmbb_coords = moved_cg_vdmbb_coords
@@ -1274,6 +1282,23 @@ def add_vdm_obj_for_cluslevel_cgvdmbb(par, vdm_scrr):
    assert vdm_res_name[0] == vdm_scrr[3]
    return res_obj
 
+def _pick_single_ca(ca_sel, prev_ca):
+    # Return a single CA atom object from a ProDy selection, handling altlocs/dups
+    # for `determine_flank_resnums`
+    if len(ca_sel) == 1:
+        return ca_sel[0]
+
+    # If we have multiple CAs (altlocs/dups), prefer the one closest to prev_ca.
+    if prev_ca is None:
+        return ca_sel[0]
+
+    best_atom, best_dist = None, float('inf')
+    for atom in ca_sel:
+        d = pr.calcDistance(prev_ca, atom)
+        if d < best_dist:
+            best_atom, best_dist = atom, d
+    return best_atom
+
 def determine_flank_resnums(par, list_resnums, s, c, vdm_ca):
    # Determine which flanking residues to add to pr obj based on chain breaks. 
    resnums_to_include = []
@@ -1282,26 +1307,30 @@ def determine_flank_resnums(par, list_resnums, s, c, vdm_ca):
    prev_ca = vdm_ca
    # Iterate over resnums 
    for r in list_resnums:
-      if r < 0:
-         res_sel = f'resnum `{r}`'
-      else:
-         res_sel = f'resnum {r}'
+      res_sel = f'resnum `{r}`' if r < 0 else f'resnum {r}'
       if s == '':
-         sel = par.select(f'chain {c} and {res_sel} and name CA')
+         ca_sel = par.select(f'chain {c} and {res_sel} and name CA')
       else:
-         sel = par.select(f'segment {s} and chain {c} and {res_sel} and name CA')
-      # Return if this residue's CA doesn't exist
-      if sel is None:
+         ca_sel = par.select(f'segment {s} and chain {c} and {res_sel} and name CA')
+
+      # If missing, stop (chain break).
+      if ca_sel is None or len(ca_sel) == 0:
          return resnums_to_include
-      # Check if there's a chain break b/n prev_ca and current CA
-      assert len(sel) == 1
-      curr_ca = sel[0]
+
+      # Collapse to one CA robustly
+      try:
+         curr_ca = _pick_single_ca(ca_sel, prev_ca)
+      except Exception:
+         return resnums_to_include
+
+      # Check chain break distance to previous CA
       dist = pr.calcDistance(prev_ca, curr_ca)
-      if dist > 4.5: # found chain break
-         return resnums_to_include
-      else: # otherwise, continue walking
-         resnums_to_include.append(r)
-         prev_ca = curr_ca
+      if dist > 4.5:  # chain break
+          return resnums_to_include
+
+      resnums_to_include.append(r)
+      prev_ca = curr_ca
+
    return resnums_to_include
 
 def flatten_flanking_CAs(cgvdmbb_clus_flankingCAs):
