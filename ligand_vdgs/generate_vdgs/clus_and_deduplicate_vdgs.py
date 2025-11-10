@@ -52,42 +52,42 @@ import align_and_cluster as clust
 import utils
 
 def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('-c', "--cg", type=str, 
-                        help="SMARTS pattern of the fragment/CG/FG. Informational only.")
-    parser.add_argument('-v', "--vdglib-dir", type=str, required=True,
-                        help="Directory for the vdms of this CG.")
-    parser.add_argument('-k', "--keep-clustered-pdbs", action='store_true', 
-                        help="Keep the `clusters/flankseq_and_bb/` dir. to keep track of "
-                        "which clusters each nr_pdb came from.")
-    parser.add_argument('-w', "--align-cg-weight", type=float, default=0.99, 
-                        help="Weight assigned to CG atoms when superposing output vdGs "
-                        "(not for clustering). Example: 0.5 assigns half of the weight " 
-                        "to CG atoms and half to vdM backbone atoms. Defaults to 0.99.")
-    parser.add_argument('-q', "--seq", default=0.40, type=float, 
-                        help="Sequence similarity threshold (fraction between 0 and 1) "
-                        "used to set the subclustering threshold. Higher similarity "
-                        "indicates redundancy. Defaults to 0.40.")
-    parser.add_argument('-f', "--flank", default=2, type=int, 
-                        help="Number of residues on each side (+/-) of each vdM to " 
-                        "include for computing sequence and backbone similarity. "
-                        "Defaults to 2.")
-    parser.add_argument('-s', "--symmetry-classes", nargs='+', type=int,
-                        help="Integers defining CG symmetry. Ex: carboxylate CC(=O)[O-] "
-                        "would be '0 1 2 2' b/c of its equivalent oxygens. If this arg " 
-                        "is not provided, the CG is assumed to be asymmetric.")
-    parser.add_argument('-n', "--size-subset", type=int, required=True,  
-                        help="The number of residues in the vdG subset. The purpose "
-                        "of this arg is for parallelization (running with different "
-                        "-n values concurrently).")
-    parser.add_argument('-l', "--logfile", type=str, default='log', help="Path to log.")
-    parser.add_argument('-x', "--print-flankbb", action='store_true', 
-                        help="Include flanking bb residues when writing out PDB.")
-    parser.add_argument('-m', "--max-num-vdgs-to-clus", default=2500, type=int, 
-                        help="Cap on # samples per AA-composition bucket to cluster.")
-    parser.add_argument('--num-procs', type=int, default=10,
-                        help="Number of AA composition buckets to run concurrently.")
-    return parser.parse_args()
+   parser = argparse.ArgumentParser()
+   parser.add_argument('-c', "--cg", type=str, 
+                       help="SMARTS pattern of the fragment/CG/FG. Informational only.")
+   parser.add_argument('-v', "--vdglib-dir", type=str, required=True,
+                       help="Directory for the vdms of this CG.")
+   parser.add_argument('-k', "--keep-clustered-pdbs", action='store_true', 
+                       help="Keep the `clusters/flankseq_and_bb/` dir. to keep track of "
+                       "which clusters each nr_pdb came from.")
+   parser.add_argument('-w', "--align-cg-weight", type=float, default=0.99, 
+                       help="Weight assigned to CG atoms when superposing output vdGs "
+                       "(not for clustering). Example: 0.5 assigns half of the weight " 
+                       "to CG atoms and half to vdM backbone atoms. Defaults to 0.99.")
+   parser.add_argument('-q', "--seq", default=0.40, type=float, 
+                       help="Sequence similarity threshold (fraction between 0 and 1) "
+                       "used to set the subclustering threshold. Higher similarity "
+                       "indicates redundancy. Defaults to 0.40.")
+   parser.add_argument('-f', "--flank", default=2, type=int, 
+                       help="Number of residues on each side (+/-) of each vdM to " 
+                       "include for computing sequence and backbone similarity. "
+                       "Defaults to 2.")
+   parser.add_argument('-s', "--symmetry-classes", nargs='+', type=int,
+                       help="Integers defining CG symmetry. Ex: carboxylate CC(=O)[O-] "
+                       "would be '0 1 2 2' b/c of its equivalent oxygens. If this arg " 
+                       "is not provided, the CG is assumed to be asymmetric.")
+   parser.add_argument('-n', "--size-subset", type=int, required=True,  
+                       help="The number of residues in the vdG subset. The purpose "
+                       "of this arg is for parallelization (running with different "
+                       "-n values concurrently).")
+   parser.add_argument('-l', "--logfile", type=str, default='log', help="Path to log.")
+   parser.add_argument('-x', "--print-flankbb", action='store_true', 
+                       help="Include flanking bb residues when writing out PDB.")
+   parser.add_argument('-m', "--max-num-vdgs-to-clus", default=2500, type=int, 
+                       help="Cap on # samples per AA-composition bucket to cluster.")
+   parser.add_argument('--num-procs', type=int, default=10,
+                       help="Number of AA composition buckets to run concurrently.")
+   return parser.parse_args()
 
 '''
 Characterize all subsets of vdMs within each vdG. First, scan the parent dataset to 
@@ -189,12 +189,12 @@ def _load_bucket(path):
       for line in f:
          rec = json.loads(line)
          _vdgs.append([
-             np.asarray(rec["cg_coords"]),
-             [np.asarray(r) for r in rec["bbcoords"]],
-             rec["flankseqs"],
-             [np.asarray(r) for r in rec["flankCAs"]],
-             rec["pdbpath"],
-             rec["scrr"],
+            np.asarray(rec["cg_coords"]),
+            [np.asarray(r) for r in rec["bbcoords"]],
+            rec["flankseqs"],
+            [np.asarray(r) for r in rec["flankCAs"]],
+            rec["pdbpath"],
+            rec["scrr"],
          ])
    return _vdgs
 
@@ -256,13 +256,13 @@ def main():
          
          # AA bucket stream: spill a single vdG record to its AA-bucket file to disk
          rec = {
-             "cg_coords": np.asarray(cg_coords).tolist(),
-             "bbcoords":  [np.asarray(x).tolist() for x in re_ordered_bbcoords],
-             "flankseqs": re_ordered_flankingseqs,  # strings already fine
-             "flankCAs":  [np.asarray(x).tolist() for x in re_ordered_CAs],
-             "pdbpath":   str(pdbpath),
-             "scrr":      [[str(s), str(ch), int(r), str(rn)] for (s, ch, r, rn) in 
-                           re_ordered_scrr],
+            "cg_coords": np.asarray(cg_coords).tolist(),
+            "bbcoords":  [np.asarray(x).tolist() for x in re_ordered_bbcoords],
+            "flankseqs": re_ordered_flankingseqs,  # strings already fine
+            "flankCAs":  [np.asarray(x).tolist() for x in re_ordered_CAs],
+            "pdbpath":   str(pdbpath),
+            "scrr":      [[str(s), str(ch), int(r), str(rn)] for (s, ch, r, rn) in 
+                          re_ordered_scrr],
          }
 
          _spill_record(vdglib_dir, size_subset, re_ordered_aas, rec)
@@ -292,13 +292,13 @@ def main():
       ctx = mp.get_context("spawn")
       try:
          with ctx.Pool(processes=int(args.num_procs), maxtasksperchild=1) as pool:
-             # Do not swallow exceptions - any worker error should abort run
-             for _ in pool.imap_unordered(_run_one_bucket_strict, jobs, chunksize=1):
-                 pass
+            # Do not swallow exceptions - any worker error should abort run
+            for _ in pool.imap_unordered(_run_one_bucket_strict, jobs, chunksize=1):
+               pass
       except Exception as e:
          err_text = f'\t[FATAL ERROR] Worker failed with exception:\n{e}\n'
          with open(logfile, 'a') as f:
-             f.write(err_text)
+            f.write(err_text)
          print(err_text, file=sys.stderr) # ensure it shows up in stdout/stderr
          sys.exit(1) # hard-fail the whole run if any worker fails
 
@@ -392,15 +392,15 @@ def copy_nr_to_outdir(vdglib_dir, nr_dir, reordered_AAs):
             shutil.copy(os.path.join(flankseqandbbclusdir, pdb), newpath) 
          except: # retry
             for attempt in range(100):
-                try:
-                    shutil.copy(os.path.join(flankseqandbbclusdir, pdb), newpath) 
-                    break
-                except Exception as e:  
-                    if attempt < 99:
-                        time.sleep(10)  # wait before retrying
-                    else:
-                        print(f"[WARNING] clus_and_deduplicate failed to create "
-                              f"{os.path.join(flankseqandbbclusdir, pdb)}: {e}")
+               try:
+                  shutil.copy(os.path.join(flankseqandbbclusdir, pdb), newpath) 
+                  break
+               except Exception as e:  
+                  if attempt < 99:
+                     time.sleep(10)  # wait before retrying
+                  else:
+                     print(f"[WARNING] clus_and_deduplicate failed to create "
+                           f"{os.path.join(flankseqandbbclusdir, pdb)}: {e}")
 
 def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs, 
    symmetry_classes, vdglib_dir, align_cg_weight, num_flanking,
@@ -570,9 +570,9 @@ def normalize_rmsd(num_atoms, atoms):
    max_atoms = 15
    
    if num_atoms < min_atoms:
-       return min_threshold  # below 8 atoms, use the minimum threshold (0.5 Å)
+      return min_threshold  # below 8 atoms, use the minimum threshold (0.5 Å)
    if num_atoms > max_atoms:
-       return max_threshold  # above 15 atoms, use the maximum threshold
+      return max_threshold  # above 15 atoms, use the maximum threshold
    
    # Linear scaling for atoms 
    scaling_factor = (num_atoms - min_atoms) / (max_atoms - min_atoms)
@@ -581,59 +581,59 @@ def normalize_rmsd(num_atoms, atoms):
    return threshold
 
 def select_diverse_pdbIDs(strings, k): # k = max num to select
-    # Greedy max–min Hamming selection over equal-length strings (PDB IDs)
-    # to promote dataset diversity. Assumes PDB IDs are 4 characters long.
-    ascii_array = strings_to_ascii_array(strings)
-    selected_indices = select_diverse_subset_greedy(ascii_array, k)
-    return [strings[i] for i in selected_indices]
+   # Greedy max–min Hamming selection over equal-length strings (PDB IDs)
+   # to promote dataset diversity. Assumes PDB IDs are 4 characters long.
+   ascii_array = strings_to_ascii_array(strings)
+   selected_indices = select_diverse_subset_greedy(ascii_array, k)
+   return [strings[i] for i in selected_indices]
 
 def strings_to_ascii_array(strings):
-    return np.array([[ord(c) for c in s] for s in strings], dtype=np.uint8)
+   return np.array([[ord(c) for c in s] for s in strings], dtype=np.uint8)
 
 @njit
 def hamming(s1, s2):
-    dist = 0
-    for i in range(len(s1)):
-        if s1[i] != s2[i]:
-            dist += 1
-    return dist
+   dist = 0
+   for i in range(len(s1)):
+      if s1[i] != s2[i]:
+         dist += 1
+   return dist
 
 @njit
 def update_min_dists(data, selected_idx, selected_mask, min_dists):
-    n = data.shape[0]
-    for i in range(n):
-        if selected_mask[i] == 0:
-            dist = hamming(data[selected_idx], data[i])
-            if dist < min_dists[i]:
-                min_dists[i] = dist
+   n = data.shape[0]
+   for i in range(n):
+      if selected_mask[i] == 0:
+         dist = hamming(data[selected_idx], data[i])
+         if dist < min_dists[i]:
+            min_dists[i] = dist
 
 def select_diverse_subset_greedy(data, k):
-    n = data.shape[0]
-    selected = [0]  # start with first point
-    selected_mask = np.zeros(n, dtype=np.uint8)
-    selected_mask[0] = 1
-    min_dists = np.full(n, 255, dtype=np.uint8)
+   n = data.shape[0]
+   selected = [0]  # start with first point
+   selected_mask = np.zeros(n, dtype=np.uint8)
+   selected_mask[0] = 1
+   min_dists = np.full(n, 255, dtype=np.uint8)
 
-    # Initial distance pass
-    for i in range(1, n):
-        min_dists[i] = hamming(data[0], data[i])
+   # Initial distance pass
+   for i in range(1, n):
+      min_dists[i] = hamming(data[0], data[i])
 
-    for _ in range(1, min(n, k)):
-        # Select max of min distances
-        max_idx = -1
-        max_val = -1
-        for i in range(n):
-            if selected_mask[i] == 0 and min_dists[i] > max_val:
-                max_val = min_dists[i]
-                max_idx = i
+   for _ in range(1, min(n, k)):
+      # Select max of min distances
+      max_idx = -1
+      max_val = -1
+      for i in range(n):
+         if selected_mask[i] == 0 and min_dists[i] > max_val:
+            max_val = min_dists[i]
+            max_idx = i
 
-        selected.append(max_idx)
-        selected_mask[max_idx] = 1
+      selected.append(max_idx)
+      selected_mask[max_idx] = 1
 
-        # Parallel update of min distances
-        update_min_dists(data, max_idx, selected_mask, min_dists)
+      # Parallel update of min distances
+      update_min_dists(data, max_idx, selected_mask, min_dists)
 
-    return selected
+   return selected
 
 if __name__ == "__main__":
-    main()
+   main()

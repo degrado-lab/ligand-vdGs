@@ -51,37 +51,37 @@ def get_vdg_AA_permutations(reordered_AAs, _vdgs):
          all_AA_cg_perm_pdbpaths, all_AA_cg_perm_vdm_scrr
 
 def permute_AA_duplicates(seq):
-    # Dictionary to store indices for each element in the sequence
-    seen = {}
-    for i, item in enumerate(seq):
-        if item not in seen:
-            seen[item] = []
-        seen[item].append(i)
+   # Dictionary to store indices for each element in the sequence
+   seen = {}
+   for i, item in enumerate(seq):
+      if item not in seen:
+         seen[item] = []
+      seen[item].append(i)
 
-    permute_groups = [] # list of all index groups that have duplicates
-    for indices in seen.values():
-        if len(indices) > 1:  # only interested in elements with duplicates
-            permute_groups.append(indices)
+   permute_groups = [] # list of all index groups that have duplicates
+   for indices in seen.values():
+      if len(indices) > 1:  # only interested in elements with duplicates
+         permute_groups.append(indices)
 
-    if not permute_groups: # no duplicates, so return the original index list
-        return [list(range(len(seq)))]
-    
-    # generate all possible permutations of indices within each group of duplicates
-    permuted_idx_lists = []
-    for perm_combination in product(*[permutations(group) for group in 
-                                      permute_groups]):
-        # start with the list of original indices
-        permuted_idx = list(range(len(seq)))
+   if not permute_groups: # no duplicates, so return the original index list
+      return [list(range(len(seq)))]
 
-        # flatten the product of permutations and assign them to the corresponding 
-        # positions
-        for group_idx, perm in zip(permute_groups, perm_combination):
-            for orig_idx, new_idx in zip(group_idx, perm):
-                permuted_idx[orig_idx] = new_idx
+   # generate all possible permutations of indices within each group of duplicates
+   permuted_idx_lists = []
+   for perm_combination in product(*[permutations(group) for group in 
+                                    permute_groups]):
+      # start with the list of original indices
+      permuted_idx = list(range(len(seq)))
 
-        permuted_idx_lists.append(permuted_idx)
-    
-    return permuted_idx_lists
+      # flatten the product of permutations and assign them to the corresponding 
+      # positions
+      for group_idx, perm in zip(permute_groups, perm_combination):
+         for orig_idx, new_idx in zip(group_idx, perm):
+            permuted_idx[orig_idx] = new_idx
+
+      permuted_idx_lists.append(permuted_idx)
+   
+   return permuted_idx_lists
 
 def combine_cg_and_vdmbb_coords(all_AA_cg_perm_cg_coords, 
                                 all_AA_cg_perm_vdm_bbcoords):
@@ -110,300 +110,300 @@ def flatten_vdg_bbs(_vdmbb):
    return bbs
 
 def get_leader_clusters(
-    data_to_clus, threshold, AA_subset, size_subset, vdglib_dir,
-    seq_weight=0.5,
-    refresh_medoid_every=64,                  # periodic refresh for big clusters
-    small_refresh_max=16,                     # robust for small clusters
-    final_exact_medoid_pass=True,             # polish small clusters cheaply
-    final_reassign_once=True                  # one refinement pass
+   data_to_clus, threshold, AA_subset, size_subset, vdglib_dir,
+   seq_weight=0.5,
+   refresh_medoid_every=64,                  # periodic refresh for big clusters
+   small_refresh_max=16,                     # robust for small clusters
+   final_exact_medoid_pass=True,             # polish small clusters cheaply
+   final_reassign_once=True                  # one refinement pass
 ):
-    metrics, datasets = [], []
-    for data, metric in data_to_clus:
-        metrics.append(metric); datasets.append(data)
-    metric_to_data = {m: d for m, d in zip(metrics, datasets)}
-    n = len(datasets[0])
-    for d in datasets: assert len(d) == n
+   metrics, datasets = [], []
+   for data, metric in data_to_clus:
+      metrics.append(metric); datasets.append(data)
+   metric_to_data = {m: d for m, d in zip(metrics, datasets)}
+   n = len(datasets[0])
+   for d in datasets: assert len(d) == n
 
-    if n == 1:
-        return {1: [0]}, {1: 0}
+   if n == 1:
+      return {1: [0]}, {1: 0}
 
-    # Implement persistent LRU memoization to reuse distances across leader pass, 
-    # exact-medoid, and reassignment without per-call sizing or cache resets.
-    
-    # Initialize once per process; keep references on the function object
-    if not hasattr(get_leader_clusters, "_seqsim_cached"):
-        # small global registries mapping dataset ids -> actual arrays
-        get_leader_clusters._SEQ_DATASETS  = {}
-        get_leader_clusters._RMSD_DATASETS = {}
+   # Implement persistent LRU memoization to reuse distances across leader pass, 
+   # exact-medoid, and reassignment without per-call sizing or cache resets.
 
-        # cache sequence similarity (0..100). key: (id(seq_dataset), i, j)
-        @lru_cache(maxsize=_SEQ_CACHE_MAXSIZE)  # defined at module scope
-        def _seqsim_cached(ds_id, i, j):
-            # use the function's registries to avoid late-binding issues
-            seq = get_leader_clusters._SEQ_DATASETS[ds_id]
-            return calc_seq_similarity(seq[i], seq[j])
+   # Initialize once per process; keep references on the function object
+   if not hasattr(get_leader_clusters, "_seqsim_cached"):
+      # small global registries mapping dataset ids -> actual arrays
+      get_leader_clusters._SEQ_DATASETS  = {}
+      get_leader_clusters._RMSD_DATASETS = {}
 
-        # cache RMSD by metric and dataset identity.
-        # key: (metric_name, id(dataset), i, j
-        @lru_cache(maxsize=_RMSD_CACHE_MAXSIZE)
-        def _rmsd_cached(metric_name, ds_id, i, j):
-            a, b = _ord_pair(i, j)
-            data = get_leader_clusters._RMSD_DATASETS[(metric_name, ds_id)]
-            X = data[a]; Y = data[b]
-            return _rmsd_pair(X, Y)
+      # cache sequence similarity (0..100). key: (id(seq_dataset), i, j)
+      @lru_cache(maxsize=_SEQ_CACHE_MAXSIZE)  # defined at module scope
+      def _seqsim_cached(ds_id, i, j):
+          # use the function's registries to avoid late-binding issues
+          seq = get_leader_clusters._SEQ_DATASETS[ds_id]
+          return calc_seq_similarity(seq[i], seq[j])
 
-        # stash them on the function so they persist across calls
-        get_leader_clusters._seqsim_cached = _seqsim_cached
-        get_leader_clusters._rmsd_cached   = _rmsd_cached
+      # cache RMSD by metric and dataset identity.
+      # key: (metric_name, id(dataset), i, j
+      @lru_cache(maxsize=_RMSD_CACHE_MAXSIZE)
+      def _rmsd_cached(metric_name, ds_id, i, j):
+          a, b = _ord_pair(i, j)
+          data = get_leader_clusters._RMSD_DATASETS[(metric_name, ds_id)]
+          X = data[a]; Y = data[b]
+          return _rmsd_pair(X, Y)
 
-    # aliases
-    _seqsim_cached = get_leader_clusters._seqsim_cached
-    _rmsd_cached   = get_leader_clusters._rmsd_cached
-    _SEQ_DATASETS  = get_leader_clusters._SEQ_DATASETS
-    _RMSD_DATASETS = get_leader_clusters._RMSD_DATASETS
+      # stash them on the function so they persist across calls
+      get_leader_clusters._seqsim_cached = _seqsim_cached
+      get_leader_clusters._rmsd_cached   = _rmsd_cached
 
-    # register the current datasets by identity for caching 
-    dsid_seq     = id(metric_to_data['flankseq']) if 'flankseq' in metric_to_data else None
-    dsid_flankbb = id(metric_to_data['flankbb'])  if 'flankbb'  in metric_to_data else None
-    dsid_cgvdmbb = id(metric_to_data['cgvdmbb'])  if 'cgvdmbb'  in metric_to_data else None
+   # aliases
+   _seqsim_cached = get_leader_clusters._seqsim_cached
+   _rmsd_cached   = get_leader_clusters._rmsd_cached
+   _SEQ_DATASETS  = get_leader_clusters._SEQ_DATASETS
+   _RMSD_DATASETS = get_leader_clusters._RMSD_DATASETS
 
-    if dsid_seq is not None and dsid_seq not in _SEQ_DATASETS:
-        _SEQ_DATASETS[dsid_seq] = metric_to_data['flankseq']
-    if dsid_flankbb is not None and ('flankbb', dsid_flankbb) not in _RMSD_DATASETS:
-        _RMSD_DATASETS[('flankbb', dsid_flankbb)] = metric_to_data['flankbb']
-    if dsid_cgvdmbb is not None and ('cgvdmbb', dsid_cgvdmbb) not in _RMSD_DATASETS:
-        _RMSD_DATASETS[('cgvdmbb', dsid_cgvdmbb)] = metric_to_data['cgvdmbb']
+   # register the current datasets by identity for caching 
+   dsid_seq     = id(metric_to_data['flankseq']) if 'flankseq' in metric_to_data else None
+   dsid_flankbb = id(metric_to_data['flankbb'])  if 'flankbb'  in metric_to_data else None
+   dsid_cgvdmbb = id(metric_to_data['cgvdmbb'])  if 'cgvdmbb'  in metric_to_data else None
 
-    def _ord_pair(i, j):
-        # Order indices so (i, j) and (j, i) share the same cache entry.
-        return (i, j) if i <= j else (j, i)
+   if dsid_seq is not None and dsid_seq not in _SEQ_DATASETS:
+      _SEQ_DATASETS[dsid_seq] = metric_to_data['flankseq']
+   if dsid_flankbb is not None and ('flankbb', dsid_flankbb) not in _RMSD_DATASETS:
+      _RMSD_DATASETS[('flankbb', dsid_flankbb)] = metric_to_data['flankbb']
+   if dsid_cgvdmbb is not None and ('cgvdmbb', dsid_cgvdmbb) not in _RMSD_DATASETS:
+      _RMSD_DATASETS[('cgvdmbb', dsid_cgvdmbb)] = metric_to_data['cgvdmbb']
 
-    # ---- distance using (RMSD + seq dissim/2) ----
-    def _dist_idx_idx(i, j, early_stop=True, cap=None):
-        # cap: if provided, we early-exit once total > min(cap, threshold)
-        cutoff = threshold if cap is None else min(cap, threshold)
-        total = 0.0
+   def _ord_pair(i, j):
+      # Order indices so (i, j) and (j, i) share the same cache entry.
+      return (i, j) if i <= j else (j, i)
 
-        if dsid_seq is not None:
-            # pull seq sim from persistent cache instead of recomputing
-            a, b = _ord_pair(i, j)
-            sim = _seqsim_cached(dsid_seq, a, b)  # 0..100
-            total += ((100.0 - sim) / 100.0) * seq_weight
-            if early_stop and total > cutoff:
-                return total
+   # ---- distance using (RMSD + seq dissim/2) ----
+   def _dist_idx_idx(i, j, early_stop=True, cap=None):
+      # cap: if provided, we early-exit once total > min(cap, threshold)
+      cutoff = threshold if cap is None else min(cap, threshold)
+      total = 0.0
 
-        if dsid_flankbb is not None:
-            # cached RMSD for 'flankbb'
-            a, b = _ord_pair(i, j)
-            total += _rmsd_cached('flankbb', dsid_flankbb, i, j)
-            if early_stop and total > cutoff:
-                return total
+      if dsid_seq is not None:
+         # pull seq sim from persistent cache instead of recomputing
+         a, b = _ord_pair(i, j)
+         sim = _seqsim_cached(dsid_seq, a, b)  # 0..100
+         total += ((100.0 - sim) / 100.0) * seq_weight
+         if early_stop and total > cutoff:
+            return total
 
-        if dsid_cgvdmbb is not None:
-            # cached RMSD for 'cgvdmbb'
-            a, b = _ord_pair(i, j)
-            total += _rmsd_cached('cgvdmbb', dsid_cgvdmbb, i, j)
-        return total
+      if dsid_flankbb is not None:
+         # cached RMSD for 'flankbb'
+         a, b = _ord_pair(i, j)
+         total += _rmsd_cached('flankbb', dsid_flankbb, i, j)
+         if early_stop and total > cutoff:
+            return total
 
-    # ---- exact medoid (O(m^2), but m is small for small clusters) ----
-    def _exact_medoid(members):
-        if len(members) <= 2:
-            return members[0]
-        best, best_sum = members[0], float('inf')
-        for c in members:
-            s = 0.0
-            for o in members:
-                if o == c: continue
-                # same distance, hits persistent caches
-                s += _dist_idx_idx(c, o, early_stop=False)  # <- full distance
-                if s >= best_sum:  # early break on the SUM, not on threshold
-                    break
-            if s < best_sum:
-                best_sum, best = s, c
-        return best
+      if dsid_cgvdmbb is not None:
+         # cached RMSD for 'cgvdmbb'
+         a, b = _ord_pair(i, j)
+         total += _rmsd_cached('cgvdmbb', dsid_cgvdmbb, i, j)
+      return total
 
-    # ---- Leader pass ----
-    reps = [0]            # representative indices
-    members = [[0]]       # cluster memberships (lists of indices)
+   # ---- exact medoid (O(m^2), but m is small for small clusters) ----
+   def _exact_medoid(members):
+      if len(members) <= 2:
+          return members[0]
+      best, best_sum = members[0], float('inf')
+      for c in members:
+         s = 0.0
+         for o in members:
+            if o == c: continue
+            # same distance, hits persistent caches
+            s += _dist_idx_idx(c, o, early_stop=False)  # <- full distance
+            if s >= best_sum:  # early break on the SUM, not on threshold
+               break
+         if s < best_sum:
+             best_sum, best = s, c
+      return best
 
-    for i in range(1, n):
-        best_j, best_d = -1, float('inf')
-        for j, r in enumerate(reps):
-            # Use persistent caches for distance calls
-            d = _dist_idx_idx(i, r, early_stop=True, cap=best_d)
-            if d < best_d:
-                best_d, best_j = d, j
+   # ---- Leader pass ----
+   reps = [0]            # representative indices
+   members = [[0]]       # cluster memberships (lists of indices)
 
-        if best_d <= threshold and best_j >= 0:
-            # assign to existing cluster
-            members[best_j].append(i)
+   for i in range(1, n):
+      best_j, best_d = -1, float('inf')
+      for j, r in enumerate(reps):
+         # Use persistent caches for distance calls
+         d = _dist_idx_idx(i, r, early_stop=True, cap=best_d)
+         if d < best_d:
+            best_d, best_j = d, j
 
-            # small-cluster refresh
-            size_now = len(members[best_j])
-            # robust for tiny clusters
-            if size_now <= small_refresh_max:
-                reps[best_j] = _exact_medoid(members[best_j])
-            # periodic refresh for big clusters
-            elif refresh_medoid_every and (size_now % refresh_medoid_every == 0):
-                reps[best_j] = _exact_medoid(members[best_j])
+      if best_d <= threshold and best_j >= 0:
+         # assign to existing cluster
+         members[best_j].append(i)
 
-        else:
-            # start new cluster
-            reps.append(i)
-            members.append([i])
+         # small-cluster refresh
+         size_now = len(members[best_j])
+         # robust for tiny clusters
+         if size_now <= small_refresh_max:
+            reps[best_j] = _exact_medoid(members[best_j])
+         # periodic refresh for big clusters
+         elif refresh_medoid_every and (size_now % refresh_medoid_every == 0):
+            reps[best_j] = _exact_medoid(members[best_j])
 
-    # ---- Final polish: exact medoid for every cluster ----
-    if final_exact_medoid_pass:
-        for j in range(len(reps)):
-            reps[j] = _exact_medoid(members[j])
+      else:
+         # start new cluster
+         reps.append(i)
+         members.append([i])
 
-        if final_reassign_once:
-            # map each item -> its current cluster
-            item2clus = {}
+   # ---- Final polish: exact medoid for every cluster ----
+   if final_exact_medoid_pass:
+      for j in range(len(reps)):
+         reps[j] = _exact_medoid(members[j])
+
+      if final_reassign_once:
+         # map each item -> its current cluster
+         item2clus = {}
+         for j, mem in enumerate(members):
+            for idx in mem:
+               item2clus[idx] = j
+
+         # single reassignment step: move only if STRICTLY closer to another medoid and within threshold
+         moved_any = False
+         for i in range(n):
+            cur_j = item2clus[i]
+            # Distances to medoids hit persistent caches
+            d_cur = _dist_idx_idx(i, reps[cur_j], early_stop=True, cap=threshold)
+            best_j, best_d = cur_j, d_cur
+
+            # If nothing can beat ~0, skip quickly
+            if best_d <= EPS:
+               continue
+
+            for j, r in enumerate(reps):
+               if j == cur_j:
+                  continue
+               strict_cap = min(best_d - EPS, threshold)  # if best_d==d_cur initially, this is d_cur-EPS
+               if strict_cap <= 0.0:
+                  continue  # can't possibly beat current
+               d = _dist_idx_idx(i, r, early_stop=True, cap=strict_cap)
+               if d < best_d:
+                  best_d, best_j = d, j
+
+            # Reassign only if strictly closer and within threshold
+            if best_j != cur_j and best_d <= threshold and best_d + EPS < d_cur:
+               # move i
+               members[cur_j].remove(i)
+               members[best_j].append(i)
+               item2clus[i] = best_j
+               moved_any = True
+
+         # drop any empties and recompute medoids once more
+         if moved_any:
+            new_reps, new_members = [], []
             for j, mem in enumerate(members):
-                for idx in mem:
-                    item2clus[idx] = j
+               if len(mem) == 0: continue
+               new_members.append(mem)
+               new_reps.append(_exact_medoid(mem))
+            members, reps = new_members, new_reps
 
-            # single reassignment step: move only if STRICTLY closer to another medoid and within threshold
-            moved_any = False
-            for i in range(n):
-                cur_j = item2clus[i]
-                # Distances to medoids hit persistent caches
-                d_cur = _dist_idx_idx(i, reps[cur_j], early_stop=True, cap=threshold)
-                best_j, best_d = cur_j, d_cur
-
-                # If nothing can beat ~0, skip quickly
-                if best_d <= EPS:
-                    continue
-
-                for j, r in enumerate(reps):
-                    if j == cur_j:
-                        continue
-                    strict_cap = min(best_d - EPS, threshold)  # if best_d==d_cur initially, this is d_cur-EPS
-                    if strict_cap <= 0.0:
-                        continue  # can't possibly beat current
-                    d = _dist_idx_idx(i, r, early_stop=True, cap=strict_cap)
-                    if d < best_d:
-                        best_d, best_j = d, j
-
-                # Reassign only if strictly closer and within threshold
-                if best_j != cur_j and best_d <= threshold and best_d + EPS < d_cur:
-                    # move i
-                    members[cur_j].remove(i)
-                    members[best_j].append(i)
-                    item2clus[i] = best_j
-                    moved_any = True
-
-            # drop any empties and recompute medoids once more
-            if moved_any:
-                new_reps, new_members = [], []
-                for j, mem in enumerate(members):
-                    if len(mem) == 0: continue
-                    new_members.append(mem)
-                    new_reps.append(_exact_medoid(mem))
-                members, reps = new_members, new_reps
-
-    clus_assignments = {cnum+1: mem for cnum, mem in enumerate(members)}
-    centroids        = {cnum+1: reps[cnum] for cnum in range(len(reps))}
-    return clus_assignments, centroids
+   clus_assignments = {cnum+1: mem for cnum, mem in enumerate(members)}
+   centroids        = {cnum+1: reps[cnum] for cnum in range(len(reps))}
+   return clus_assignments, centroids
 
 def kabsch(X, Y, chunk_size=30000):
-    """
-    Rotate and translate X into Y to minimize SSD (Kabsch, 1976).
-    X, Y: arrays of shape [M, N, 3]
-    Returns:
-        R:   [M, 3, 3]
-        t:   [M, 3]
-        ssd: [M]
-    """
-    R_chunks, t_chunks, ssd_chunks = [], [], []
-    M = len(X)
+   """
+   Rotate and translate X into Y to minimize SSD (Kabsch, 1976).
+   X, Y: arrays of shape [M, N, 3]
+   Returns:
+       R:   [M, 3, 3]
+       t:   [M, 3]
+       ssd: [M]
+   """
+   R_chunks, t_chunks, ssd_chunks = [], [], []
+   M = len(X)
 
-    for start in range(0, M, chunk_size):
-        stop = min(start + chunk_size, M)
-        Xc_in = X[start:stop]
-        Yc_in = Y[start:stop]
+   for start in range(0, M, chunk_size):
+      stop = min(start + chunk_size, M)
+      Xc_in = X[start:stop]
+      Yc_in = Y[start:stop]
 
-        mask = np.logical_or(np.isnan(Xc_in), np.isnan(Yc_in))
-        valid_atom = ~np.any(mask, axis=2)
-        N_atoms = np.sum(valid_atom, axis=1, keepdims=True)
-        zero_rows = (N_atoms == 0).squeeze(-1)
-        safeN = np.where(N_atoms == 0, 1, N_atoms)
+      mask = np.logical_or(np.isnan(Xc_in), np.isnan(Yc_in))
+      valid_atom = ~np.any(mask, axis=2)
+      N_atoms = np.sum(valid_atom, axis=1, keepdims=True)
+      zero_rows = (N_atoms == 0).squeeze(-1)
+      safeN = np.where(N_atoms == 0, 1, N_atoms)
 
-        X_nonan = np.where(mask, 0.0, Xc_in).astype(np.float32)
-        Y_nonan = np.where(mask, 0.0, Yc_in).astype(np.float32)
+      X_nonan = np.where(mask, 0.0, Xc_in).astype(np.float32)
+      Y_nonan = np.where(mask, 0.0, Yc_in).astype(np.float32)
 
-        valid_coords = np.repeat(valid_atom[:, :, None], 3, axis=2)
-        Xbar = (np.sum(X_nonan * valid_coords, axis=1, keepdims=True) /
-                safeN[:, None, :].astype(np.float32))
-        Ybar = (np.sum(Y_nonan * valid_coords, axis=1, keepdims=True) /
-                safeN[:, None, :].astype(np.float32))
+      valid_coords = np.repeat(valid_atom[:, :, None], 3, axis=2)
+      Xbar = (np.sum(X_nonan * valid_coords, axis=1, keepdims=True) /
+              safeN[:, None, :].astype(np.float32))
+      Ybar = (np.sum(Y_nonan * valid_coords, axis=1, keepdims=True) /
+              safeN[:, None, :].astype(np.float32))
 
-        Xc = X_nonan - Xbar
-        Yc = Y_nonan - Ybar
-        Xc[mask] = 0.0
-        Yc[mask] = 0.0
+      Xc = X_nonan - Xbar
+      Yc = Y_nonan - Ybar
+      Xc[mask] = 0.0
+      Yc[mask] = 0.0
 
-        H = np.matmul(np.transpose(Xc, (0, 2, 1)), Yc)
-        U, S, Vt = np.linalg.svd(H, full_matrices=False)
-        d = np.sign(np.linalg.det(np.matmul(U, Vt))).astype(np.float32)
+      H = np.matmul(np.transpose(Xc, (0, 2, 1)), Yc)
+      U, S, Vt = np.linalg.svd(H, full_matrices=False)
+      d = np.sign(np.linalg.det(np.matmul(U, Vt))).astype(np.float32)
 
-        D = np.zeros((H.shape[0], 3, 3), dtype=np.float32)
-        D[:, 0, 0] = 1.0
-        D[:, 1, 1] = 1.0
-        D[:, 2, 2] = d
+      D = np.zeros((H.shape[0], 3, 3), dtype=np.float32)
+      D[:, 0, 0] = 1.0
+      D[:, 1, 1] = 1.0
+      D[:, 2, 2] = d
 
-        R = np.matmul(U.astype(np.float32), np.matmul(D, Vt.astype(np.float32)))
-        t = (Ybar - np.matmul(Xbar, R)).reshape(-1, 3)
+      R = np.matmul(U.astype(np.float32), np.matmul(D, Vt.astype(np.float32)))
+      t = (Ybar - np.matmul(Xbar, R)).reshape(-1, 3)
 
-        XRmY = np.matmul(Xc, R) - Yc
-        ssd = np.sum(XRmY ** 2, axis=(1, 2)).astype(np.float64)
+      XRmY = np.matmul(Xc, R) - Yc
+      ssd = np.sum(XRmY ** 2, axis=(1, 2)).astype(np.float64)
 
-        if np.any(zero_rows):
-            ssd[zero_rows] = np.inf
+      if np.any(zero_rows):
+         ssd[zero_rows] = np.inf
 
-        R_chunks.append(R)
-        t_chunks.append(t.astype(np.float32))
-        ssd_chunks.append(ssd)
+      R_chunks.append(R)
+      t_chunks.append(t.astype(np.float32))
+      ssd_chunks.append(ssd)
 
-    R = np.concatenate(R_chunks) if R_chunks else np.empty((0, 3, 3), np.float32)
-    t = np.concatenate(t_chunks) if t_chunks else np.empty((0, 3), np.float32)
-    ssd = np.concatenate(ssd_chunks) if ssd_chunks else np.empty((0,), np.float64)
-    return R, t, ssd
+   R = np.concatenate(R_chunks) if R_chunks else np.empty((0, 3, 3), np.float32)
+   t = np.concatenate(t_chunks) if t_chunks else np.empty((0, 3), np.float32)
+   ssd = np.concatenate(ssd_chunks) if ssd_chunks else np.empty((0,), np.float64)
+   return R, t, ssd
 
 def _rmsd_pair(X, Y,):
-    '''RMSD between two coordinate arrays (N,3)'''
-    X = np.asarray(X, dtype=np.float64)
-    Y = np.asarray(Y, dtype=np.float64)
-    if X.shape != Y.shape:
-        raise ValueError(f"RMSD pair got mismatched shapes: {X.shape} vs {Y.shape}")
-    # Use vectorized Kabsch with a single pair (M=1)
-    _, _, ssd = kabsch(X[None, ...], Y[None, ...], chunk_size=1)
-    n_atoms = X.shape[0]
-    return float(np.sqrt(ssd[0] / n_atoms))
+   '''RMSD between two coordinate arrays (N,3)'''
+   X = np.asarray(X, dtype=np.float64)
+   Y = np.asarray(Y, dtype=np.float64)
+   if X.shape != Y.shape:
+      raise ValueError(f"RMSD pair got mismatched shapes: {X.shape} vs {Y.shape}")
+   # Use vectorized Kabsch with a single pair (M=1)
+   _, _, ssd = kabsch(X[None, ...], Y[None, ...], chunk_size=1)
+   n_atoms = X.shape[0]
+   return float(np.sqrt(ssd[0] / n_atoms))
 
 def calc_seq_similarity(list1, list2):
    # Percent identity of flanking residue names after dropping positions labeled 'vdm' 
    # or 'X'. Returns identity=0 (max dissimilarity) if all positions drop.
-    list1 = [i for i in list1 if i != 'vdm']
-    list2 = [i for i in list2 if i != 'vdm']
-    assert len(list1) == len(list2)
-    # Exclude residues if at least one of them is an "X"
-    indices_to_exclude = []
-    for ind in range(len(list1)):
-         if list1[ind] == 'X' or list2[ind] == 'X':
-            indices_to_exclude.append(ind)
-    list1 = [item for idx, item in enumerate(list1) if idx not in indices_to_exclude]
-    list2 = [item for idx, item in enumerate(list2) if idx not in indices_to_exclude]
-    matches = sum(1 for a, b in zip(list1, list2) if a == b)
+   list1 = [i for i in list1 if i != 'vdm']
+   list2 = [i for i in list2 if i != 'vdm']
+   assert len(list1) == len(list2)
+   # Exclude residues if at least one of them is an "X"
+   indices_to_exclude = []
+   for ind in range(len(list1)):
+      if list1[ind] == 'X' or list2[ind] == 'X':
+         indices_to_exclude.append(ind)
+   list1 = [item for idx, item in enumerate(list1) if idx not in indices_to_exclude]
+   list2 = [item for idx, item in enumerate(list2) if idx not in indices_to_exclude]
+   matches = sum(1 for a, b in zip(list1, list2) if a == b)
 
-    # Calculate the percentage of matches. If all residues were dropped out, 
-    # it should be treated as max dissimilarity.
-    if len(list1) == 0:
-        match_percentage = 0
-    else:
-        match_percentage = (matches / len(list1)) * 100
-    return match_percentage
+   # Calculate the percentage of matches. If all residues were dropped out, 
+   # it should be treated as max dissimilarity.
+   if len(list1) == 0:
+      match_percentage = 0
+   else:
+      match_percentage = (matches / len(list1)) * 100
+   return match_percentage
 
 def get_vdm_res_features(prody_obj, pdbpath, num_flanking):
    # Identify the vdM residues (occ == 2). To be safe, select > 1.5 and < 2.5.
@@ -694,51 +694,49 @@ def reorder_vdg_subset(vdg_subset, vdms_dict, cg_obj, prody_obj):
    return sort_vdGs_by_AA(super_list)
 
 def sort_vdGs_by_AA(super_list):
-    # Check if all sublists have equal length
-    assert all(len(sublist) == len(super_list[0]) for sublist in super_list)
-    # Combine the sublists into a list of tuples, where each tuple corresponds to the 
-    # elements at the same index
-    combined = list(zip(*super_list))
-    # Sort the combined list based on the first element (from the first sublist)
-    sorted_combined = sorted(combined, key=lambda x: x[0])
-    # Unzip the sorted combined list back into sublists
-    sorted_sublists = list(zip(*sorted_combined))
-    return [list(sublist) for sublist in sorted_sublists]
+   # Check if all sublists have equal length
+   assert all(len(sublist) == len(super_list[0]) for sublist in super_list)
+   # Combine the sublists into a list of tuples, where each tuple corresponds to the 
+   # elements at the same index
+   combined = list(zip(*super_list))
+   # Sort the combined list based on the first element (from the first sublist)
+   sorted_combined = sorted(combined, key=lambda x: x[0])
+   # Unzip the sorted combined list back into sublists
+   sorted_sublists = list(zip(*sorted_combined))
+   return [list(sublist) for sublist in sorted_sublists]
 
 def permute_on_indices(symmetry_classes, coords_to_permute):
-    # Given a list of indices to permute on (symmetry_classes), permute a list or 
-    # array of coordinates.
-
+   # Given a list of indices to permute on (symmetry_classes), permute a list or 
+   # array of coordinates.
    assert len(symmetry_classes) == len(coords_to_permute)
-
    # Group coordinates by their indices
    grouped_coords = {}
    for idx, coord in zip(symmetry_classes, coords_to_permute):
-       if idx not in grouped_coords:
-           grouped_coords[idx] = []
-       grouped_coords[idx].append(coord)
+      if idx not in grouped_coords:
+         grouped_coords[idx] = []
+      grouped_coords[idx].append(coord)
 
    # Generate all permutations of coordinates within each group
    grouped_permutations = {}
    for key in grouped_coords:
-       grouped_permutations[key] = list(permutations(grouped_coords[key]))
+      grouped_permutations[key] = list(permutations(grouped_coords[key]))
 
    # Generate all combinations of permutations (one for each group)
    result = []
    for perm_combination in product(*grouped_permutations.values()):
-       # Rebuild the permuted list from the permuted groups
-       permuted_list = []
-       # For each original index, we need to pick the corresponding permuted item
-       perm_idx = {key: 0 for key in grouped_permutations}  # Keep track of which 
-                                            # element in each permutation we're at
-       for idx in symmetry_classes:
-           # Find the group corresponding to the current index (grouped_permutations)
-           group_perm = perm_combination[list(
-              grouped_permutations.keys()).index(idx)]
-           permuted_list.append(group_perm[perm_idx[idx]])
-           perm_idx[idx] += 1  # Move to the next item in this group's permutation
-       
-       result.append(np.array(permuted_list))
+      # Rebuild the permuted list from the permuted groups
+      permuted_list = []
+      # For each original index, we need to pick the corresponding permuted item
+      perm_idx = {key: 0 for key in grouped_permutations}  # Keep track of which 
+                                           # element in each permutation we're at
+      for idx in symmetry_classes:
+         # Find the group corresponding to the current index (grouped_permutations)
+         group_perm = perm_combination[list(
+            grouped_permutations.keys()).index(idx)]
+         permuted_list.append(group_perm[perm_idx[idx]])
+         perm_idx[idx] += 1  # Move to the next item in this group's permutation
+      
+      result.append(np.array(permuted_list))
 
    return result
 
@@ -802,100 +800,100 @@ def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_c
    num_flanking, first_pdb_out, first_pdb_cg_vdmbb_coords, weights, atomgroup_dict, 
    print_flankbb, symmetry_classes, reordered_AAs, clusterlabel=None):
     
-    assert len(all_pdbpaths) == len(all_cg_and_vdmbb_coords)
-    ref = np.array([[0, 0, 0], [-1, 0, 1], [1, -1, 0]])  # reference for aligning CG
+   assert len(all_pdbpaths) == len(all_cg_and_vdmbb_coords)
+   ref = np.array([[0, 0, 0], [-1, 0, 1], [1, -1, 0]])  # reference for aligning CG
 
-    failed = []
-    for clusnum, clus_mem_indices in sorted(clus_assignments.items()):
-        subdir = f'{clusterlabel}clus_{clusnum}' if clusterlabel else f'clus_{clusnum}'
-        clusnum_dir = os.path.join(clusdir, subdir)
-        os.makedirs(clusnum_dir, exist_ok=False)  # Intentionally fail if it's a re-run
-        centroid_ind = centroid_assignments[clusnum]
-        # Output the centroid first
-        data = get_clus_mem_data(centroid_ind, all_cg_coords, all_cg_and_vdmbb_coords, 
-            all_flankbb_coords, all_pdbpaths, all_scrr_cg_perm, num_flanking, 
-            atomgroup_dict)
-        if data is None:
-            failed.append(all_pdbpaths[centroid_ind])
+   failed = []
+   for clusnum, clus_mem_indices in sorted(clus_assignments.items()):
+      subdir = f'{clusterlabel}clus_{clusnum}' if clusterlabel else f'clus_{clusnum}'
+      clusnum_dir = os.path.join(clusdir, subdir)
+      os.makedirs(clusnum_dir, exist_ok=False)  # Intentionally fail if it's a re-run
+      centroid_ind = centroid_assignments[clusnum]
+      # Output the centroid first
+      data = get_clus_mem_data(centroid_ind, all_cg_coords, all_cg_and_vdmbb_coords, 
+         all_flankbb_coords, all_pdbpaths, all_scrr_cg_perm, num_flanking, 
+         atomgroup_dict)
+      if data is None:
+         failed.append(all_pdbpaths[centroid_ind])
+         continue
+      (cent_cg_coords, cent_cg_vdmbb_coords, cent_flankbb_coords, cent_pdbpath, 
+       cent_scrr_cg_perm, cent_pr_obj) = data
+      cent_pdb_outpath = get_clus_pdb_outpath(clusnum, clusnum_dir, cent_pdbpath, 
+                                  cent_scrr_cg_perm, centroid_ind, is_centroid=True)
+
+      if first_pdb_out is None:
+         # Write the very first PDB aligned to the 3-atom reference
+         try:
+            first_pdb_out, first_pdb_cg_vdmbb_coords = print_out_first_pdb_of_clus(
+                cent_pdb_outpath, cent_cg_coords, cent_cg_vdmbb_coords, cent_pr_obj, 
+                ref, cent_scrr_cg_perm, print_flankbb)
+            # For the first cluster, the "moved centroid coords" are the first-PDB coords
+            moved_cent_coords = first_pdb_cg_vdmbb_coords
+         except Exception as e:
+            print(f'[ERROR] {reordered_AAs} cluster {clusnum} centroid, the first '
+                  f'PDB, failed ({cent_pdbpath}): \n{e}\n'
+                  f'Skipping entire AA bucket; must troubleshoot.')
+            first_pdb_out, first_pdb_cg_vdmbb_coords = None, None
             continue
-        (cent_cg_coords, cent_cg_vdmbb_coords, cent_flankbb_coords, cent_pdbpath, 
-         cent_scrr_cg_perm, cent_pr_obj) = data
-        cent_pdb_outpath = get_clus_pdb_outpath(clusnum, clusnum_dir, cent_pdbpath, 
-                                    cent_scrr_cg_perm, centroid_ind, is_centroid=True)
+      else:
+         # Align this cluster's centroid to the very first PDB’s coords (target_coords). 
+         # `get_transf_and_coords` handles symmetry permutations.
+         try:
+            moved_cent_transf, moved_cent_coords = get_transf_and_coords(
+                     cent_cg_vdmbb_coords, first_pdb_cg_vdmbb_coords, weights, 
+                     cent_pr_obj, cent_scrr_cg_perm, symmetry_classes)
+         except Exception as e: # Sometimes errors out, though rare.
+            print(f'[WARNING] {reordered_AAs} cluster {clusnum}: \n{e}\n'
+                  f'Failed to align centroid ({cent_pdbpath}) to the first PDB '
+                  f'({first_pdb_out}). Need to skip entire cluster, which has '
+                  f'{len(clus_mem_indices)} members.')
 
-        if first_pdb_out is None:
-           # Write the very first PDB aligned to the 3-atom reference
-            try:
-                first_pdb_out, first_pdb_cg_vdmbb_coords = print_out_first_pdb_of_clus(
-                    cent_pdb_outpath, cent_cg_coords, cent_cg_vdmbb_coords, cent_pr_obj, 
-                    ref, cent_scrr_cg_perm, print_flankbb)
-                # For the first cluster, the "moved centroid coords" are the first-PDB coords
-                moved_cent_coords = first_pdb_cg_vdmbb_coords
-            except Exception as e:
-               print(f'[ERROR] {reordered_AAs} cluster {clusnum} centroid, the first '
-                     f'PDB, failed ({cent_pdbpath}): \n{e}\n'
-                     f'Skipping entire AA bucket; must troubleshoot.')
-               first_pdb_out, first_pdb_cg_vdmbb_coords = None, None
+            failed.append(cent_pdbpath)
+            continue
+
+         write_out_subsequent_clus_pdbs(cent_pr_obj, cent_pdb_outpath, 
+                             cent_scrr_cg_perm, print_flankbb, moved_cent_transf)
+
+      # Now, process non-centroid members
+      for ind in clus_mem_indices:
+         if ind == centroid_ind:
+            continue
+
+         try:
+            mem_data = get_clus_mem_data(
+               ind, all_cg_coords, all_cg_and_vdmbb_coords, all_flankbb_coords,
+               all_pdbpaths, all_scrr_cg_perm, num_flanking, atomgroup_dict)
+            if mem_data is None:
+               failed.append(all_pdbpaths[ind])
                continue
-        else:
-           # Align this cluster's centroid to the very first PDB’s coords (target_coords). 
-           # `get_transf_and_coords` handles symmetry permutations.
-            try:
-                moved_cent_transf, moved_cent_coords = get_transf_and_coords(
-                        cent_cg_vdmbb_coords, first_pdb_cg_vdmbb_coords, weights, cent_pr_obj,
-                        cent_scrr_cg_perm, symmetry_classes)
-            except Exception as e: # Sometimes errors out, though rare.
-              print(f'[WARNING] {reordered_AAs} cluster {clusnum}: \n{e}\n'
-                    f'Failed to align centroid ({cent_pdbpath}) to the first PDB '
-                    f'({first_pdb_out}). Need to skip entire cluster, which has '
-                    f'{len(clus_mem_indices)} members.')
 
-              failed.append(cent_pdbpath)
-              continue
+            (clusmem_cg_coords, clusmem_cg_vdmbb_coords, clusmem_flankbb_coords,
+             clusmem_pdbpath, clusmem_scrr_cg_perm, clusmem_pr_obj) = mem_data
 
-            write_out_subsequent_clus_pdbs(cent_pr_obj, cent_pdb_outpath, 
-                                cent_scrr_cg_perm, print_flankbb, moved_cent_transf)
+            clusmem_pdb_outpath = get_clus_pdb_outpath(
+               clusnum, clusnum_dir, clusmem_pdbpath, clusmem_scrr_cg_perm, ind, 
+               is_centroid=False)
 
-        # Now, process non-centroid members
-        for ind in clus_mem_indices:
-           if ind == centroid_ind:
-              continue
+            if clusnum == 1: # the centroid to align onto _is_ the first pdb instead of a 
+               # cluster cent that's aligned onto the first pdb.
+               target_coords = first_pdb_cg_vdmbb_coords
+            else:
+               target_coords = moved_cent_coords
 
-           try:
-              mem_data = get_clus_mem_data(
-                  ind, all_cg_coords, all_cg_and_vdmbb_coords, all_flankbb_coords,
-                  all_pdbpaths, all_scrr_cg_perm, num_flanking, atomgroup_dict)
-              if mem_data is None:
-                  failed.append(all_pdbpaths[ind])
-                  continue
+            moved_transf, _ = get_transf_and_coords(
+               clusmem_cg_vdmbb_coords, target_coords, weights, clusmem_pr_obj,
+               clusmem_scrr_cg_perm, symmetry_classes)
 
-              (clusmem_cg_coords, clusmem_cg_vdmbb_coords, clusmem_flankbb_coords,
-               clusmem_pdbpath, clusmem_scrr_cg_perm, clusmem_pr_obj) = mem_data
+            write_out_subsequent_clus_pdbs(
+               clusmem_pr_obj, clusmem_pdb_outpath, clusmem_scrr_cg_perm,
+               print_flankbb, moved_transf)
 
-              clusmem_pdb_outpath = get_clus_pdb_outpath(
-                  clusnum, clusnum_dir, clusmem_pdbpath, clusmem_scrr_cg_perm, ind, 
-                  is_centroid=False)
+         except Exception as e:
+            print(f"[WARNING] {reordered_AAs} cluster member {ind} of clusnum "
+                  f"{clusnum} ({all_pdbpaths[ind]}): {e}")
+            failed.append(all_pdbpaths[ind])
 
-              if clusnum == 1: # the centroid to align onto _is_ the first pdb instead of a 
-                 # cluster cent that's aligned onto the first pdb.
-                 target_coords = first_pdb_cg_vdmbb_coords
-              else:
-                 target_coords = moved_cent_coords
-
-              moved_transf, _ = get_transf_and_coords(
-                  clusmem_cg_vdmbb_coords, target_coords, weights, clusmem_pr_obj,
-                  clusmem_scrr_cg_perm, symmetry_classes)
-
-              write_out_subsequent_clus_pdbs(
-                  clusmem_pr_obj, clusmem_pdb_outpath, clusmem_scrr_cg_perm,
-                  print_flankbb, moved_transf)
-
-           except Exception as e:
-              print(f"[WARNING] {reordered_AAs} cluster member {ind} of clusnum "
-                    f"{clusnum} ({all_pdbpaths[ind]}): {e}")
-              failed.append(all_pdbpaths[ind])
-
-    return first_pdb_out, first_pdb_cg_vdmbb_coords, failed
+   return first_pdb_out, first_pdb_cg_vdmbb_coords, failed
 
 def get_transf_and_coords(mobile_coords, target_coords, weights, obj, scrrs, 
                           symmetry_classes):
@@ -1271,8 +1269,7 @@ def add_vdm_obj_for_cluslevel_cgvdmbb(par, vdm_scrr):
 
    if vdm_scrr[0]: # has a pdb segment defined
       res_obj = par.select(
-         f'segment {vdm_scrr[0]} and chain {vdm_scrr[1]} and {res_sel}'
-         )
+         f'segment {vdm_scrr[0]} and chain {vdm_scrr[1]} and {res_sel}')
    else: # no segment
       res_obj = par.select(
          f'chain {vdm_scrr[1]} and {res_sel}')
@@ -1283,21 +1280,21 @@ def add_vdm_obj_for_cluslevel_cgvdmbb(par, vdm_scrr):
    return res_obj
 
 def _pick_single_ca(ca_sel, prev_ca):
-    # Return a single CA atom object from a ProDy selection, handling altlocs/dups
-    # for `determine_flank_resnums`
-    if len(ca_sel) == 1:
-        return ca_sel[0]
+   # Return a single CA atom object from a ProDy selection, handling altlocs/dups
+   # for `determine_flank_resnums`
+   if len(ca_sel) == 1:
+      return ca_sel[0]
 
-    # If we have multiple CAs (altlocs/dups), prefer the one closest to prev_ca.
-    if prev_ca is None:
-        return ca_sel[0]
+   # If we have multiple CAs (altlocs/dups), prefer the one closest to prev_ca.
+   if prev_ca is None:
+      return ca_sel[0]
 
-    best_atom, best_dist = None, float('inf')
-    for atom in ca_sel:
-        d = pr.calcDistance(prev_ca, atom)
-        if d < best_dist:
-            best_atom, best_dist = atom, d
-    return best_atom
+   best_atom, best_dist = None, float('inf')
+   for atom in ca_sel:
+      d = pr.calcDistance(prev_ca, atom)
+      if d < best_dist:
+         best_atom, best_dist = atom, d
+   return best_atom
 
 def determine_flank_resnums(par, list_resnums, s, c, vdm_ca):
    # Determine which flanking residues to add to pr obj based on chain breaks. 
