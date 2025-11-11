@@ -6,8 +6,9 @@ import prody as pr
 import os
 import utils
 from collections import defaultdict
+import traceback
 
-def get_fragments(bond_radius, mol, min_frag_size=4, max_frag_size=7, quiet=False): 
+def get_fragments(bond_radius, mol, min_frag_size=4, max_frag_size=7, quiet=True): 
     # Decompose the ligand into fragments and store the fragment SMILES. Use SMILES 
     # instead of SMARTS b/c only SMILES (from rdkit) differentiates aliphatic and 
     # aryl (C,c vs. [#6]). Fragment on bond radii `bond_radius` AND the postive 
@@ -19,12 +20,16 @@ def get_fragments(bond_radius, mol, min_frag_size=4, max_frag_size=7, quiet=Fals
         substructs += fragment_on_bond_d(mol, rad)
     # Add substructs to `filtered_frags`.
     for orig_sub, orig_mol_inds in substructs: # contains H's that need to be scrubbed.
-        sub_perms_mols_inds, sub_smiles = manually_remove_Hs(orig_sub, return_single_mol_or_perms='perms')
+        # apply size threshold.
+        frag_size = orig_sub.GetNumHeavyAtoms()
+        if frag_size < min_frag_size or frag_size > max_frag_size:
+            continue
+        _results = manually_remove_Hs(orig_sub, return_single_mol_or_perms='perms')
+        if _results is None:
+            continue
+
+        sub_perms_mols_inds, sub_smiles = _results
         for sub, perm_inds in sub_perms_mols_inds: 
-            # apply size threshold.
-            frag_size = len([i for i in sub.GetAtoms() if i.GetSymbol() != 'H'])
-            if frag_size < min_frag_size or frag_size > max_frag_size:
-                continue
             # skip if the elements are all carbons
             frag_elements = "".join(sorted([a.GetSymbol() for a in sub.GetAtoms() if 
                         a.GetSymbol() != 'H'])) # b/c rdkit will add implicit H's
@@ -167,8 +172,11 @@ def manually_remove_Hs(orig_substruct, return_single_mol_or_perms):
     # Remove hydrogens. RDKit docs say that Chem.RemoveHs() implicit and explicit are removed, 
     # but this isn't true for [nH], [OH], [Ho], etc. so need to manually remove H's. 
     # Convert back to SMILES, without showing explicit hydrogens
-    smiles_w_H = Chem.MolToSmiles(orig_substruct, allHsExplicit=False, 
+    try:
+        smiles_w_H = Chem.MolToSmiles(orig_substruct, allHsExplicit=False, 
                               isomericSmiles=False) # still has H's though unfortunately
+    except:
+        return None
     
     # First, export SMILES *with explicit Hs shown* so that patterns like [NH3+] are present, 
     # then regex-strip bracket hydrogens while keeping charge and other annotations.
@@ -190,16 +198,24 @@ def manually_remove_Hs(orig_substruct, return_single_mol_or_perms):
     # -- Parse the SMILES back into a new molecule
     mol_from_smarts = Chem.MolFromSmarts(smiles_no_Hs)
     # -- Map original atoms to new atom order using substructure matching
-    matches_to_map_to_sub = orig_substruct.GetSubstructMatches(mol_from_smarts, 
-        uniquify=False) # returns all permutations of order of atom inds
+    try:
+        matches_to_map_to_sub = orig_substruct.GetSubstructMatches(mol_from_smarts, 
+            uniquify=False) # returns all permutations of order of atom inds
+    except:
+        return None
     # -- Reorder atoms in the original mol. matches_to_map_to_sub is a list of perms, so 
     #    we just need to use the first one
     cg_atom_perms = []
     for perm_inds in list(matches_to_map_to_sub):
         mol_copy = Chem.Mol(orig_substruct) # for immutable deep copy; don't use copy.deepcopy()
-        renumbered_substruct = Chem.RenumberAtoms(mol_copy, perm_inds)
+        try:
+            renumbered_substruct = Chem.RenumberAtoms(mol_copy, perm_inds)
+        except:
+            continue
         cg_atom_perms.append((renumbered_substruct, perm_inds))
         elements_list = [atom.GetSymbol() for atom in renumbered_substruct.GetAtoms()]
+    if len(cg_atom_perms) == 0:
+        return None
     if return_single_mol_or_perms == 'single':
         return cg_atom_perms[0], smiles_no_Hs # return the first permutation only
     elif return_single_mol_or_perms == 'perms':

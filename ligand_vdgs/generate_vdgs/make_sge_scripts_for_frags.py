@@ -17,11 +17,12 @@ counts_threshold = 80 # min number of ligs containing this frag in order to run 
                         # vdg generation on
 max_size_frag = 5 # 5 atoms. 
 out_dir_for_sge_scripts = 'ligand_vdgs/generate_vdgs/frag_submit_scripts/'
-out_dir_for_vdg_lib = '/wynton/group/degradolab/skt/docking/databases/frag_vdg_lib/'
+out_dir_for_vdg_lib = '/wynton/home/degradolab/skt/docking/frag_lib'
 log_dir = '/wynton/home/degradolab/skt/docking/frag_sge_logs'
 pdb_parent_dir = '/wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2/'
 probe_dir = '/wynton/group/degradolab/skt/docking/databases/probe_output/'
-max_num_clus = '1000' # max number of vdgs to cluster for each vdg subset
+max_num_clus = '3000' # max number of vdgs to cluster for each vdg subset
+h_rt = '37:00:00 '
 
 # ------------------------------------------------------------------------------------------
 
@@ -29,7 +30,8 @@ replace = {'$LOG_DIR': log_dir,
            '$PDB_DIR': pdb_parent_dir,
            '$PROBE_DIR': probe_dir,
            '$OUTPUT_DIR': out_dir_for_vdg_lib,
-           '$MAX_NUM_CLUS': max_num_clus}
+           '$MAX_NUM_CLUS': max_num_clus, 
+           '$RUN_TIME': h_rt}
 
 def main():
     print("NOTE TO USER: the `symmetry_classes` flag of vdg_generation_wrapper.py has to be "

@@ -8,9 +8,9 @@
 #$ -N $JOB_NAME 
 #$ -cwd
 #$ -j y                #-- tells system STDERR and STDOUT should be joined
-#$ -l h_rt=300:00:00   #-- runtime limit - max 2 weeks == 336 hours
+#$ -l h_rt=$RUN_TIME   #-- runtime limit - max 2 weeks == 336 hours
 #$ -R yes              #-- SGE host reservation
-#$ -l mem_free=15G
+#$ -l mem_free=5G
 #$ -pe smp 10          #-- Request 10 slots in the SMP parallel environment
             
 date # start time
