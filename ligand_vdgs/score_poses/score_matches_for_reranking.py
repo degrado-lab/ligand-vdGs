@@ -1,4 +1,5 @@
 import os
+import math
 from pprint import pprint
 
 matches_dirs = ['/wynton/home/degradolab/skt/docking/vdg_matches/' + x for x in 
@@ -6,14 +7,19 @@ matches_dirs = ['/wynton/home/degradolab/skt/docking/vdg_matches/' + x for x in
                 '9gx3', '9fqy', '9d0s', '9foc',
                 '9msr', '9rlo', '9jj5', '9rfe', '8yqe', '9ddg', 
                 '9g0h', '7hc7', '9ei7', '9fs0', '9psz', 
-               '9r9k', '9qff', '9d9i']]
+                '9r9k', '9qff', '9d9i']]
 
-rmsd_cuts = [.7, .6]
+rmsd_cuts = [.7]
+#rmsd_cuts = [.7, .6]
 
-vdg_sizes_to_incl_in_count = [{"sizes": [1, 2], "weighted": False}, 
-                              {"sizes": [1, 2], "weighted": True}, 
-                              {"sizes": [1], "weighted": False}, 
-                              {"sizes": [2], "weighted": False}]
+calc_log_odds = False
+EPS = 1e-12  # small pseudocount to avoid log(0) or div-by-zero
+
+vdg_sizes_to_incl_in_count = [#{"sizes": [1, 2], "weighted": False}, 
+                              #{"sizes": [1, 2], "weighted": True}, 
+                              #{"sizes": [1], "weighted": False}, 
+                              {"sizes": [2], "weighted": False}
+                              ]
 
 ignore_frags = ['CC(C)N', 'CN(C)C', 'Cn(c)c', 'CN(c)C', 'cn(c)C',
                 'cn(c)-c', 'cN(c)C', 'cn(c)c', 'cN(C)C']
@@ -124,15 +130,31 @@ for matches_dir in matches_dirs:
             # Step 1: Collect total scores
             sample_totals = {}
             for sample_key, frags in scores_dict.items():
-                score = 0
                 # equally weight each fragment by averaging normalized contributions
                 num_frags = len(all_keys) if all_keys else 1
-                for frag in all_keys:
-                    avg = frag_avgs.get(frag, 1)  # avoid div by zero
-                    val = scores_dict[sample_key][frag]
-                    contrib = (val / avg) if avg > 0 else 0
-                    score += contrib
-                sample_totals[sample_key] = score / num_frags
+
+                if calc_log_odds:
+                    # average of per-fragment natural log-odds
+                    log_sum = 0.0
+                    for frag in all_keys:
+                        avg = frag_avgs.get(frag, 0.0)
+                        val = scores_dict[sample_key][frag]
+                        # odds with pseudocounts; protects against zeros
+                        odds = (val + EPS) / (avg + EPS)
+                        log_sum += math.log(odds)
+                    #score = log_sum / num_frags # for averaging across all frags
+                    score = log_sum             # for summing across all frags
+                else:
+                    # original normalized-average score
+                    score = 0.0
+                    for frag in all_keys:
+                        avg = frag_avgs.get(frag, 1.0)  # avoid div by zero
+                        val = scores_dict[sample_key][frag]
+                        contrib = (val / avg) if avg > 0 else 0.0
+                        score += contrib
+                    score = score / num_frags 
+
+                sample_totals[sample_key] = score
 
             # Step 2: Sort the scores_dict by total descending
             sorted_samples = sorted(scores_dict.keys(), key=lambda s: sample_totals[s], 
@@ -149,7 +171,8 @@ for matches_dir in matches_dirs:
 
             # Step 4: Print header with Total column
             if print_counts:
-                print(f"{'Pose':<20}" + "".join(f"{k:<12}" for k in all_keys) + f"{'Total':<10}")
+                total_hdr = 'Total (avg log-odds)' if calc_log_odds else 'Total'
+                print(f"{'Pose':<20}" + "".join(f"{k:<12}" for k in all_keys) + f"{total_hdr:<20}")
 
             # Step 5: Print sorted rows with Total column
             for sample_key in sorted_samples:
@@ -158,7 +181,7 @@ for matches_dir in matches_dirs:
                 row = f"{sample_key:<20}"
                 for k in all_keys:
                     row += f"{counts.get(k, 0):<12}"
-                row += f"{total:<10.2f}"
+                row += f"{total:<20.4f}" if calc_log_odds else f"{total:<10.2f}"
                 if print_counts:
                     print(row)
 
