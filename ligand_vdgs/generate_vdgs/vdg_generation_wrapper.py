@@ -5,8 +5,6 @@ import argparse
 import shutil
 import multiprocessing
 
-num_procs = 20
-
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('-s', '--smarts', type=str, required=True, 
@@ -43,6 +41,8 @@ def parse_args():
     parser.add_argument('-m', "--max-num-vdgs-to-clus", default=2500, type=int, 
                         help="Maximum number of PDBs w/ vdgs of the same AA compositions "
                         "to cluster.")
+    parser.add_argument('--num-procs', type=int, default=10,
+                        help="Number of processes to use for multiprocessing.")
     return parser.parse_args()
 
 
@@ -61,6 +61,7 @@ def main():
     if symm_classes is not None:
         symm_classes = ' '.join(symm_classes)
     max_num_to_clus = args.max_num_vdgs_to_clus
+    num_procs = args.num_procs
 
     if not cg: 
         cg = smarts
@@ -78,7 +79,8 @@ def main():
     if os.path.exists(logfile):
         logfile = logfile + '_' + str(time.time())
     write_out_commandline_params(logfile, smarts, cg, pdb_dir, probe_dir, out_dir, 
-                                 symm_classes, logdir, max_num_to_clus, align_cg_weight)
+                                 symm_classes, logdir, max_num_to_clus, align_cg_weight, 
+                                 num_procs)
 
     # Run smarts_to_cg.py
     if trial_run:
@@ -95,21 +97,33 @@ def main():
     # Pass tuple of arguments to starmap
     args_for_fingerprint = [(i, num_procs, fingerprints_cmd) for i in range(num_procs)]
 
-    with multiprocessing.Pool(processes=num_procs) as pool:
+    with multiprocessing.Pool(processes=num_procs, maxtasksperchild=1) as pool:
         pool.starmap(run_gen_fingerprints, args_for_fingerprint)
 
     # Run fingerprints_to_pdbs.py
     fingerprints = os.path.join(out_dir, 'fingerprints') # output from generate_fingerprints.py
-    to_pdbs_cmd = f'python external/vdG-miner/vdg_miner/programs/fingerprints_to_pdbs.py -c "{cg}" -m "{match_pkl}" -l "{logfile}" -f "{fingerprints}" -p {pdb_dir} -o "{out_dir}" -s -e'
+    to_pdbs_cmd_template = (
+        f'python external/vdG-miner/vdg_miner/programs/fingerprints_to_pdbs.py '
+        f'-c "{cg}" -m "{match_pkl}" -l "{logfile}" -f "{fingerprints}" '
+        f'-p {pdb_dir} -o "{out_dir}" -s -e')
 
-    subprocess.run(to_pdbs_cmd, shell=True, check=True)
+
+    args_for_to_pdbs = [(i, num_procs, to_pdbs_cmd_template) for i in range(num_procs)]
+    with multiprocessing.Pool(processes=num_procs, maxtasksperchild=1) as pool:
+        pool.starmap(run_fingerprints_to_pdbs, args_for_to_pdbs)
+
+    written_vdg_pdbs = os.listdir(os.path.join(out_dir, 'vdg_pdbs'))
+    final_num_vdg_pdbs = len([f for f in written_vdg_pdbs  if f.endswith('.pdb.gz') 
+        and os.path.isfile(os.path.join(out_dir, 'vdg_pdbs', f))])
+    with open(logfile, 'a') as f:
+        f.write(f"\nFinal total: {final_num_vdg_pdbs} vdg pdb files written out.\n")
 
     # Run clus_and_deduplicate_vdgs.py
     if symm_classes is not None:
-        deduplicate_template = f'python ligand_vdgs/generate_vdgs/clus_and_deduplicate_vdgs.py -c "{cg}" -v "{out_dir}" -s {symm_classes} -l "{logfile}" -w {align_cg_weight} -m {max_num_to_clus}'
+        deduplicate_template = f'python ligand_vdgs/generate_vdgs/clus_and_deduplicate_vdgs.py -c "{cg}" -v "{out_dir}" -s {symm_classes} -l "{logfile}" -w {align_cg_weight} -m {max_num_to_clus} --num-procs {num_procs}'
     else:
-        deduplicate_template = f'python ligand_vdgs/generate_vdgs/clus_and_deduplicate_vdgs.py -c "{cg}" -v "{out_dir}" -l "{logfile}" -w {align_cg_weight} -m {max_num_to_clus}'
-    
+        deduplicate_template = f'python ligand_vdgs/generate_vdgs/clus_and_deduplicate_vdgs.py -c "{cg}" -v "{out_dir}" -l "{logfile}" -w {align_cg_weight} -m {max_num_to_clus} --num-procs {num_procs}'
+
     # Add optional flags, if requested 
     if keep_clustered_pdbs:
         deduplicate_template += ' -k'
@@ -118,7 +132,7 @@ def main():
 
     # Create a Pool of workers and run the deduplication commands concurrently
     num_vdms_list = [1, 2]
-    with multiprocessing.Pool(processes=len(num_vdms_list)) as pool:
+    with multiprocessing.Pool(processes=len(num_vdms_list), maxtasksperchild=1) as pool:
         pool.starmap(run_deduplicate, [(num_vdms, deduplicate_template) for num_vdms 
                                        in num_vdms_list])
 
@@ -179,8 +193,13 @@ def run_gen_fingerprints(job_index, num_procs, fingerprints_cmd):
     fingerprints_cmd = f'{fingerprints_cmd} -j {job_index} -n {num_procs}'
     subprocess.run(fingerprints_cmd, shell=True, check=True)
 
+def run_fingerprints_to_pdbs(job_index, num_procs, cmd_template):
+    cmd = f'{cmd_template} -j {job_index} -n {num_procs}'
+    subprocess.run(cmd, shell=True, check=True)
+
 def write_out_commandline_params(logfile, smarts, cg, pdb_dir, probe_dir, out_dir, 
-                                 symm_classes, logdir, max_num_to_clus, align_cg_weight):
+                                 symm_classes, logdir, max_num_to_clus, align_cg_weight, 
+                                 num_procs):
     if not os.path.exists(logdir):
         os.mkdir(logdir)
     #print(f'\nLogdir: {logdir}\n')
@@ -193,6 +212,7 @@ def write_out_commandline_params(logfile, smarts, cg, pdb_dir, probe_dir, out_di
         _log.write(f'Parent PDB dir: {pdb_dir} \n')
         _log.write(f'Probe dir: {probe_dir} \n')
         _log.write(f'Output dir: {out_dir} \n')
+        _log.write(f'Number of processes: {num_procs} \n')
 
 if __name__ == '__main__':
     main()

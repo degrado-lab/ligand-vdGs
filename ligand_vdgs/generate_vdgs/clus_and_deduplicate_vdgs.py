@@ -302,14 +302,16 @@ def main():
          print(err_text, file=sys.stderr) # ensure it shows up in stdout/stderr
          sys.exit(1) # hard-fail the whole run if any worker fails
 
-   # Remove per-bucket temp files that were used now that clustering is done
+   # Remove only this run's temp files so concurrent -n runs don't clobber each other
    try:
-      stream_root = os.path.join(vdglib_dir, "stream_tmp")
-      if os.path.isdir(stream_root):
-         shutil.rmtree(stream_root)
+       stream_dir = _aa_tmp_dir(vdglib_dir, size_subset)
+       if os.path.isdir(stream_dir):
+           shutil.rmtree(stream_dir)
    except Exception as _e:
-      with open(logfile, 'a') as f:
-         f.write(f'\t[STREAM WARNING]: failed to remove {stream_root}: {_e}\n')
+       with open(logfile, 'a') as f:
+           f.write(f'\t[STREAM WARNING]: failed to remove {stream_dir}: {_e}\n')
+
+
    
    '''
    Clean up the entire output from clus_and_deduplicate_vdgs.py.
@@ -326,6 +328,19 @@ def main():
    '''
    delete_clusterdirs(vdglib_dir, logfile, size_subset, keep_clustered_pdbs)
 
+   # Delete temporary stream dirs. Usually, these jobs are run concurrently with 
+   # different -n args, so remove the parent stream_tmp/ dir only when it's the last 
+   # process. Use os.rmdir b/c it will only be successful if it's the last one.
+   stream_root = os.path.join(vdglib_dir, "stream_tmp")
+   try:
+      os.rmdir(stream_root) # succeeds only if empty (i.e., the last process)
+   except FileNotFoundError: 
+      # another process deleted it immediately after the os.rmdir() call
+      pass
+   except OSError:
+      # not empty (other -n jobs still running); leave it
+      pass
+    
    # Print out time elapsed
    seconds = time.time() - start_time
    hours = round(seconds // 3600)
@@ -385,7 +400,8 @@ def copy_nr_to_outdir(vdglib_dir, nr_dir, reordered_AAs):
          vdmscrr_str = '_'.join(vdmscrr_list)
          newname = f'{biounit}_{vdmscrr_str}.pdb.gz'
          newpath = os.path.join(nr_dir, newname)
-         assert not os.path.exists(newpath)
+         if os.path.exists(newpath):
+            raise FileExistsError(f"{newpath} already exists - investigate why.")
          # attempt to copy it to the newpath, but sge sometimes gives a 
          # communication send error when there's lag, so allow 100 attempts
          try:
