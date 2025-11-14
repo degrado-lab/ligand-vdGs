@@ -342,11 +342,10 @@ def main():
       pass
     
    # Print out time elapsed
-   seconds = time.time() - start_time
-   hours = round(seconds // 3600)
-   minutes = (seconds % 3600) // 60
-   seconds = seconds % 60
-   seconds = round(seconds, 2)
+   s = time.time() - start_time
+   hours = int(s // 3600)
+   minutes = int((s % 3600) // 60)
+   seconds = round(s % 60, 2)
     
    # Write out results to log file
    with open(logfile, 'a') as file:
@@ -360,10 +359,10 @@ def main():
             aa_subset_len = len(os.listdir(os.path.join(nr_dir_of_size_subset, aa_subset)))
             num_vdgs_of_size_subset += aa_subset_len
       
-      file.write(f'\t{num_vdgs_of_size_subset} nonredun. vdgs of subset size '
-                 f'{size_subset} out of {num_vdg_pdbs} vdgs.\n')
       file.write(f"Completed clus_and_deduplicate_vdgs.py in {hours} h, ")
       file.write(f"{minutes} mins, and {seconds} secs \n") 
+      file.write(f'\t{num_vdgs_of_size_subset} nonredun. vdgs of subset size '
+                 f'{size_subset} out of {num_vdg_pdbs} vdgs.\n')
    
    current, peak = tracemalloc.get_traced_memory()
    peak_mem = np.round(peak / (1024 * 1024 * 1024), 2)

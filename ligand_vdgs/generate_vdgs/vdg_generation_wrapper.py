@@ -66,6 +66,8 @@ def main():
     if not cg: 
         cg = smarts
 
+    main_script_start = time.time()
+    
     # Set up outdir
     cg = cg.rstrip('"').lstrip('"')
     out_dir = os.path.join(out_dir, cg)
@@ -82,17 +84,18 @@ def main():
                                  symm_classes, logdir, max_num_to_clus, align_cg_weight, 
                                  num_procs)
 
-    # Run smarts_to_cg.py
+    # ----- Run smarts_to_cg.py -----
     if trial_run:
-        smarts_to_cg_cmd = f'python external/vdG-miner/vdg_miner/programs/smarts_to_cgs.py -s {smarts} -c "{cg}" -p {pdb_dir} -o "{out_dir}" -l "{logfile}" -t {trial_run}'
+        smarts_to_cg_cmd = f'python external/vdG-miner/vdg_miner/programs/smarts_to_cgs.py -s {smarts} -c "{cg}" -p {pdb_dir} -o "{out_dir}" -l "{logfile}" -t {trial_run} -n {num_procs}'
     else:
-        smarts_to_cg_cmd = f'python external/vdG-miner/vdg_miner/programs/smarts_to_cgs.py -s {smarts} -c "{cg}" -p {pdb_dir} -o "{out_dir}" -l "{logfile}"'
+        smarts_to_cg_cmd = f'python external/vdG-miner/vdg_miner/programs/smarts_to_cgs.py -s {smarts} -c "{cg}" -p {pdb_dir} -o "{out_dir}" -l "{logfile}" -n {num_procs}'
     
     subprocess.run(smarts_to_cg_cmd, shell=True, check=True)
 
-    # Run generate_fingerprints.py
+    # ----- Run generate_fingerprints.py -----
     match_pkl = os.path.join(out_dir, f'{cg}_matches.pkl') # output from smarts_to_cg.py
     fingerprints_cmd = f'python external/vdG-miner/vdg_miner/programs/generate_fingerprints.py -c "{cg}" -l "{logfile}" -m "{match_pkl}" -p {pdb_dir} -b {probe_dir} -o "{out_dir}"'
+    gen_fingerprints_start = time.time()
 
     # Pass tuple of arguments to starmap
     args_for_fingerprint = [(i, num_procs, fingerprints_cmd) for i in range(num_procs)]
@@ -100,14 +103,27 @@ def main():
     with multiprocessing.Pool(processes=num_procs, maxtasksperchild=1) as pool:
         pool.starmap(run_gen_fingerprints, args_for_fingerprint)
 
-    # Run fingerprints_to_pdbs.py
-    fingerprints = os.path.join(out_dir, 'fingerprints') # output from generate_fingerprints.py
+    gen_fingerprints_elapsed = time.time() - gen_fingerprints_start
+    hours, minutes, seconds = convert_time_elapsed(gen_fingerprints_elapsed)
+    
+    fingerprints_dir = os.path.join(out_dir, "fingerprints")
+    num_fp_files = 0
+    for root, dirs, files in os.walk(fingerprints_dir):
+        num_fp_files += len([f for f in files if f.endswith('.npy')])
+
+    with open(logfile, 'a') as f:
+        f.write(f"Completed generate_fingerprints.py in {hours} h, ")
+        f.write(f"{minutes} mins, and {seconds} secs.\n")
+        f.write(f"\n{num_fp_files} fingerprint sets generated.\n")
+
+    # ----- Run fingerprints_to_pdbs.py -----
     to_pdbs_cmd_template = (
         f'python external/vdG-miner/vdg_miner/programs/fingerprints_to_pdbs.py '
-        f'-c "{cg}" -m "{match_pkl}" -l "{logfile}" -f "{fingerprints}" '
+        f'-c "{cg}" -m "{match_pkl}" -l "{logfile}" -f "{fingerprints_dir}" '
         f'-p {pdb_dir} -o "{out_dir}" -s -e')
 
-
+    f_to_pdb_start = time.time()
+    
     args_for_to_pdbs = [(i, num_procs, to_pdbs_cmd_template) for i in range(num_procs)]
     with multiprocessing.Pool(processes=num_procs, maxtasksperchild=1) as pool:
         pool.starmap(run_fingerprints_to_pdbs, args_for_to_pdbs)
@@ -115,10 +131,16 @@ def main():
     written_vdg_pdbs = os.listdir(os.path.join(out_dir, 'vdg_pdbs'))
     final_num_vdg_pdbs = len([f for f in written_vdg_pdbs  if f.endswith('.pdb.gz') 
         and os.path.isfile(os.path.join(out_dir, 'vdg_pdbs', f))])
+    
+    fingerprints_elapsed = time.time() - f_to_pdb_start
+    hours, minutes, seconds = convert_time_elapsed(fingerprints_elapsed)
+    
     with open(logfile, 'a') as f:
-        f.write(f"\nFinal total: {final_num_vdg_pdbs} vdg pdb files written out.\n")
+        f.write(f"Completed fingerprints_to_pdbs.py in {hours} h, ")
+        f.write(f"{minutes} mins, and {seconds} secs.\n")
+        f.write(f"\n{final_num_vdg_pdbs} vdg pdb files written out.\n")
 
-    # Run clus_and_deduplicate_vdgs.py
+    # ----- Run clus_and_deduplicate_vdgs.py -----
     if symm_classes is not None:
         deduplicate_template = f'python ligand_vdgs/generate_vdgs/clus_and_deduplicate_vdgs.py -c "{cg}" -v "{out_dir}" -s {symm_classes} -l "{logfile}" -w {align_cg_weight} -m {max_num_to_clus} --num-procs {num_procs}'
     else:
@@ -146,9 +168,14 @@ def main():
         clean_up_clusdirs(out_dir, 'flankseq_and_bb', logfile) 
         delete_empty_dirs(os.path.join(out_dir, 'clusters'))
     
+    main_script_elapsed = time.time() - main_script_start
+    hours, minutes, seconds = convert_time_elapsed(main_script_elapsed)
+
     with open(logfile, 'a') as _log:
         _log.write(f'='*79 + '\n')
         _log.write(f'Job completed.\n')
+        _log.write(f'Total job time: {hours} h, ')
+        _log.write(f'{minutes} mins, and {seconds} secs.\n')
 
 def delete_empty_dirs(_dir):
     for root, dirs, files in os.walk(_dir):
@@ -169,6 +196,12 @@ def clean_up_clusdirs(out_dir, clus_level, logfile):
                     for file in files:
                         _log.write(f"\t\t{file}\n")
             shutil.rmtree(direc)
+
+def convert_time_elapsed(seconds):
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = round(seconds % 60, 2)
+    return h, m, s
 
 def set_up_outdir(out_dir):
     # Set up output directory
