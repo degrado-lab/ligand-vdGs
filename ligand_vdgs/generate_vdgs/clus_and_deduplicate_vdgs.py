@@ -47,6 +47,7 @@ import prody as pr
 import multiprocessing as mp
 import json, gzip, hashlib
 import traceback
+import getpass
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'functions'))
 import align_and_cluster as clust
 import utils
@@ -165,14 +166,92 @@ def _run_one_bucket_strict(args):
 def _aa_key_str(reordered_aas):
    return "_".join(reordered_aas)
 
+def _stream_root(vdglib_dir):
+   # Root for AA composition streaming buckets.
+   # Tries $TMPDIR, /scratch, /tmp, and vdglib_dir as fallback
+
+   user = os.environ.get("USER") or getpass.getuser() or "unknown"
+   vdglib_tag = os.path.basename(os.path.abspath(vdglib_dir.rstrip(os.sep)))
+
+   tmpdir_env = os.environ.get("TMPDIR")
+   if tmpdir_env:
+      root = os.path.join(tmpdir_env, f"vdg_stream_{vdglib_tag}")
+   elif os.path.isdir("/scratch"):
+      root = os.path.join("/scratch", user, f"vdg_stream_{vdglib_tag}")
+   elif os.path.isdir("/tmp"):
+      root = os.path.join("/tmp", user, f"vdg_stream_{vdglib_tag}")
+   else:
+      root = os.path.join(vdglib_dir, "stream_tmp")
+
+   os.makedirs(root, exist_ok=True)
+   return root
+
 def _aa_tmp_dir(vdglib_dir, size_subset):
    # Write per-AA-bucket records to disk to free memory
-   return os.path.join(vdglib_dir, "stream_tmp", str(size_subset))
+   return os.path.join(_stream_root(vdglib_dir), str(size_subset))
 
 def _aa_tmp_path(vdglib_dir, size_subset, aa_key):
    h = hashlib.sha1(aa_key.encode()).hexdigest()[:16]
    fname = f"{aa_key[:80]}__{h}.jsonl.gz"
    return os.path.join(_aa_tmp_dir(vdglib_dir, size_subset), fname)
+
+def _flank_tmp_size_root(vdglib_dir, size_subset):
+   # Follows same priority as in _stream_root()
+   user = os.environ.get("USER") or getpass.getuser() or "unknown"
+   vdglib_tag = os.path.basename(os.path.abspath(vdglib_dir.rstrip(os.sep)))
+
+   tmpdir_env = os.environ.get("TMPDIR")
+   if tmpdir_env:
+      root = os.path.join(tmpdir_env, f"vdg_flankseq_{vdglib_tag}", str(size_subset))
+   elif os.path.isdir("/scratch"):
+      root = os.path.join("/scratch", user, f"vdg_flankseq_{vdglib_tag}", str(size_subset))
+   elif os.path.isdir("/tmp"):
+      root = os.path.join("/tmp", user, f"vdg_flankseq_{vdglib_tag}", str(size_subset))
+   else:
+      root = os.path.join(vdglib_dir, "clusters", "flankseq_and_bb", str(size_subset))
+
+   os.makedirs(root, exist_ok=True)
+   return root
+
+def _flank_tmp_dir(vdglib_dir, size_subset, aa_label):
+   root = _flank_tmp_size_root(vdglib_dir, size_subset)
+   path = os.path.join(root, aa_label)
+   os.makedirs(path, exist_ok=True)
+   return path
+
+def _persist_flank_clusters_from_tmp(vdglib_dir, size_subset, logfile):
+   '''
+   Copy flankseq_and_bb clusters for this subset size from scratch TMPDIR
+   to persistent storage under:
+       <vdglib_dir>/clusters/flankseq_and_bb/<size_subset>/
+   '''
+   tmpdir_env = os.environ.get("TMPDIR")
+   if not tmpdir_env and not os.path.isdir("/scratch") and not os.path.isdir("/tmp"):
+      return
+
+   tmp_root = _flank_tmp_size_root(vdglib_dir, size_subset)
+   # If _flank_tmp_size_root fell back into vdglib_dir already, no need to persist
+   persistent_root = os.path.join(vdglib_dir, "clusters", "flankseq_and_bb", str(size_subset))
+   if os.path.abspath(tmp_root).startswith(os.path.abspath(persistent_root)):
+      return
+
+   if not os.path.isdir(tmp_root):
+      return
+   
+   if not any(os.scandir(tmp_root)):
+      return
+
+   dest_root = persistent_root
+   os.makedirs(dest_root, exist_ok=True)
+
+   # We want to merge tmp_root into dest_root, not replace dest_root.
+   for entry in os.listdir(tmp_root):
+      src = os.path.join(tmp_root, entry)
+      dst = os.path.join(dest_root, entry)
+      if os.path.isdir(src):
+         shutil.copytree(src, dst, dirs_exist_ok=True)
+      else:
+         shutil.copy2(src, dst)
 
 def _spill_record(vdglib_dir, size_subset, reordered_aas, record):
    # Append one vdG record to its AA bucket file (gzip JSONL)
@@ -310,8 +389,6 @@ def main():
    except Exception as _e:
        with open(logfile, 'a') as f:
            f.write(f'\t[STREAM WARNING]: failed to remove {stream_dir}: {_e}\n')
-
-
    
    '''
    Clean up the entire output from clus_and_deduplicate_vdgs.py.
@@ -326,12 +403,22 @@ def main():
    are quite memory-intensive. However, this final stage of clustering can be preserved 
    using the --keep-clustered-pdbs flag.
    '''
+   
+   # Persist flankseq_and_bb clusters from scratch to global disk if requested
+   if keep_clustered_pdbs:
+      try:
+         _persist_flank_clusters_from_tmp(vdglib_dir, size_subset, logfile)
+      except Exception as e:
+         with open(logfile, 'a') as f:
+            f.write(f"\t[WARNING] Failed to persist flankseq_and_bb "
+                    f"for size_subset {size_subset}: {e}\n")
+
    delete_clusterdirs(vdglib_dir, logfile, size_subset, keep_clustered_pdbs)
 
    # Delete temporary stream dirs. Usually, these jobs are run concurrently with 
    # different -n args, so remove the parent stream_tmp/ dir only when it's the last 
    # process. Use os.rmdir b/c it will only be successful if it's the last one.
-   stream_root = os.path.join(vdglib_dir, "stream_tmp")
+   stream_root = _stream_root(vdglib_dir)
    try:
       os.rmdir(stream_root) # succeeds only if empty (i.e., the last process)
    except FileNotFoundError: 
@@ -372,9 +459,13 @@ def main():
    tracemalloc.stop()
 
 def copy_nr_to_outdir(vdglib_dir, nr_dir, reordered_AAs):
-   clustersdir = os.path.join(vdglib_dir, 'clusters', 'flankseq_and_bb', 
-                              str(len(reordered_AAs)), '_'.join(reordered_AAs))
-   nr_dir = os.path.join(nr_dir, str(len(reordered_AAs)), '_'.join(reordered_AAs))
+   size_subset = len(reordered_AAs)
+   aa_label = '_'.join(reordered_AAs)
+
+   # Clusters now live in scratch (or fallback location)
+   clustersdir = _flank_tmp_dir(vdglib_dir, size_subset, aa_label)
+
+   nr_dir = os.path.join(nr_dir, str(size_subset), aa_label)
    utils.handle_existing_files(nr_dir)
    os.makedirs(nr_dir, exist_ok=True)
    for cgvdmbbclus in os.listdir(clustersdir):
@@ -525,11 +616,12 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
          final_exact_medoid_pass=True, final_reassign_once=True)
             
       # Output the flankseq+bb clusters
-      flankseq_and_bb_clusdir_for_this_cgvdmbb_clus = os.path.join(vdglib_dir, 'clusters', 
-         'flankseq_and_bb', str(len(reordered_AAs)), reordered_AAs_str, 
-         f'cgvdmbb_{cgvdmbb_clusnum}') 
-      utils.handle_existing_files(flankseq_and_bb_clusdir_for_this_cgvdmbb_clus) 
-
+      size_subset = len(reordered_AAs)
+      flank_root_for_aa = _flank_tmp_dir(vdglib_dir, size_subset, reordered_AAs_str)
+      flankseq_and_bb_clusdir_for_this_cgvdmbb_clus = os.path.join(
+          flank_root_for_aa, f'cgvdmbb_{cgvdmbb_clusnum}')
+      utils.handle_existing_files(flankseq_and_bb_clusdir_for_this_cgvdmbb_clus)
+      
       first_pdb_out, first_pdb_cg_vdmbb_coords, failed_pdbs = clust.write_out_clusters(
          flankseq_and_bb_clusdir_for_this_cgvdmbb_clus, 
          flankingseq_and_bb_cluster_assignments, flankingseq_and_bb_clus_centroids,
