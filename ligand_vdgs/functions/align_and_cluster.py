@@ -798,7 +798,8 @@ def elements_in_clusters(indices_of_elements_in_cluster, cg_coords, vdm_bbcoords
 def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_coords, 
    all_pdbpaths, all_scrr_cg_perm, all_cg_and_vdmbb_coords, all_flankbb_coords, 
    num_flanking, first_pdb_out, first_pdb_cg_vdmbb_coords, weights, atomgroup_dict, 
-   print_flankbb, symmetry_classes, reordered_AAs, clusterlabel=None):
+   print_flankbb, symmetry_classes, reordered_AAs, write_cluster_members, 
+   clusterlabel=None):
     
    assert len(all_pdbpaths) == len(all_cg_and_vdmbb_coords)
    ref = np.array([[0, 0, 0], [-1, 0, 1], [1, -1, 0]])  # reference for aligning CG
@@ -854,6 +855,8 @@ def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_c
          write_out_subsequent_clus_pdbs(cent_pr_obj, cent_pdb_outpath, 
                              cent_scrr_cg_perm, print_flankbb, moved_cent_transf)
 
+      if not write_cluster_members: 
+         continue
       # Now, process non-centroid members
       for ind in clus_mem_indices:
          if ind == centroid_ind:

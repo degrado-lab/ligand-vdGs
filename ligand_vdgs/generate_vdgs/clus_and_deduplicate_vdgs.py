@@ -11,7 +11,7 @@ A vdG is considered redundant if it meets both criteria after clustering:
        `distance = flank-CA RMSD + (sequence dissimilarity)/2`
    with threshold:
        `threshold = size-normalized flank-CA RMSD cutoff + (1 − seq_sim_thresh)/2`, 
-   where sequence dissimilarity = 1 − (percent identity).  
+   where sequence dissimilarity = 1 − (fractional sequence identity).  
 
 ---
 Workflow Overview
@@ -122,7 +122,7 @@ def _run_one_bucket_strict(args):
 
    (bucket_path, seq_sim_thresh, _reordered_AAs, symmetry_classes,
      vdglib_dir, align_cg_weight, num_flanking, logfile, print_flankbb,
-     max_num_to_clus) = args
+     max_num_to_clus, keep_clustered_pdbs) = args
 
    _vdgs = _load_bucket(bucket_path) 
 
@@ -149,7 +149,7 @@ def _run_one_bucket_strict(args):
       # Cluster + write out for this AA bucket
       cluster_vdgs_of_same_AA_comp(
          _vdgs, seq_sim_thresh, _reordered_AAs, symmetry_classes, vdglib_dir,
-         align_cg_weight, num_flanking, atomgroup_dict,
+         align_cg_weight, num_flanking, atomgroup_dict, keep_clustered_pdbs,
          print_flankbb=print_flankbb, logfile=logfile)
 
       # Copy centroids to nr output dir for this bucket
@@ -365,7 +365,7 @@ def main():
          jobs.append((
             path, seq_sim_thresh, list(_reordered_AAs), symmetry_classes,
             vdglib_dir, align_cg_weight, num_flanking, logfile,
-            print_flankbb, max_num_to_clus))
+            print_flankbb, max_num_to_clus, keep_clustered_pdbs))
 
       # Clean, isolated processes
       ctx = mp.get_context("spawn")
@@ -446,8 +446,8 @@ def main():
             aa_subset_len = len(os.listdir(os.path.join(nr_dir_of_size_subset, aa_subset)))
             num_vdgs_of_size_subset += aa_subset_len
       
-      file.write(f"Completed clus_and_deduplicate_vdgs.py in {hours} h, ")
-      file.write(f"{minutes} mins, and {seconds} secs \n") 
+      file.write(f"\nCompleted clus_and_deduplicate_vdgs.py for subset size {size_subset} ")
+      file.write(f"in {hours} h, {minutes} mins, and {seconds} secs. \n")
       file.write(f'\t{num_vdgs_of_size_subset} nonredun. vdgs of subset size '
                  f'{size_subset} out of {num_vdg_pdbs} vdgs.\n')
    
@@ -510,7 +510,7 @@ def copy_nr_to_outdir(vdglib_dir, nr_dir, reordered_AAs):
 
 def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs, 
    symmetry_classes, vdglib_dir, align_cg_weight, num_flanking,
-   atomgroup_dict, print_flankbb, logfile):
+   atomgroup_dict, keep_clustered_pdbs, print_flankbb, logfile):
    # Cluster vdG subsets with identical vdm AA compositions to identify redundancies. 
    # First, get all AA permutations for identical AAs. For example, if the vdms are 
    # [Ala1, Ala2, Glu], then we need to sample [Ala1, Ala2, Glu] and [Ala2, Ala1, 
@@ -574,7 +574,7 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
       all_AA_cg_perm_vdm_scrr_cg_perm, all_AA_cg_perm_cg_and_vdmbb_coords, 
       all_AA_cg_perm_flat_flankCAs, num_flanking, first_pdb_out, 
       first_pdb_cg_vdmbb_coords, cgvdmbb_weights, atomgroup_dict, print_flankbb, 
-      symmetry_classes, reordered_AAs)
+      symmetry_classes, reordered_AAs, write_cluster_members=True)
 
    if len(failed_pdbs) > 0:
       with open(logfile, 'a') as file:
@@ -622,13 +622,15 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
           flank_root_for_aa, f'cgvdmbb_{cgvdmbb_clusnum}')
       utils.handle_existing_files(flankseq_and_bb_clusdir_for_this_cgvdmbb_clus)
       
+      write_out_flankbb_clusters = bool(keep_clustered_pdbs)
       first_pdb_out, first_pdb_cg_vdmbb_coords, failed_pdbs = clust.write_out_clusters(
          flankseq_and_bb_clusdir_for_this_cgvdmbb_clus, 
          flankingseq_and_bb_cluster_assignments, flankingseq_and_bb_clus_centroids,
          cgvdmbb_clus_cg_coords, cgvdmbb_clus_pdbpaths, cgvdmbb_clus_vdm_scrr_cg_perm, 
          cgvdmbb_clus_cgvdmbb_coords, cgvdmbb_clus_flat_flankingCAs, num_flanking, 
          first_pdb_out, first_pdb_cg_vdmbb_coords, cgvdmbb_weights, atomgroup_dict, 
-         print_flankbb, symmetry_classes, reordered_AAs, clusterlabel='flankseq_and_bb')
+         print_flankbb, symmetry_classes, reordered_AAs, 
+         write_cluster_members=write_out_flankbb_clusters, clusterlabel='flankseq_and_bb')
 
       if len(failed_pdbs) > 0:
          with open(logfile, 'a') as file:
@@ -640,22 +642,16 @@ def delete_clusterdirs(vdglib_dir, logfile, size_subset, keep_clustered_pdbs):
       all_clusters = os.path.join(vdglib_dir, 'clusters')
       # delete temp folder
       tempdir = os.path.join(all_clusters, 'temp', 'cgvdmbb', str(size_subset))
-      if not os.path.exists(tempdir):
-         file.write(f"\t{tempdir} does not exist.\n")
-      else:
+      if os.path.exists(tempdir):
          shutil.rmtree(tempdir)
       # delete cgvdmbb 
       cgvdmbbdir = os.path.join(all_clusters, 'cgvdmbb', str(size_subset))
-      if not os.path.exists(cgvdmbbdir):
-         file.write(f"\t{cgvdmbbdir} does not exist.\n")
-      else:
+      if os.path.exists(cgvdmbbdir):
          shutil.rmtree(cgvdmbbdir)
       # delete flankseq_and_bb unless keep_clustered_pdbs is True
       if not keep_clustered_pdbs:
          flank_dir = os.path.join(all_clusters, 'flankseq_and_bb', str(size_subset))
-         if not os.path.exists(flank_dir):
-            file.write(f"\t{flank_dir} does not exist.\n")
-         else:
+         if os.path.exists(flank_dir):
             shutil.rmtree(flank_dir)
 
 def normalize_rmsd(num_atoms, atoms):

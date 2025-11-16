@@ -84,6 +84,17 @@ def main():
                                  symm_classes, logdir, max_num_to_clus, align_cg_weight, 
                                  num_procs)
 
+    # Set up temporary outdir for fingerprints 
+    fp_tmp_root = (os.environ.get("TMPDIR") if os.environ.get("TMPDIR") and os.path.isdir(
+        os.environ["TMPDIR"])
+        else "/scratch" if os.path.isdir("/scratch")
+        else "/tmp")
+
+    cg_safe = cg.replace(os.sep, "_").replace(" ", "_").replace("#", "hash")
+    out_leaf = os.path.basename(os.path.normpath(out_dir))
+    fp_out_root = os.path.join(fp_tmp_root, f"vdg_fp_{cg_safe}_{out_leaf}")
+    os.makedirs(fp_out_root, exist_ok=True)
+
     # ----- Run smarts_to_cg.py -----
     if trial_run:
         smarts_to_cg_cmd = f'python external/vdG-miner/vdg_miner/programs/smarts_to_cgs.py -s {smarts} -c "{cg}" -p {pdb_dir} -o "{out_dir}" -l "{logfile}" -t {trial_run} -n {num_procs}'
@@ -94,7 +105,7 @@ def main():
 
     # ----- Run generate_fingerprints.py -----
     match_pkl = os.path.join(out_dir, f'{cg}_matches.pkl') # output from smarts_to_cg.py
-    fingerprints_cmd = f'python external/vdG-miner/vdg_miner/programs/generate_fingerprints.py -c "{cg}" -l "{logfile}" -m "{match_pkl}" -p {pdb_dir} -b {probe_dir} -o "{out_dir}"'
+    fingerprints_cmd = f'python external/vdG-miner/vdg_miner/programs/generate_fingerprints.py -c "{cg}" -l "{logfile}" -m "{match_pkl}" -p {pdb_dir} -b {probe_dir} -o "{fp_out_root}"'
     gen_fingerprints_start = time.time()
 
     # Pass tuple of arguments to starmap
@@ -105,16 +116,16 @@ def main():
 
     gen_fingerprints_elapsed = time.time() - gen_fingerprints_start
     hours, minutes, seconds = convert_time_elapsed(gen_fingerprints_elapsed)
-    
-    fingerprints_dir = os.path.join(out_dir, "fingerprints")
+
+    fingerprints_dir = os.path.join(fp_out_root, "fingerprints")
     num_fp_files = 0
     for root, dirs, files in os.walk(fingerprints_dir):
         num_fp_files += len([f for f in files if f.endswith('.npy')])
 
     with open(logfile, 'a') as f:
-        f.write(f"Completed generate_fingerprints.py in {hours} h, ")
+        f.write(f"\nCompleted generate_fingerprints.py in {hours} h, ")
         f.write(f"{minutes} mins, and {seconds} secs.\n")
-        f.write(f"\n{num_fp_files} fingerprint sets generated.\n")
+        f.write(f"\t{num_fp_files} fingerprint sets generated.\n")
 
     # ----- Run fingerprints_to_pdbs.py -----
     to_pdbs_cmd_template = (
@@ -136,9 +147,9 @@ def main():
     hours, minutes, seconds = convert_time_elapsed(fingerprints_elapsed)
     
     with open(logfile, 'a') as f:
-        f.write(f"Completed fingerprints_to_pdbs.py in {hours} h, ")
+        f.write(f"\nCompleted fingerprints_to_pdbs.py in {hours} h, ")
         f.write(f"{minutes} mins, and {seconds} secs.\n")
-        f.write(f"\n{final_num_vdg_pdbs} vdg pdb files written out.\n")
+        f.write(f"\t{final_num_vdg_pdbs} vdg pdb files written out.\n")
 
     # ----- Run clus_and_deduplicate_vdgs.py -----
     if symm_classes is not None:
@@ -160,14 +171,15 @@ def main():
 
     # Clean up the final state of clusters dir. Each subset's tempdir, flankseq, and 
     # flankbb dirs were cleaned up along the way, but the highest level of these dirs 
-    # need to be deleted too.
+    # need to be deleted too. Also, delete the fingerprints temp dir.
     clean_up_clusdirs(out_dir, 'temp', logfile) 
     clean_up_clusdirs(out_dir, 'cgvdmbb', logfile) 
     delete_empty_dirs(os.path.join(out_dir, 'nr_vdgs'))
     if not keep_clustered_pdbs:
         clean_up_clusdirs(out_dir, 'flankseq_and_bb', logfile) 
         delete_empty_dirs(os.path.join(out_dir, 'clusters'))
-    
+    shutil.rmtree(fp_out_root, ignore_errors=True)
+
     main_script_elapsed = time.time() - main_script_start
     hours, minutes, seconds = convert_time_elapsed(main_script_elapsed)
 
@@ -185,9 +197,7 @@ def delete_empty_dirs(_dir):
 def clean_up_clusdirs(out_dir, clus_level, logfile):
     direc = os.path.join(out_dir, 'clusters', clus_level)
     with open(logfile, 'a') as _log:
-        if not os.path.exists(direc):
-            _log.write(f"\t{direc} does not exist.\n")
-        else:
+        if os.path.exists(direc):
             # Check if there are files. 
             # They should have been deleted in the last set of clus_and_deduplicate_vdgs.py
             for root, dirs, files in os.walk(direc):
@@ -235,7 +245,6 @@ def write_out_commandline_params(logfile, smarts, cg, pdb_dir, probe_dir, out_di
                                  num_procs):
     if not os.path.exists(logdir):
         os.mkdir(logdir)
-    #print(f'\nLogdir: {logdir}\n')
     with open(logfile, 'w') as _log:
         _log.write(f'SMARTS: {smarts} \n')
         _log.write(f'CG: {cg} \n')
