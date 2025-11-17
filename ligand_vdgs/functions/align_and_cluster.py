@@ -8,11 +8,11 @@ import gc
 import prody as pr
 import time
 from functools import lru_cache
-import shutil
 
 _RMSD_CACHE_MAXSIZE = 100_000
 _SEQ_CACHE_MAXSIZE  = 50_000
 _ATOMGROUP_CACHE_MAXSIZE = 1000
+_DATASET_REGISTRY_MAXSIZE = 256  # max number of distinct datasets per process
 
 EPS = 1e-9   # strict-improvement epsilon for reassignment; tune to 1e-8 if needed
 
@@ -137,9 +137,8 @@ def get_leader_clusters(
       get_leader_clusters._RMSD_DATASETS = {}
 
       # cache sequence similarity (0..100). key: (id(seq_dataset), i, j)
-      @lru_cache(maxsize=_SEQ_CACHE_MAXSIZE)  # defined at module scope
+      @lru_cache(maxsize=_SEQ_CACHE_MAXSIZE)
       def _seqsim_cached(ds_id, i, j):
-          # use the function's registries to avoid late-binding issues
           seq = get_leader_clusters._SEQ_DATASETS[ds_id]
           return calc_seq_similarity(seq[i], seq[j])
 
@@ -156,11 +155,33 @@ def get_leader_clusters(
       get_leader_clusters._seqsim_cached = _seqsim_cached
       get_leader_clusters._rmsd_cached   = _rmsd_cached
 
+      # cap number of datasets referenced by the registries
+      def _ensure_dataset_capacity():
+         """
+         If too many distinct datasets have been registered, clear the registries 
+         and the LRU caches and start fresh. This prevents unbounded growth of 
+         _SEQ_DATASETS and _RMSD_DATASETS.
+         """
+         seq_ds  = get_leader_clusters._SEQ_DATASETS
+         rmsd_ds = get_leader_clusters._RMSD_DATASETS
+
+         if (len(seq_ds)  >= _DATASET_REGISTRY_MAXSIZE or
+            len(rmsd_ds) >= _DATASET_REGISTRY_MAXSIZE):
+
+            seq_ds.clear()
+            rmsd_ds.clear()
+            _seqsim_cached.cache_clear()
+            _rmsd_cached.cache_clear()
+
+      # stash helper on the function object too
+      get_leader_clusters._ensure_dataset_capacity = staticmethod(_ensure_dataset_capacity)
+
    # aliases
    _seqsim_cached = get_leader_clusters._seqsim_cached
    _rmsd_cached   = get_leader_clusters._rmsd_cached
    _SEQ_DATASETS  = get_leader_clusters._SEQ_DATASETS
    _RMSD_DATASETS = get_leader_clusters._RMSD_DATASETS
+   _ensure_dataset_capacity = get_leader_clusters._ensure_dataset_capacity
 
    # register the current datasets by identity for caching 
    dsid_seq     = id(metric_to_data['flankseq']) if 'flankseq' in metric_to_data else None
@@ -168,17 +189,20 @@ def get_leader_clusters(
    dsid_cgvdmbb = id(metric_to_data['cgvdmbb'])  if 'cgvdmbb'  in metric_to_data else None
 
    if dsid_seq is not None and dsid_seq not in _SEQ_DATASETS:
+      _ensure_dataset_capacity()
       _SEQ_DATASETS[dsid_seq] = metric_to_data['flankseq']
    if dsid_flankbb is not None and ('flankbb', dsid_flankbb) not in _RMSD_DATASETS:
+      _ensure_dataset_capacity()
       _RMSD_DATASETS[('flankbb', dsid_flankbb)] = metric_to_data['flankbb']
    if dsid_cgvdmbb is not None and ('cgvdmbb', dsid_cgvdmbb) not in _RMSD_DATASETS:
+      _ensure_dataset_capacity()
       _RMSD_DATASETS[('cgvdmbb', dsid_cgvdmbb)] = metric_to_data['cgvdmbb']
 
    def _ord_pair(i, j):
       # Order indices so (i, j) and (j, i) share the same cache entry.
       return (i, j) if i <= j else (j, i)
 
-   # ---- distance using (RMSD + seq dissim/2) ----
+   # ---- distance = seq_dissim * seq_weight + RMSD(flankbb?) + RMSD(cgvdmbb?)
    def _dist_idx_idx(i, j, early_stop=True, cap=None):
       # cap: if provided, we early-exit once total > min(cap, threshold)
       cutoff = threshold if cap is None else min(cap, threshold)
@@ -420,7 +444,7 @@ def get_vdm_res_features(prody_obj, pdbpath, num_flanking):
 
       # Sequence of (contiguous) flanking residues
       flanking_seq_dict = {} # key = relative flank num (-1, +1, etc.), 
-                             # value = list(CA coords, AA identity)
+                             # value = list(AA identity, CA coords)
       # Walk up and down the flanking residues and check that they are actually
       # neighboring the vdM, and not jumped through a chain break. If there's a
       # chain break, report the AA as "X".
@@ -921,8 +945,7 @@ def get_transf_and_coords(mobile_coords, target_coords, weights, obj, scrrs,
    return best_transf, best_moved_coords
 
 def write_out_subsequent_clus_pdbs(pr_obj, pdb_outpath, scrrs, print_flankbb, transf):
-   # Align to the first PDB (if it's a centroid) or its cluster centroid (if it's a cluster 
-   # mem)
+   # Align to the first PDB if it's a centroid or to its cluster centroid if it's a cluster mem
    pr_obj_copy = pr_obj.copy() # b/c of mutability
    pr.applyTransformation(transf, pr_obj_copy)
    # Set occupancies so that only the vdMs being clustered are 2.0 (whereas originally, 
@@ -976,52 +999,73 @@ def write_out_first_pdb(mobile, target, pr_obj, outpath, clusmem_cg_vdmbb_coords
    
    return moved_cg_vdmbb_coords
 
-def rewrite_temp_clusters(clusdir, clean_dir, size_subset, subset_AAs):
-   # Clean up the cluster directory by merging degenerate vdGs (based on diff AA perms 
-   # and CG perms of the same PDB), deleting degenerate pdbs/clusters, and 
-   # renumbering/sorting by cluster size. Must merge before deleting duplicates b/c 
-   # need the duplicate names to determine which clusters are equivalent.
+def reassign_cgvdmbb_clusters(cgvdmbb_clus_assignments,
+    all_pdbpaths, all_scrr_cg_perm):
+   """
+   Merge equivalent clusters with degenerate vdGs (diff AA perms and CG perms of the same 
+   PDB) and reassign cluster numbers by size. Must merge before deleting duplicates b/c 
+   need the duplicate names to determine which clusters are equivalent. 
 
+   Returns: 
+       {new_cluster_number: [indices_into_all_*_arrays, ...]}
+   where indices correspond to the entries in all_* arrays
+   (e.g., all_AA_cg_perm_cg_coords, all_AA_cg_perm_pdbpaths, etc.)
+   for mapping between clusters.
+   """
+
+   # Dict architecture containing _all_ vdGs with sorted scrrs:
+   #   temp_clus_assignments[(clusnum,)] = [
+   #       (pdb_base, sorted_scrrs, clus_mem_index, pdbpath), ...]
    temp_clus_assignments = {}
-   ''' Structure:
-   temp_clus_assignments[tuple([clusnum])] = ALL vdgs w/ sorted scrrs. 
-   Don't remove identical vdgs yet.
-   '''
-   clean_dir = os.path.join(clean_dir, str(size_subset), subset_AAs)
-   clusdir = os.path.join(clusdir, str(size_subset), subset_AAs)
-   for cgvdmbb_clus in os.listdir(clusdir):
-      cgvdmbb_clus_dir = os.path.join(clusdir, cgvdmbb_clus)
-      for pdb in os.listdir(cgvdmbb_clus_dir):
-         pdbpath = os.path.join(cgvdmbb_clus_dir, pdb)
-         temp_clus_assignments = get_temp_clus_assignments(cgvdmbb_clus, pdb, 
-         pdbpath, temp_clus_assignments)
 
+   for cgvdmbb_clusnum, member_indices in cgvdmbb_clus_assignments.items():
+      clus_label = f'clus_{cgvdmbb_clusnum}'
+      clus_tup = (clus_label,)
+
+      if clus_tup not in temp_clus_assignments:
+         temp_clus_assignments[clus_tup] = []
+
+      for ix in member_indices:
+         pdbpath = all_pdbpaths[ix]
+         pdbname = os.path.basename(pdbpath)
+
+         if pdbname.endswith('.pdb.gz'):
+            pdb_base = pdbname[:-len('.pdb.gz')]
+         elif pdbname.endswith('.pdb'):
+            pdb_base = pdbname[:-len('.pdb')]
+         else:
+            pdb_base = pdbname
+
+         scrrs, cg_perm = all_scrr_cg_perm[ix]
+         # scrrs is a list of [seg, chain, resnum, resname]
+         grouped_scrrs = [
+            [str(seg), str(chain), str(resnum), str(resname)]
+            for (seg, chain, resnum, resname) in scrrs]
+         sorted_scrrs = sorted(grouped_scrrs)
+
+         # index for this specific pdb of specific AA perm and cg perm for mapping it 
+         # back to the original "all_AA_cg_perm"...etc... lists. 
+         clus_mem_index = str(ix) 
+
+         vdg = (pdb_base, sorted_scrrs, clus_mem_index, pdbpath)
+
+         # Remove duplicates
+         existing_pairs = [v[:2] for v in temp_clus_assignments[clus_tup]]
+         if vdg[:2] not in existing_pairs:
+            temp_clus_assignments[clus_tup].append(vdg)
+
+   # Merge_equivalent_clusters -> delete_redun_vdgs -> reassign_temp_clusters
    temp_clus_assignments = merge_equivalent_clusters(temp_clus_assignments)
    pruned_clusters = delete_redun_vdgs(temp_clus_assignments)
    reassigned = reassign_temp_clusters(pruned_clusters)
 
-   # Move the deduplicated and reassigned PDBs to the new clus dir.
+   # Convert from vdg tuples back to index lists. Reassign clusters.
    renumbered_clusters = {}
    for new_cgvdmbb_clusnum, vdgs in reassigned.items():
-      renumbered_clusters[new_cgvdmbb_clusnum] = []
-      reassigned_clusdir = os.path.join(clean_dir, f'clus_{new_cgvdmbb_clusnum}')
-      os.makedirs(reassigned_clusdir)
+      renumbered_clusters[new_cgvdmbb_clusnum] = [int(v[2]) for v in vdgs]
 
-      # Move the vdgs.
-      for vdg in vdgs:
-         pdbbase, vdmscrrs, ix, vdgpath = vdg
-         renumbered_clusters[new_cgvdmbb_clusnum].append(int(ix))
-         # rename the pdb for clarity
-         scrr_str = '_'.join(['_'.join([str(z) for z in v_s]) for v_s in vdmscrrs])
-         if 'centroid' in vdgpath:
-            new_pdbname = f'{pdbbase}_{scrr_str}_centroid.pdb.gz'
-         else:
-            new_pdbname = f'{pdbbase}_{scrr_str}.pdb.gz'
-         assert not os.path.exists(new_pdbname)
-         shutil.move(vdgpath, os.path.join(reassigned_clusdir, new_pdbname))
-   
    return renumbered_clusters 
-         
+
 def determine_redundant_temp_vdg(already_seen_temp_vdgs, 
                                  candidate_pdbbase, candidate_scrr):
    # Return True if the candidate vdg has already been seen.
@@ -1041,31 +1085,6 @@ def determine_cluster_redundancy(clusnumA_vdgs, clusnumB_vdgs):
          if vdgA_pdbbase == vdgB_pdbbase and vdgA_sorted_scrrs == vdgB_sorted_scrrs:
             return True
    return False
-
-def get_temp_clus_assignments(cgvdmbb_clus, pdb, pdbpath, temp_clus_assignments):
-   pdb_base = pdb.split('.pdb.gz')[0]
-   pdb_base = '_'.join(pdb_base.split('_')[1:]) # removes "clus{x}_" from name
-   scrrs = pdb.split('.pdb.gz_')[1].removesuffix('.pdb.gz')
-   scrrs = scrrs.split('_CGperm')[0]
-   scrrs = scrrs.split('_')
-   assert len(scrrs) % 4 == 0
-   grouped_scrrs = [scrrs[i:i+4] for i in range(0, len(scrrs), 4)]
-   sorted_scrrs = sorted(grouped_scrrs)
-
-   clus_mem_index = pdb.split('_ix')[1].split('_')[0].removesuffix(
-      '.pdb.gz') # index for this specific pdb of specific AA perm and cg perm for 
-                 # mapping it back to the original "all_AA_cg_perm...etc..." lists. 
-   vdg = tuple([pdb_base, sorted_scrrs, clus_mem_index, pdbpath]) # determine 
-      # redundancy just on pdb_base and sorted_scrrs, but record pdb path so that 
-      # one file can be referenced for copying over to a clean cluster dir.
-   # Check for redundancy (does this vdG already exist in temp_clus_assignments?)
-   clus_tuple = tuple([cgvdmbb_clus])
-   if clus_tuple not in temp_clus_assignments.keys():
-      temp_clus_assignments[clus_tuple] = []
-   existing_in_clus = [i[:2] for i in temp_clus_assignments[clus_tuple]]
-   if not vdg[:2] in existing_in_clus:
-      temp_clus_assignments[clus_tuple].append(vdg)
-   return temp_clus_assignments
 
 def merge_equivalent_clusters(temp_clus_assignments):
    # After gathering all the pdb and sorted scrrs, find the degenerate vdGs and merge them.
@@ -1111,8 +1130,6 @@ def delete_redun_vdgs(temp_clus_assignments):
 def reassign_temp_clusters(pruned_clusters):
    '''
    Reassign cluster numbers, sorting cluster numbers based on size.
-   Each subdict is re-ordered on the "clustering" level (meaning flank seq clusters
-   are reordered first, followed by flank bb clusters, followed by cgvdmbb clusters).
    '''
    clus_tuples = list(pruned_clusters.keys())
    original_clus_labels = {}
@@ -1263,28 +1280,8 @@ def get_weights(num_cg_atoms, num_bb_atoms, align_cg_weight):
       raise ValueError('Weights do not sum to 1.')
    return weights
 
-def add_vdm_obj_for_cluslevel_cgvdmbb(par, vdm_scrr):
-   r = vdm_scrr[2] 
-   if r < 0:
-      res_sel = f'resnum `{r}`'
-   else:
-      res_sel = f'resnum {r}'
-
-   if vdm_scrr[0]: # has a pdb segment defined
-      res_obj = par.select(
-         f'segment {vdm_scrr[0]} and chain {vdm_scrr[1]} and {res_sel}')
-   else: # no segment
-      res_obj = par.select(
-         f'chain {vdm_scrr[1]} and {res_sel}')
-   assert len(set(res_obj.getResindices())) == 1
-   vdm_res_name = list(set(res_obj.getResnames()))
-   assert len(vdm_res_name)  == 1
-   assert vdm_res_name[0] == vdm_scrr[3]
-   return res_obj
-
 def _pick_single_ca(ca_sel, prev_ca):
    # Return a single CA atom object from a ProDy selection, handling altlocs/dups
-   # for `determine_flank_resnums`
    if len(ca_sel) == 1:
       return ca_sel[0]
 

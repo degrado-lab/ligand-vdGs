@@ -23,7 +23,7 @@ pdb_parent_dir = '/wynton/group/degradolab/skt/docking/databases/prepwizard_BioL
 probe_dir = '/wynton/group/degradolab/skt/docking/databases/probe_output/'
 max_num_clus = '5000' # max number of vdgs to cluster for each vdg subset
 h_rt = '150:00:00 '
-num_procs = '10'
+num_procs = '20'
 
 # ------------------------------------------------------------------------------------------
 
@@ -69,7 +69,7 @@ def output_script(template, smiles):
     # each time output_script is called, but it's ok.
     replace['$SMILES'] = f'"{smiles}"'
     replace['$CG'] = f'"{smiles}"' 
-    replace['$JOB_NAME'] = f'"{smiles}"'
+    replace['$JOB_NAME'] = f'"{smiles}"'.replace("#", "hash") # safe name
     # read template
     with open(template, 'r') as f:
         lines = f.readlines()

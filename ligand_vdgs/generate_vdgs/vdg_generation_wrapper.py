@@ -85,14 +85,14 @@ def main():
                                  num_procs)
 
     # Set up temporary outdir for fingerprints 
-    fp_tmp_root = (os.environ.get("TMPDIR") if os.environ.get("TMPDIR") and os.path.isdir(
+    tmp_root = (os.environ.get("TMPDIR") if os.environ.get("TMPDIR") and os.path.isdir(
         os.environ["TMPDIR"])
         else "/scratch" if os.path.isdir("/scratch")
         else "/tmp")
 
     cg_safe = cg.replace(os.sep, "_").replace(" ", "_").replace("#", "hash")
     out_leaf = os.path.basename(os.path.normpath(out_dir))
-    fp_out_root = os.path.join(fp_tmp_root, f"vdg_fp_{cg_safe}_{out_leaf}")
+    fp_out_root = os.path.join(tmp_root, f"vdg_fp_{cg_safe}_{out_leaf}")
     os.makedirs(fp_out_root, exist_ok=True)
 
     # ----- Run smarts_to_cg.py -----
@@ -169,9 +169,12 @@ def main():
         pool.starmap(run_deduplicate, [(num_vdms, deduplicate_template) for num_vdms 
                                        in num_vdms_list])
 
-    # Clean up the final state of clusters dir. Each subset's tempdir, flankseq, and 
-    # flankbb dirs were cleaned up along the way, but the highest level of these dirs 
-    # need to be deleted too. Also, delete the fingerprints temp dir.
+    # Clean up the final state of clusters dir. Each subset's temp, flankseq, and 
+    # flankbb dirs were cleaned up by clus_and_deduplicate_vdgs.py, but the top-level folders 
+    # need to be deleted too. If --keep-clustered-pdbs, note that the retained clustered output 
+    # is organized in this format to trace earlier cluster results: 
+    # clusters/flankseq_and_bb/size_subset/vdg_AAs/cgvdmbb_clusnum/flankseq_and_bb_clusnum 
+    # Finally, delete the fingerprints temp dir.
     clean_up_clusdirs(out_dir, 'temp', logfile) 
     clean_up_clusdirs(out_dir, 'cgvdmbb', logfile) 
     delete_empty_dirs(os.path.join(out_dir, 'nr_vdgs'))
@@ -179,6 +182,11 @@ def main():
         clean_up_clusdirs(out_dir, 'flankseq_and_bb', logfile) 
         delete_empty_dirs(os.path.join(out_dir, 'clusters'))
     shutil.rmtree(fp_out_root, ignore_errors=True)
+    flankseq_root = os.path.join(tmp_root, f"vdg_flankseq_{cg_safe}")
+    # remove flankseq_root if it exists and is a dir and is empty
+    if os.path.exists(flankseq_root) and os.path.isdir(flankseq_root):
+        if not os.listdir(flankseq_root):
+            shutil.rmtree(flankseq_root)
 
     main_script_elapsed = time.time() - main_script_start
     hours, minutes, seconds = convert_time_elapsed(main_script_elapsed)

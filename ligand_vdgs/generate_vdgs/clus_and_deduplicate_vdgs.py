@@ -390,20 +390,12 @@ def main():
        with open(logfile, 'a') as f:
            f.write(f'\t[STREAM WARNING]: failed to remove {stream_dir}: {_e}\n')
    
-   '''
-   Clean up the entire output from clus_and_deduplicate_vdgs.py.
-   At each clustering stage (cgvdmbb then flankseq_and_bb), the clustered PDBs are 
-   output so that they can be loaded in for the next step. (The libraries 
-   are usually way too large to store in memory.) At the end of the final stage of 
-   clustering (the flankseq_and_bb level), the clustered output is organized by:
-   CG/clusters/flankseq_and_bb/size_subset/vdg_AAs/cgvdmbb_clusnum/flankseq_and_bb_clusnum.
-   Therefore, it's easy to trace the earlier cluster results, and that earlier output
-   (clusters/temp/ and clusters/cgvdmbb) can be deleted. By default, the final stage of
-   clustering (clusters/flankseq_and_bb) is deleted as well, because all of the clusters
-   are quite memory-intensive. However, this final stage of clustering can be preserved 
-   using the --keep-clustered-pdbs flag.
-   '''
-   
+   # Clean up the entire output from clus_and_deduplicate_vdgs.py. The final stage of 
+   # clustering can be preserved using the --keep-clustered-pdbs flag. The retained 
+   # clustered output is in the form: 
+   # clusters/flankseq_and_bb/size_subset/vdg_AAs/cgvdmbb_clusnum/flankseq_and_bb_clusnum 
+   # to easily trace clustering steps.
+
    # Persist flankseq_and_bb clusters from scratch to global disk if requested
    if keep_clustered_pdbs:
       try:
@@ -414,6 +406,10 @@ def main():
                     f"for size_subset {size_subset}: {e}\n")
 
    delete_clusterdirs(vdglib_dir, logfile, size_subset, keep_clustered_pdbs)
+   if not keep_clustered_pdbs:
+       tmp_root = _flank_tmp_size_root(vdglib_dir, size_subset)
+       if os.path.isdir(tmp_root):
+           shutil.rmtree(tmp_root)
 
    # Delete temporary stream dirs. Usually, these jobs are run concurrently with 
    # different -n args, so remove the parent stream_tmp/ dir only when it's the last 
@@ -553,41 +549,14 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
    cgvdmbb_clus_assignments, cgvdmbb_clus_centroids = clust.get_leader_clusters(
       cgvdmbb_data_to_clus, cgvdmbb_rmsd_cut, reordered_AAs_str, len(reordered_AAs), 
       vdglib_dir, final_exact_medoid_pass=True, final_reassign_once=True)
+   cgvdmbb_weights = clust.get_weights(num_cg_atoms, num_vdmbb_atoms, align_cg_weight)
+   first_pdb_out = None          # will be set when writing flankseq_and_bb PDBs
+   first_pdb_cg_vdmbb_coords = False
 
-   # Output the cgvdmbb clusters
-     
-   # Define dir to output "temp" files (temp bc clusters need to be reassigned
-   # later to handle degenerate binding sites for different AA and CG 
-   # permutations of the same PDB).
-   temp_cgvdmbb_clusdir = os.path.join(vdglib_dir, 'clusters', 'temp', 'cgvdmbb', 
-      str(len(reordered_AAs)), reordered_AAs_str) 
-   utils.handle_existing_files(temp_cgvdmbb_clusdir)
-   cgvdmbb_weights = clust.get_weights(num_cg_atoms, num_vdmbb_atoms, 
-                                             align_cg_weight)
-   
-   first_pdb_out = None # update with pdb name of first pdb that's output for ref
-   first_pdb_cg_vdmbb_coords = False 
-
-   first_pdb_out, first_pdb_cg_vdmbb_coords, failed_pdbs = clust.write_out_clusters(
-      temp_cgvdmbb_clusdir, cgvdmbb_clus_assignments, cgvdmbb_clus_centroids,
-      all_AA_cg_perm_cg_coords, all_AA_cg_perm_pdbpaths, 
-      all_AA_cg_perm_vdm_scrr_cg_perm, all_AA_cg_perm_cg_and_vdmbb_coords, 
-      all_AA_cg_perm_flat_flankCAs, num_flanking, first_pdb_out, 
-      first_pdb_cg_vdmbb_coords, cgvdmbb_weights, atomgroup_dict, print_flankbb, 
-      symmetry_classes, reordered_AAs, write_cluster_members=True)
-
-   if len(failed_pdbs) > 0:
-      with open(logfile, 'a') as file:
-         for fail in failed_pdbs:
-            file.write(f'\tFailed to parse {fail}.\n')
-
-   # Clean up the cgvdmbb output dir by merging degenerate vdGs (diff AA and 
-   # CG perms of the same PDB), deleting degenerate pdbs/clusters, and 
-   # reassigning clus nums by size.
-   tempdir = os.path.join(vdglib_dir, 'clusters', 'temp', 'cgvdmbb')
-   cleandir = os.path.join(vdglib_dir, 'clusters', 'cgvdmbb')
-   reassigned_cgvdmbb_clus = clust.rewrite_temp_clusters(tempdir, cleandir, 
-                                    len(reordered_AAs), reordered_AAs_str)
+   # Merge degenerate vdGs (diff AA and CG perms of the same PDB) and reassign cluster 
+   # numbers by size. 
+   reassigned_cgvdmbb_clus = clust.reassign_cgvdmbb_clusters(cgvdmbb_clus_assignments, 
+      all_AA_cg_perm_pdbpaths, all_AA_cg_perm_vdm_scrr_cg_perm)
 
    # Next, further subdivide each cluster on rmsd of the bb stretches flanking the vdms 
    # + their sequences. 
@@ -640,14 +609,7 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
 def delete_clusterdirs(vdglib_dir, logfile, size_subset, keep_clustered_pdbs):
    with open(logfile, 'a') as file:
       all_clusters = os.path.join(vdglib_dir, 'clusters')
-      # delete temp folder
-      tempdir = os.path.join(all_clusters, 'temp', 'cgvdmbb', str(size_subset))
-      if os.path.exists(tempdir):
-         shutil.rmtree(tempdir)
-      # delete cgvdmbb 
-      cgvdmbbdir = os.path.join(all_clusters, 'cgvdmbb', str(size_subset))
-      if os.path.exists(cgvdmbbdir):
-         shutil.rmtree(cgvdmbbdir)
+
       # delete flankseq_and_bb unless keep_clustered_pdbs is True
       if not keep_clustered_pdbs:
          flank_dir = os.path.join(all_clusters, 'flankseq_and_bb', str(size_subset))
