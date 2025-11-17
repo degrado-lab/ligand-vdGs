@@ -12,7 +12,6 @@ from functools import lru_cache
 _RMSD_CACHE_MAXSIZE = 100_000
 _SEQ_CACHE_MAXSIZE  = 50_000
 _ATOMGROUP_CACHE_MAXSIZE = 1000
-_DATASET_REGISTRY_MAXSIZE = 256  # max number of distinct datasets per process
 
 EPS = 1e-9   # strict-improvement epsilon for reassignment; tune to 1e-8 if needed
 
@@ -142,8 +141,7 @@ def get_leader_clusters(
           seq = get_leader_clusters._SEQ_DATASETS[ds_id]
           return calc_seq_similarity(seq[i], seq[j])
 
-      # cache RMSD by metric and dataset identity.
-      # key: (metric_name, id(dataset), i, j
+      # cache RMSD by metric and dataset identity
       @lru_cache(maxsize=_RMSD_CACHE_MAXSIZE)
       def _rmsd_cached(metric_name, ds_id, i, j):
           a, b = _ord_pair(i, j)
@@ -154,34 +152,12 @@ def get_leader_clusters(
       # stash them on the function so they persist across calls
       get_leader_clusters._seqsim_cached = _seqsim_cached
       get_leader_clusters._rmsd_cached   = _rmsd_cached
-
-      # cap number of datasets referenced by the registries
-      def _ensure_dataset_capacity():
-         """
-         If too many distinct datasets have been registered, clear the registries 
-         and the LRU caches and start fresh. This prevents unbounded growth of 
-         _SEQ_DATASETS and _RMSD_DATASETS.
-         """
-         seq_ds  = get_leader_clusters._SEQ_DATASETS
-         rmsd_ds = get_leader_clusters._RMSD_DATASETS
-
-         if (len(seq_ds)  >= _DATASET_REGISTRY_MAXSIZE or
-            len(rmsd_ds) >= _DATASET_REGISTRY_MAXSIZE):
-
-            seq_ds.clear()
-            rmsd_ds.clear()
-            _seqsim_cached.cache_clear()
-            _rmsd_cached.cache_clear()
-
-      # stash helper on the function object too
-      get_leader_clusters._ensure_dataset_capacity = staticmethod(_ensure_dataset_capacity)
-
+ 
    # aliases
    _seqsim_cached = get_leader_clusters._seqsim_cached
    _rmsd_cached   = get_leader_clusters._rmsd_cached
    _SEQ_DATASETS  = get_leader_clusters._SEQ_DATASETS
    _RMSD_DATASETS = get_leader_clusters._RMSD_DATASETS
-   _ensure_dataset_capacity = get_leader_clusters._ensure_dataset_capacity
 
    # register the current datasets by identity for caching 
    dsid_seq     = id(metric_to_data['flankseq']) if 'flankseq' in metric_to_data else None
@@ -189,13 +165,10 @@ def get_leader_clusters(
    dsid_cgvdmbb = id(metric_to_data['cgvdmbb'])  if 'cgvdmbb'  in metric_to_data else None
 
    if dsid_seq is not None and dsid_seq not in _SEQ_DATASETS:
-      _ensure_dataset_capacity()
       _SEQ_DATASETS[dsid_seq] = metric_to_data['flankseq']
    if dsid_flankbb is not None and ('flankbb', dsid_flankbb) not in _RMSD_DATASETS:
-      _ensure_dataset_capacity()
       _RMSD_DATASETS[('flankbb', dsid_flankbb)] = metric_to_data['flankbb']
    if dsid_cgvdmbb is not None and ('cgvdmbb', dsid_cgvdmbb) not in _RMSD_DATASETS:
-      _ensure_dataset_capacity()
       _RMSD_DATASETS[('cgvdmbb', dsid_cgvdmbb)] = metric_to_data['cgvdmbb']
 
    def _ord_pair(i, j):
@@ -207,10 +180,10 @@ def get_leader_clusters(
       # cap: if provided, we early-exit once total > min(cap, threshold)
       cutoff = threshold if cap is None else min(cap, threshold)
       total = 0.0
+      a, b = _ord_pair(i, j)
 
       if dsid_seq is not None:
          # pull seq sim from persistent cache instead of recomputing
-         a, b = _ord_pair(i, j)
          sim = _seqsim_cached(dsid_seq, a, b)  # 0..100
          total += ((100.0 - sim) / 100.0) * seq_weight
          if early_stop and total > cutoff:
@@ -218,15 +191,14 @@ def get_leader_clusters(
 
       if dsid_flankbb is not None:
          # cached RMSD for 'flankbb'
-         a, b = _ord_pair(i, j)
-         total += _rmsd_cached('flankbb', dsid_flankbb, i, j)
+         total += _rmsd_cached('flankbb', dsid_flankbb, a, b)
          if early_stop and total > cutoff:
             return total
 
       if dsid_cgvdmbb is not None:
          # cached RMSD for 'cgvdmbb'
-         a, b = _ord_pair(i, j)
-         total += _rmsd_cached('cgvdmbb', dsid_cgvdmbb, i, j)
+         total += _rmsd_cached('cgvdmbb', dsid_cgvdmbb, a, b)
+
       return total
 
    # ---- exact medoid (O(m^2), but m is small for small clusters) ----
@@ -1240,8 +1212,8 @@ def add_flank_obj_for_cluslevel_flank(par, vdm_scrr, num_flanking, pdbpath):
 
 def get_clus_mem_data(ind, all_cg_coords, all_cg_and_vdmbb_coords, all_flankbb_coords,
                       all_pdbpaths, all_scrr_cg_perm, num_flanking, atomgroup_dict):
-   # Given the index of a cluster member, return the cg coords, cg+vdmbb coords, 
-   # pdbpath, scrr_cg_perm, pr_obj, and output pdb name.
+   # Given the index of a cluster member, return its CG coords, CG+vdM bb coords, 
+   # flanking bb coords, pdb path, scrr/cg-perm label, and ProDy AtomGroup.
       
    clusmem_cg_coords = all_cg_coords[ind]
    clusmem_cg_vdmbb_coords = all_cg_and_vdmbb_coords[ind]
