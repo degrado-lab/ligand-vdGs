@@ -3,8 +3,8 @@ __pycache__/
 *.log
 *logs/
 *tmp/
-log
 *.chkpt
 *.bak
 bak/
 *.egg-info/
+ligand_vdgs/generate_vdgs/frag_submit_scripts

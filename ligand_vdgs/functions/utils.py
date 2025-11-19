@@ -10,8 +10,8 @@ def handle_existing_files(out_dir):
              'output dir name to prevent accidental overwriting.')
 
 def set_up_outdir(outdir, overwrite=False):
-    '''Create outdir if it does not exist, and require overwrite_existing if it does,
-    so that there are no stale files.'''
+    '''Create outdir if it does not exist, and require overwrite if it does, so that there are '
+    no stale files.'''
     if os.path.exists(outdir):
         if not os.path.isdir(outdir):
             raise ValueError(f'The filename you designated as the output directory, {outdir}, '
@@ -125,36 +125,119 @@ def smiles_equiv(existingfrag, sub_smiles, check_atom_order):
 
     return is_equivalent
 
+def _find_resonance_O_groups(mol):
+    """
+    Find resonance X–O groups where:
+      - A central atom X has at least one multiple bond to O, and
+      - Either:
+          * X has >= 3 O neighbors, or
+          * X has >= 2 O neighbors AND (any O is anionic OR X is charged).
+
+    All X–O bonds in such a group will be treated as resonance-equivalent
+    (ignore single vs double).
+
+    Returns: dict {bond_idx: (center_atomic_num, group_id)}
+    """
+    resonance_groups = {}
+    next_group_id = 0
+
+    # X candidates where multi-O resonance is common
+    X_CANDIDATES = {6, 7, 8, 15, 16}  # C, N, O, P, S
+
+    for atom in mol.GetAtoms():
+        z = atom.GetAtomicNum()
+        if z not in X_CANDIDATES:
+            continue
+
+        center_charge = atom.GetFormalCharge()
+        oxy_bonds = []
+        has_multiple_to_O = False
+        has_anionic_O = False
+
+        for bond in atom.GetBonds():
+            other = bond.GetOtherAtom(atom)
+            if other.GetAtomicNum() == 8:  # oxygen neighbor
+                oxy_bonds.append(bond.GetIdx())
+                if bond.GetBondTypeAsDouble() > 1.01:  # > single
+                    has_multiple_to_O = True
+                if other.GetFormalCharge() < 0:
+                    has_anionic_O = True
+
+        num_O = len(oxy_bonds)
+        if not has_multiple_to_O or num_O < 2:
+            continue
+
+        # Decide if this X center should be treated as a resonance X–O center
+        is_resonance_center = (num_O >= 3 or (num_O >= 2 and 
+                              (has_anionic_O or center_charge != 0)))
+
+        if not is_resonance_center:
+            continue
+
+        for bidx in oxy_bonds:
+            resonance_groups[bidx] = (z, next_group_id)
+        next_group_id += 1
+
+    return resonance_groups
+
 def identify_mol_symmetry(mol):
     """
     Identify atom symmetry using Weisfeiler–Lehman (WL) color refinement.
-    1. Assign initial atom labels based on atomic numbers.
-    2. Iteratively refine labels based on the labels of neighboring atoms until 
-       convergence. At convergence, atoms with the same final label are 
-       determined to be symmetrically equivalent.
+    - Atom labels: (atomic number, is_aromatic)  [charges ignored to allow
+      resonance-equivalent atoms (e.g. carboxylate, nitrate) to become equivalent]
+    - Bond labels:
+        * Normal bonds: (0, bond_order, is_aromatic, is_conjugated)
+        * Resonance X–O bonds: (1, center_atomic_num, group_id)
 
     Returns a list of lists, where atom indices in each sublist are equivalent.
     """
-    # Initial labels: atomic numbers (ignores charge, valence, etc.)
-    labels = [atom.GetAtomicNum() for atom in mol.GetAtoms()]
+    atoms = list(mol.GetAtoms())
+    num_atoms = mol.GetNumAtoms()
 
-    # Precompute neighbor atom indices for each atom
-    nbrs = [[b.GetOtherAtomIdx(a.GetIdx()) for b in a.GetBonds()]
-            for a in mol.GetAtoms()]
+    labels = [(atom.GetAtomicNum(), atom.GetIsAromatic()) for atom in atoms]
 
+    # Precompute resonance X–O bond groups
+    resonance_groups = _find_resonance_O_groups(mol)
+
+    def bond_featurizer(bond):
+        bidx = bond.GetIdx()
+        if bidx in resonance_groups:
+            center_z, group_id = resonance_groups[bidx]
+            # 1 = resonance X–O type
+            return (1, center_z, group_id)
+
+        # 0 = normal bond type
+        return (0, float(bond.GetBondTypeAsDouble()), bond.GetIsAromatic(),
+            bond.GetIsConjugated())
+
+    # Precompute neighbors and bond labels
+    nbrs = [[] for _ in range(num_atoms)]
+    bond_labels = [[] for _ in range(num_atoms)]
+
+    for bond in mol.GetBonds():
+        i = bond.GetBeginAtomIdx()
+        j = bond.GetEndAtomIdx()
+        b_label = bond_featurizer(bond)
+
+        nbrs[i].append(j)
+        nbrs[j].append(i)
+        bond_labels[i].append(b_label)
+        bond_labels[j].append(b_label)
+
+    # WL refinement
     changed = True
     while changed:
         changed = False
-
-        # Refinement step:
-        # atom's signature = (current label, sorted multiset of neighbor labels)
         sigs = []
-        for i in range(mol.GetNumAtoms()):
-            sigs.append(
-                (labels[i], tuple(sorted(labels[j] for j in nbrs[i])))
-            )
 
-        # Relabel signatures to compact consecutive integers
+        for i in range(num_atoms):
+            neigh_sig = []
+            for j, b_lbl in zip(nbrs[i], bond_labels[i]):
+                neigh_sig.append((b_lbl, labels[j]))
+
+            neigh_sig.sort()
+            sigs.append((labels[i], tuple(neigh_sig)))
+
         uniq = {}
         refined_labels = []
         next_id = 0
@@ -177,3 +260,29 @@ def identify_mol_symmetry(mol):
     # Sort classes by size, then lexicographically by indices (for stability)
     return sorted(groups.values(), key=lambda g: (len(g), g))
 
+def define_symmetry(smiles):
+    # returns None if no symmetry, or symm_classes if symmetry
+    mol_obj = Chem.MolFromSmarts(smiles)
+    symm_groups = identify_mol_symmetry(mol_obj)
+    has_symm = len(symm_groups) < mol_obj.GetNumAtoms()
+    if not has_symm:
+        return None
+
+    # Step 1: assign raw labels based on group index
+    max_index = max(max(sub) for sub in symm_groups)
+    raw = [None] * (max_index + 1)
+    for label, sub in enumerate(symm_groups):
+        for idx in sub:
+            raw[idx] = label
+
+    # Step 2: renumber labels in order of first appearance (so sequence starts with 0)
+    mapping = {}
+    next_label = 0
+    normalized = []
+    for lab in raw:
+        if lab not in mapping:
+            mapping[lab] = next_label
+            next_label += 1
+        normalized.append(mapping[lab])
+
+    return " ".join(map(str, normalized))

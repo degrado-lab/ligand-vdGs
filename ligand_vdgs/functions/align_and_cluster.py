@@ -535,18 +535,29 @@ def get_cg_coords(prody_obj, pdbpath):
    # 3.0, 3.1, 3.2, etc.) to allow a 1:1 correspondence of equivalent atoms between 
    # different ligands.
    cg = prody_obj.select('occupancy > 2.9')
+
+   if cg is None or len(cg) == 0:
+      print(f'[WARNING] get_cg_coords: no atoms with occupancy > 2.9 in {pdbpath}')
+      return None
+
    num_atoms = len(cg)
    cg_coords = []
    for ind in range(num_atoms):
       occ = f'3.{ind}'
       atom = cg.select(f'occupancy == {occ}')
-      if len(atom) != 1:
-         print(f'[WARNING] get_cg_coords: {len(atom)} atoms are occupancy {occ} in {pdbpath}.')
+      if atom is None or len(atom) != 1:
+         print(f'[WARNING] get_cg_coords: {0 if atom is None else len(atom)} atoms '
+               f'are occupancy {occ} in {pdbpath}.')
          return None
       atom_coords = atom.getCoords()[0]
       cg_coords.append(atom_coords)
 
-   return np.array(cg_coords)
+   cg_coords = np.asarray(cg_coords, dtype=float)
+
+   if not np.isfinite(cg_coords).all(): # reject NaN or inf coords
+      return None
+
+   return cg_coords
 
 def get_bb_coords(obj):
    bb_coords = []
@@ -839,14 +850,10 @@ def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_c
             moved_cent_transf, moved_cent_coords = get_transf_and_coords(
                      cent_cg_vdmbb_coords, first_pdb_cg_vdmbb_coords, weights, 
                      cent_pr_obj, cent_scrr_cg_perm, symmetry_classes)
-         except Exception as e: # Sometimes errors out, though rare.
-            print(f'[WARNING] {reordered_AAs} cluster {clusnum}: \n{e}\n'
-                  f'Failed to align centroid ({cent_pdbpath}) to the first PDB '
-                  f'({first_pdb_out}). Need to skip entire cluster, which has '
-                  f'{len(clus_mem_indices)} members.')
-
+         except Exception as e:
+            print(f'[ERROR] {reordered_AAs} cluster {clusnum} centroid failed ({cent_pdbpath}): {e}')
             failed.append(cent_pdbpath)
-            continue
+            raise
 
          write_out_subsequent_clus_pdbs(cent_pr_obj, cent_pdb_outpath, 
                              cent_scrr_cg_perm, print_flankbb, moved_cent_transf)
@@ -1120,54 +1127,34 @@ def reassign_temp_clusters(pruned_clusters):
    return reassigned_cgvdmbb_clusters
 
 def get_pr_obj_to_print(clusmem_pdbpath, vdg_scrr_cg_perm,
-                       num_flanking, atomgroup_dict):
-   try:
-      # Use cache only if enabled AND the key is present
-      if _ATOMGROUP_CACHE_MAXSIZE > 0 and clusmem_pdbpath in atomgroup_dict:
-         par = atomgroup_dict[clusmem_pdbpath]
-      else:
-         par = pr.parsePDB(clusmem_pdbpath)
-         if _ATOMGROUP_CACHE_MAXSIZE > 0:
-            # Evict oldest (FIFO) if at capacity
-            if len(atomgroup_dict) >= _ATOMGROUP_CACHE_MAXSIZE:
-               try:
-                   atomgroup_dict.pop(next(iter(atomgroup_dict)))
-               except StopIteration:
-                   pass
-            atomgroup_dict[clusmem_pdbpath] = par
+                        num_flanking, atomgroup_dict):
+    exceptions = []  # collect all exceptions we hit
 
-   except:  # retry
-      for attempt in range(100):
-         try:
-            par = pr.parsePDB(clusmem_pdbpath)
-            if _ATOMGROUP_CACHE_MAXSIZE > 0:
-               if len(atomgroup_dict) >= _ATOMGROUP_CACHE_MAXSIZE:
-                  try:
-                      atomgroup_dict.pop(next(iter(atomgroup_dict)))
-                  except StopIteration:
-                      pass
-               atomgroup_dict[clusmem_pdbpath] = par
-            break
-         except Exception as e:
-            if attempt < 99:
-               time.sleep(10)
+    for attempt in range(6):  # 1 initial try + 5 retries
+        try:
+            # Use cache only if enabled AND the key is present
+            if _ATOMGROUP_CACHE_MAXSIZE > 0 and clusmem_pdbpath in atomgroup_dict:
+                par = atomgroup_dict[clusmem_pdbpath]
             else:
-               print(f"[WARNING] get_pr_obj_to_print failed on {clusmem_pdbpath}: {e}")
-               return None
+                par = pr.parsePDB(clusmem_pdbpath)
+                if _ATOMGROUP_CACHE_MAXSIZE > 0:
+                    # Evict oldest (FIFO) if at capacity
+                    if len(atomgroup_dict) >= _ATOMGROUP_CACHE_MAXSIZE:
+                        try:
+                            atomgroup_dict.pop(next(iter(atomgroup_dict)))
+                        except StopIteration:
+                            pass
+                    atomgroup_dict[clusmem_pdbpath] = par
 
-   # Add CG to pr obj
-   pr_obj = par.select('occupancy > 2.9')  # occ >= 3 is CG
-   vdg_scrrs, cg_perm = vdg_scrr_cg_perm
-   for vdm_scrr in vdg_scrrs:
-      try:
-         flank_obj = add_flank_obj_for_cluslevel_flank(par, vdm_scrr, num_flanking,
-                                                       clusmem_pdbpath)
-         pr_obj += flank_obj
-      except Exception as e:
-         print(f"[WARNING] flanking residues could not be added on {clusmem_pdbpath}: {e}")
-         pass
+            # if we got here, it worked
+            return par
 
-   return pr_obj.copy()
+        except Exception as e:
+            if attempt < 5:  # still have retries left
+                time.sleep(30)
+            else:
+                print(f"[WARNING] get_pr_obj_to_print failed on {clusmem_pdbpath}")
+                return None
 
 def add_flank_obj_for_cluslevel_flank(par, vdm_scrr, num_flanking, pdbpath):
    # Check +/- flank num to see whether to include it in the pr obj or not.

@@ -103,6 +103,13 @@ def main():
     
     subprocess.run(smarts_to_cg_cmd, shell=True, check=True)
 
+    # Check in logfile to see if there were no cg matches. Exit early if so.
+    no_ligs_msg = 'No ligands contain the specified SMARTS pattern.\n'
+    with open(logfile, 'r') as f:
+        if no_ligs_msg in f.read():
+            print(no_ligs_msg)
+            return
+
     # ----- Run generate_fingerprints.py -----
     match_pkl = os.path.join(out_dir, f'{cg}_matches.pkl') # output from smarts_to_cg.py
     fingerprints_cmd = f'python external/vdG-miner/vdg_miner/programs/generate_fingerprints.py -c "{cg}" -l "{logfile}" -m "{match_pkl}" -p {pdb_dir} -b {probe_dir} -o "{fp_out_root}"'
@@ -123,9 +130,9 @@ def main():
         num_fp_files += len([f for f in files if f.endswith('.npy')])
 
     with open(logfile, 'a') as f:
-        f.write(f"\nCompleted generate_fingerprints.py in {hours} h, ")
+        f.write(f"Completed generate_fingerprints.py in {hours} h, ")
         f.write(f"{minutes} mins, and {seconds} secs.\n")
-        f.write(f"\t{num_fp_files} fingerprint sets generated.\n")
+        f.write(f"\t{num_fp_files} fingerprint sets generated.\n\n")
 
     # ----- Run fingerprints_to_pdbs.py -----
     to_pdbs_cmd_template = (
@@ -147,11 +154,13 @@ def main():
     hours, minutes, seconds = convert_time_elapsed(fingerprints_elapsed)
     
     with open(logfile, 'a') as f:
-        f.write(f"\nCompleted fingerprints_to_pdbs.py in {hours} h, ")
+        f.write(f"Completed fingerprints_to_pdbs.py in {hours} h, ")
         f.write(f"{minutes} mins, and {seconds} secs.\n")
         f.write(f"\t{final_num_vdg_pdbs} vdg pdb files written out.\n")
 
     # ----- Run clus_and_deduplicate_vdgs.py -----
+    with open(logfile, 'a') as f:
+        f.write(f"\n----- Starting clus_and_deduplicate_vdgs.py -----\n")
     if symm_classes is not None:
         deduplicate_template = f'python ligand_vdgs/generate_vdgs/clus_and_deduplicate_vdgs.py -c "{cg}" -v "{out_dir}" -s {symm_classes} -l "{logfile}" -w {align_cg_weight} -m {max_num_to_clus} --num-procs {num_procs}'
     else:

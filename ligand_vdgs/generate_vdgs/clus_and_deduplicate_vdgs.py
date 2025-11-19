@@ -126,6 +126,18 @@ def _run_one_bucket_strict(args):
 
    _vdgs = _load_bucket(bucket_path) 
 
+   # Filter out any vdGs with NaN or inf CG coords
+   filtered_vdgs = []
+   for (cg_coords, bbcoords, flankseqs, flankCAs, pdbpath, scrr) in _vdgs:
+      if not np.isfinite(cg_coords).all():
+         with open(logfile, 'a') as f:
+            f.write(f'[WARNING] dropping vdG from {pdbpath} from bucket '
+                    f'{tuple(_reordered_AAs)} due to NaN or inf CG coords.\n')
+         continue
+      filtered_vdgs.append([cg_coords, bbcoords, flankseqs, flankCAs, pdbpath, scrr])
+
+   _vdgs = filtered_vdgs
+
    # Cluster vdG subsets with identical vdM AA compositions to identify redundancy. 
    # If there are > max_num_to_clus samples, select only the PDBs with highest PDB ID
    # diversity. Note that a single PDB can contribute multiple vdGs, so even after  
@@ -136,10 +148,11 @@ def _run_one_bucket_strict(args):
       pdbIDs = [z[-2].split('/')[-1][:4] for z in _vdgs]
       diverse_pdbIDs = select_diverse_pdbIDs(pdbIDs, max_num_to_clus)
       _vdgs = [z for z in _vdgs if z[-2].split('/')[-1][:4] in diverse_pdbIDs]
-      with open(logfile, 'a') as file:
-         file.write(f'\tThere are {orig_num_vdgs} vdgs for the {tuple(_reordered_AAs)} '
-            f'subset, so only {len(_vdgs)} vdgs with maximum PDB ID '
-            f'diversity were selected.\n')
+      if orig_num_vdgs != len(_vdgs):
+         with open(logfile, 'a') as file:
+            file.write(f'\tThere are {orig_num_vdgs} vdgs for the {tuple(_reordered_AAs)} '
+               f'subset, so only {len(_vdgs)} vdgs with maximum PDB ID '
+               f'diversity were selected.\n')
       # Note that len(_vdgs) may be > max_num_to_clus because >1 vdgs might 
       # belong to the same PDB.
 
@@ -313,7 +326,8 @@ def main():
       cg_coords = clust.get_cg_coords(prody_obj, pdbpath)
       if cg_coords is None:
          with open(logfile, 'a') as file:
-            file.write(f'\tIncorrect number of occ >= 3 atoms in vdg_pdbs/{pdbname}.\n')
+            file.write(f'[WARNING] get_cg_coords: NaN or inf CG coords in {pdbpath}; '
+                       f'skipping.\n')
          continue
       # Define symmetry class if it's None so it's compatible with pdb output naming
       if symmetry_classes is None: 
@@ -375,7 +389,7 @@ def main():
             for _ in pool.imap_unordered(_run_one_bucket_strict, jobs, chunksize=1):
                pass
       except Exception as e:
-         err_text = f'\t[FATAL ERROR] Worker failed with exception:\n{e}\n'
+         err_text = f'[FATAL ERROR] Worker failed with exception:\n{e}\n'
          with open(logfile, 'a') as f:
             f.write(err_text)
          print(err_text, file=sys.stderr) # ensure it shows up in stdout/stderr
@@ -605,6 +619,8 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
          with open(logfile, 'a') as file:
             for fail in failed_pdbs:
                file.write(f'\tFailed to parse {fail}.\n')
+               file.flush()
+               os.fsync(file.fileno()) # force os flush b/c of lag
 
 def delete_clusterdirs(vdglib_dir, logfile, size_subset, keep_clustered_pdbs):
    with open(logfile, 'a') as file:

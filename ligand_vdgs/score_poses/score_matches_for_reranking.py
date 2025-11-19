@@ -25,7 +25,7 @@ ignore_frags = ['CC(C)N', 'CN(C)C', 'Cn(c)c', 'CN(c)C', 'cn(c)C',
                 'cn(c)-c', 'cN(c)C', 'cn(c)c', 'cN(C)C']
 # ignore CC(C)N?
 
-print_counts = False
+print_counts = True
 
 # Collect per-condition results across all matches_dirs (PDB structs)
 results = []  # list of dicts summarizing each (rmsd, sizes, weighted) over all dirs
@@ -49,7 +49,7 @@ for matches_dir in matches_dirs:
             
             num_rank_1_or_2 = 0
             num_rank_3 = 0
-            num_true_positives = 0
+            num_query_pdbs = 0
 
             for structure in structures:
                 if not os.path.isdir(os.path.join(matches_dir, structure)):
@@ -196,12 +196,12 @@ for matches_dir in matches_dirs:
             if print_counts:
                 print(avg_row)
 
-            # Step 7: print ranks of all "true_pos" samples
-            true_pos_samples = [s for s in sorted_samples if "true_pos" in s]
+            # Step 7: print ranks of all "ground truth" (xtal structure) samples
+            ground_truth_samples = [s for s in sorted_samples if "xtal" in s]
 
-            if true_pos_samples:
-                for s in true_pos_samples:
-                    num_true_positives += 1
+            if ground_truth_samples:
+                for s in ground_truth_samples:
+                    num_query_pdbs += 1
                     rank = sorted_samples.index(s) + 1  # +1 for human-readable rank
                     if print_counts:
                         print(f"{s:<25} ranked #{rank} out of {len(sorted_samples)}")
@@ -210,7 +210,7 @@ for matches_dir in matches_dirs:
                     elif rank == 3:
                         num_rank_3 += 1
             else:
-                print("\n(No samples with 'true_pos' found.)")
+                print("\n(No samples with '_xtal' found.)")
 
             # Record per-condition result for this matches_dir 
             results.append({
@@ -220,7 +220,7 @@ for matches_dir in matches_dirs:
                 "weighted": weighted,
                 "rank_1_2": num_rank_1_or_2,
                 "rank_3": num_rank_3,
-                "true_pos_total": num_true_positives,
+                "num_queries_total": num_query_pdbs,
                 "rank_1_2_3_total": num_rank_1_or_2 + num_rank_3,})
 
 # Aggregate across all matches_dirs and report best condition(s) 
@@ -228,12 +228,12 @@ if results:
     # aggregate by (rmsd, sizes, weighted)
     from collections import defaultdict
 
-    agg = defaultdict(lambda: {"rank_1_2": 0, "rank_3": 0, "true_pos_total": 0})
+    agg = defaultdict(lambda: {"rank_1_2": 0, "rank_3": 0, "num_queries_total": 0})
     for r in results:
         key = (r["rmsd"], r["sizes"], r["weighted"])
         agg[key]["rank_1_2"] += r["rank_1_2"]
         agg[key]["rank_3"] += r["rank_3"]
-        agg[key]["true_pos_total"] += r["true_pos_total"]
+        agg[key]["num_queries_total"] += r["num_queries_total"]
 
     # Compute combined metric (#1/#2/#3 hits)
     summary = []
@@ -246,17 +246,17 @@ if results:
             "rank_1_2": vals["rank_1_2"],
             "rank_3": vals["rank_3"],
             "rank_1_2_3_total": combined,
-            "true_pos_total": vals["true_pos_total"],})
+            "num_queries_total": vals["num_queries_total"],})
 
     # pretty print summary
     print("\n=================== SUMMARY ACROSS ALL DIRECTORIES ===================")
     print(f"{'RMSD':<8}{'Sizes':<16}{'Weighted':<10}{'#1-2':<8}{'#3':<8}{'#1-3 total':<12}"
-          f"{'TP total':<10}")
+          f"{'Total queries':<10}")
     for row in sorted(summary, key=lambda x: (-x["rank_1_2_3_total"], -x["rank_1_2"], 
                                               -x["rank_3"])):
         print(f"{row['rmsd']:<8}{str(row['sizes']):<16}{str(row['weighted']):<10}"
               f"{row['rank_1_2']:<8}{row['rank_3']:<8}{row['rank_1_2_3_total']:<12}"
-              f"{row['true_pos_total']:<10}")
+              f"{row['num_queries_total']:<10}")
 
 else:
     print("\n(No results collected; please check input directories.)")
