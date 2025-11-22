@@ -157,6 +157,8 @@ def main():
         f.write(f"Completed fingerprints_to_pdbs.py in {hours} h, ")
         f.write(f"{minutes} mins, and {seconds} secs.\n")
         f.write(f"\t{final_num_vdg_pdbs} vdg pdb files written out.\n")
+    aggregate_fp_job_stats(num_procs, logfile)  # across all jobs
+    remove_fp2pdb_stats_files(os.path.dirname(logfile))  # cleanup
 
     # ----- Run clus_and_deduplicate_vdgs.py -----
     with open(logfile, 'a') as f:
@@ -272,6 +274,43 @@ def write_out_commandline_params(logfile, smarts, cg, pdb_dir, probe_dir, out_di
         _log.write(f'Probe dir: {probe_dir} \n')
         _log.write(f'Output dir: {out_dir} \n')
         _log.write(f'Number of processes: {num_procs} \n')
+
+def aggregate_fp_job_stats(num_procs, logfile):
+    # aggregate across all jobs
+    total_env_all = 0
+    failed_env_all = 0
+
+    logdir = os.path.dirname(logfile) # find stats files
+    for j in range(num_procs):
+        stats_path = os.path.join(logdir, f'fp2pdb_stats_job_{j}.txt')
+        if not os.path.exists(stats_path):
+            continue
+        with open(stats_path, 'r') as sf:
+            parts = sf.read().strip().split()
+            if len(parts) >= 2:
+                total_env_all += int(parts[0])
+                failed_env_all += int(parts[1])
+
+    if total_env_all > 0:
+        failure_pct_all = 100.0 * failed_env_all / total_env_all
+    else:
+        failure_pct_all = 0.0
+
+    aggregate_msg = (
+        f'\tFailure rate: ({failure_pct_all:.2f}%)\n')
+
+    with open(logfile, 'a') as f:
+        f.write(aggregate_msg) 
+
+def remove_fp2pdb_stats_files(out_dir):
+    # Delete all fp2pdb_stats_job_*.txt files under out_dir
+    for root, dirs, files in os.walk(out_dir):
+        for fname in files:
+            if fname.startswith("fp2pdb_stats_job_") and fname.endswith(".txt"):
+                try:
+                    os.remove(os.path.join(root, fname))
+                except Exception:
+                    pass
 
 if __name__ == '__main__':
     main()

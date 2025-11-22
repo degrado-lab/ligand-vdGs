@@ -523,7 +523,6 @@ def get_AA_and_CA_coords(prody_obj, current_resindex):
       # Ensure shape is (3,)
       CA_coords = np.asarray(CA_coords, dtype=float).reshape(3,)
    except Exception:
-      # print warning and be specific about error
       print(f'[WARNING] Could not resolve CA for resindex {current_resindex} in '
             f'{prody_obj.getTitle()}. Defaulting to AA="X".')
       return 'X', np.array([np.nan, np.nan, np.nan])
@@ -826,6 +825,12 @@ def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_c
          continue
       (cent_cg_coords, cent_cg_vdmbb_coords, cent_flankbb_coords, cent_pdbpath, 
        cent_scrr_cg_perm, cent_pr_obj) = data
+      
+      scrrs, _ = cent_scrr_cg_perm
+      if len(scrrs) != len(reordered_AAs):
+          print(f"[WARNING] centroid scrr length {len(scrrs)} != size_subset "
+                f"{len(reordered_AAs)} for AA set {reordered_AAs} in {cent_pdbpath}")
+      
       cent_pdb_outpath = get_clus_pdb_outpath(clusnum, clusnum_dir, cent_pdbpath, 
                                   cent_scrr_cg_perm, centroid_ind, is_centroid=True)
 
@@ -876,6 +881,11 @@ def write_out_clusters(clusdir, clus_assignments, centroid_assignments, all_cg_c
             (clusmem_cg_coords, clusmem_cg_vdmbb_coords, clusmem_flankbb_coords,
              clusmem_pdbpath, clusmem_scrr_cg_perm, clusmem_pr_obj) = mem_data
 
+            scrrs, _ = clusmem_scrr_cg_perm
+            if len(scrrs) != len(reordered_AAs):
+               print(f"[WARNING] mem scrr length {len(scrrs)} != size_subset "
+                     f"{len(reordered_AAs)} for set {reordered_AAs} in {clusmem_pdbpath}")
+            
             clusmem_pdb_outpath = get_clus_pdb_outpath(
                clusnum, clusnum_dir, clusmem_pdbpath, clusmem_scrr_cg_perm, ind, 
                is_centroid=False)
@@ -1128,9 +1138,10 @@ def reassign_temp_clusters(pruned_clusters):
 
 def get_pr_obj_to_print(clusmem_pdbpath, vdg_scrr_cg_perm,
                         num_flanking, atomgroup_dict):
-    exceptions = []  # collect all exceptions we hit
 
-    for attempt in range(6):  # 1 initial try + 5 retries
+    exceptions = set()  # collect unique exception messages
+
+    for attempt in range(6): # 1 initial attempt + 5 retries
         try:
             # Use cache only if enabled AND the key is present
             if _ATOMGROUP_CACHE_MAXSIZE > 0 and clusmem_pdbpath in atomgroup_dict:
@@ -1146,14 +1157,17 @@ def get_pr_obj_to_print(clusmem_pdbpath, vdg_scrr_cg_perm,
                             pass
                     atomgroup_dict[clusmem_pdbpath] = par
 
-            # if we got here, it worked
-            return par
+            return par  # success
 
         except Exception as e:
-            if attempt < 5:  # still have retries left
+            exceptions.add(str(e))  # record unique exception message
+
+            if attempt < 5:
                 time.sleep(30)
             else:
-                print(f"[WARNING] get_pr_obj_to_print failed on {clusmem_pdbpath}")
+                print(f"\t[WARNING] get_pr_obj_to_print failed on {clusmem_pdbpath}.")
+                for msg in exceptions:
+                    print(f"\t\tException: {msg}")
                 return None
 
 def add_flank_obj_for_cluslevel_flank(par, vdm_scrr, num_flanking, pdbpath):
@@ -1311,11 +1325,18 @@ def flatten_flanking_seqs(flankingCAs_clus_flankingseqs):
    return flattened_flankingseqs_for_vdgs_in_flankingCA_clus
 
 def reset_occs(pr_obj_copy, scrrs):
-   # Set occupancies so that only the vdMs being clustered are 2.0
-   pr_obj_copy.protein.setOccupancies(1.0) # reset protein only; don't touch ligand
+   """
+   Reset all residues to 1.0. 
+   Assign 2.0 to only the vdMs being clustered (in scrr_list).
+   """
+   
+   vdm_sel = pr_obj_copy.select('(occupancy > 1.8) and (occupancy < 2.2)')
+   if vdm_sel is not None:
+      vdm_sel.setOccupancies(1.0)
+
    scrr_list, perm = scrrs
-   for scrr in scrr_list: 
-      seg, chain, resnum, resname = scrr
+
+   for seg, chain, resnum, resname in scrr_list:
       if resnum < 0:
          res_sel = f'resnum `{resnum}`'
       else:
@@ -1324,9 +1345,12 @@ def reset_occs(pr_obj_copy, scrrs):
          sel = f'chain {chain} and {res_sel} and resname {resname}'
       else:
          sel = f'segname {seg} and chain {chain} and {res_sel} and resname {resname}'
-      
+
       target = pr_obj_copy.select(sel)
       if target is not None:
-          target.setOccupancies(2.0)
+         target.setOccupancies(2.0)
+      else:
+         print('[WARNING] reset_occs: no atoms matched', sel, 'in',
+               pr_obj_copy.getTitle())
 
    return pr_obj_copy

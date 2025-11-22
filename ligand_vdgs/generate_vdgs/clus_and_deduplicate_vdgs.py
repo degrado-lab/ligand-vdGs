@@ -402,7 +402,7 @@ def main():
            shutil.rmtree(stream_dir)
    except Exception as _e:
        with open(logfile, 'a') as f:
-           f.write(f'\t[STREAM WARNING]: failed to remove {stream_dir}: {_e}\n')
+           f.write(f'\t[STREAM WARNING]: Failed to remove {stream_dir}: {_e}\n')
    
    # Clean up the entire output from clus_and_deduplicate_vdgs.py. The final stage of 
    # clustering can be preserved using the --keep-clustered-pdbs flag. The retained 
@@ -618,7 +618,7 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
       if len(failed_pdbs) > 0:
          with open(logfile, 'a') as file:
             for fail in failed_pdbs:
-               file.write(f'\tFailed to parse {fail}.\n')
+               file.write(f'\t[WARNING] Failed to parse {fail}.\n')
                file.flush()
                os.fsync(file.fileno()) # force os flush b/c of lag
 

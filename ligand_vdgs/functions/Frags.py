@@ -1,12 +1,11 @@
+import os
 import re
-import tempfile
+import io
 from rdkit import Chem
 from rdkit.Chem import AllChem
-import prody as pr
-import os
-import utils
 from collections import defaultdict
-import traceback
+import prody as pr
+import utils
 
 def get_fragments(bond_radius, mol, min_frag_size=4, max_frag_size=7, quiet=True): 
     # Decompose the ligand into fragments and store the fragment SMILES. Use SMILES 
@@ -171,13 +170,6 @@ def manually_remove_Hs(orig_substruct, return_single_mol_or_perms):
     'perms' (when processing frags). '''
     # Remove hydrogens. RDKit docs say that Chem.RemoveHs() implicit and explicit are removed, 
     # but this isn't true for [nH], [OH], [Ho], etc. so need to manually remove H's. 
-    # Convert back to SMILES, without showing explicit hydrogens
-    try:
-        smiles_w_H = Chem.MolToSmiles(orig_substruct, allHsExplicit=False, 
-                              isomericSmiles=False) # still has H's though unfortunately
-    except:
-        return None
-    
     # First, export SMILES *with explicit Hs shown* so that patterns like [NH3+] are present, 
     # then regex-strip bracket hydrogens while keeping charge and other annotations.
     smiles_w_H = Chem.MolToSmiles(orig_substruct, allHsExplicit=True, 
@@ -213,7 +205,6 @@ def manually_remove_Hs(orig_substruct, return_single_mol_or_perms):
         except:
             continue
         cg_atom_perms.append((renumbered_substruct, perm_inds))
-        elements_list = [atom.GetSymbol() for atom in renumbered_substruct.GetAtoms()]
     if len(cg_atom_perms) == 0:
         return None
     if return_single_mol_or_perms == 'single':
@@ -247,14 +238,16 @@ def is_organic(mol):
 def get_frags_from_pdbfile(pdbfile, lig_smiles, quiet=False): 
     if pdbfile.endswith('.pdb') or pdbfile.endswith('.pdb.gz'):
         query_struct = pr.parsePDB(pdbfile)
+    elif pdbfile.endswith('.cif'):
+        query_struct = pr.parseCIF(pdbfile)
     # Identify ligand and fragment it
     hetatms = query_struct.hetatm.select('not (ion or resname SEP or resname TPO or resname MSE)')
     assert len(set(hetatms.getResindices())) == 1
     # Convert from prody obj to rdkit Mol obj
-    with tempfile.NamedTemporaryFile(suffix=".pdb", delete=False) as tmp_pdb:
-        pr.writePDB(tmp_pdb.name, hetatms)
-    
-    pdb_mol = Chem.MolFromPDBFile(tmp_pdb.name, removeHs=True)
+    buf = io.StringIO()
+    pr.writePDBStream(buf, hetatms)
+    pdb_block = buf.getvalue()
+    pdb_mol = Chem.MolFromPDBBlock(pdb_block, removeHs=True)
     lig_template = Chem.MolFromSmiles(lig_smiles) 
     # Assign bond orders (b/c rdkit doesn't calculate this from PDB coords) to detect 
     # correct valence and aromaticity 
@@ -282,7 +275,6 @@ def summarize_frags(frags_in_lib, frags_to_exclude, frags_to_include):
     groups = {
         "Excluded": [],
         "Not in include list": [],
-        "Not searched": [],
         "Not in vdg lib or incomplete": [],
         "In vdg lib and in include list": []}
 
