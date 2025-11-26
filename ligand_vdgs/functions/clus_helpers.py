@@ -3,6 +3,7 @@ import numpy as np
 import prody as pr
 from itertools import permutations, product, combinations
 from numba import njit
+import hashlib
 
 def get_vdg_AA_permutations(reordered_AAs, _vdgs):
     permuted_indices = permute_AA_duplicates(reordered_AAs)
@@ -451,4 +452,59 @@ def select_diverse_subset_greedy(data, k):
 
    return selected
 
+def _stream_root(vdglib_dir):
+    # Root for AA composition streaming buckets.
+    # Tries $TMPDIR, /scratch, /tmp, and vdglib_dir as fallback.
+    user = os.environ.get("USER") or getpass.getuser() or "unknown"
+    vdglib_tag = os.path.basename(os.path.abspath(vdglib_dir.rstrip(os.sep)))
+    tmpdir_env = os.environ.get("TMPDIR")
+    if tmpdir_env:
+        root = os.path.join(tmpdir_env, f"vdg_stream_{vdglib_tag}")
+    elif os.path.isdir("/scratch"):
+        root = os.path.join("/scratch", user, f"vdg_stream_{vdglib_tag}")
+    elif os.path.isdir("/tmp"):
+        root = os.path.join("/tmp", user, f"vdg_stream_{vdglib_tag}")
+    else:
+        root = os.path.join(vdglib_dir, "stream_tmp")
+    os.makedirs(root, exist_ok=True)
+    return root
 
+def _aa_tmp_dir(vdglib_dir, size_subset):
+    # Write per-AA-bucket records to disk to free memory
+    return os.path.join(_stream_root(vdglib_dir), str(size_subset))
+
+def _aa_tmp_path(vdglib_dir, size_subset, aa_key):
+    # AA bucket file name is based on AA key plus a short SHA1 suffix
+    h = hashlib.sha1(aa_key.encode()).hexdigest()[:16]
+    fname = f"{aa_key[:80]}__{h}.jsonl.gz"
+    return os.path.join(_aa_tmp_dir(vdglib_dir, size_subset), fname)
+
+def normalize_rmsd(num_atoms, atoms):
+    ''' Return a size-normalized RMSD threshold (Å) for the given atom set
+    ('cgvdmbb' or 'flankbb'). The threshold scales linearly with the number
+    of atoms between 8 and 15:
+        flankbb: 0.5 Å → 1.5 Å
+        cgvdmbb: 0.5 Å → 1.0 Å
+    Below 8 atoms, use the minimum; above 15, use the maximum.
+    '''
+
+    if atoms == 'flankbb':
+        max_threshold = 1.5
+        min_threshold = 0.5
+    elif atoms == 'cgvdmbb':
+        max_threshold = 1.0
+        min_threshold = 0.5
+    else:
+        raise ValueError(f"Unknown atom set for normalize_rmsd: {atoms}")
+
+    min_atoms = 8
+    max_atoms = 15
+
+    if num_atoms < min_atoms:
+        return min_threshold
+    if num_atoms > max_atoms:
+        return max_threshold
+
+    scaling_factor = (num_atoms - min_atoms) / (max_atoms - min_atoms)
+    threshold = min_threshold + scaling_factor * (max_threshold - min_threshold)
+    return threshold

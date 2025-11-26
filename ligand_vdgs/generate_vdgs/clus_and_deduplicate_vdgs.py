@@ -18,9 +18,10 @@ A vdG is considered redundant if it meets both criteria after clustering:
 Workflow Overview
 
 1. **Scan & stream**  
-   Parse each PDB, extract vdGs, and write AA-combo buckets to disk (JSONL gzip).
-   Each record is a vdG environment (CG + vdM backbone + flanking seq/CA) written
-   to a per–AA–composition bucket file in scratch.
+   For each fingerprint environment, reconstruct the local vdG AtomGroup from the 
+   parent PDB, extract vdGs (CG + vdM backbone + flanking seq/CA), and write AA-combo 
+   buckets to disk (JSONL gzip). Each record is a vdG environment written to a 
+   per–AA–composition bucket file in scratch.
 
 2. **Primary clustering (pose)**  
    Within each AA bucket, cluster on RMSD of [CG + vdM backbone] using a size-scaled cutoff.
@@ -48,15 +49,27 @@ import shutil
 import numpy as np
 import prody as pr
 import multiprocessing as mp
-import json, gzip, hashlib
+import json, gzip
 import traceback
-import getpass
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'functions'))
+import pickle
+def add_paths():
+    here = os.path.dirname(os.path.abspath(__file__))
+    paths = [
+        os.path.join(here, "..", "functions"),
+        os.path.join(here, "..", "..", "external", "vdG-miner", "vdg_miner", "programs"),
+        os.path.join(here, "..", "..", "external", "vdG-miner", "vdg_miner"),]
+    for p in paths:
+        p = os.path.abspath(p)
+        if p not in sys.path:
+            sys.path.append(p)
+add_paths()
 import align_and_cluster as clust
-import utils
 from clus_helpers import (get_vdg_AA_permutations, combine_cg_and_vdmbb_coords, 
    flatten_flanking_seqs, flatten_flanking_CAs, get_cg_coords, get_vdg_subsets, 
-   select_diverse_pdbIDs)
+   select_diverse_pdbIDs, _stream_root, _aa_tmp_dir, _aa_tmp_path, normalize_rmsd,)
+from fingerprint_helpers import (_pick_atom_by_com, log_warning,
+    align_coords_sanity_check, _resolve_duplicate_ligand_occupancies)
+from constants import cg_atoms
 
 def parse_args():
    parser = argparse.ArgumentParser()
@@ -64,6 +77,14 @@ def parse_args():
                        help="SMARTS pattern of the fragment/CG/FG. Informational only.")
    parser.add_argument('-v', "--vdglib-dir", type=str, required=True,
                        help="Directory for the vdms of this CG.")
+   parser.add_argument('-P', "--pdb-dir", type=str, required=True,
+                       help="Parent PDB database directory (RCSB-style mirror).")
+   parser.add_argument('-F', "--fingerprints-dir", type=str, required=True,
+                       help="Directory containing fingerprints/ produced by "
+                            "generate_fingerprints.py (the fp_out_root).")
+   parser.add_argument('--cg-match-dict-pkl', type=str,
+                       help="Path to the pickled CG match dictionary if the CG "
+                            "is not proteinaceous (output from smarts_to_cgs.py).")
    parser.add_argument('-w', "--align-cg-weight", type=float, default=0.99, 
                        help="Weight assigned to CG atoms when superposing output vdGs "
                        "(not for clustering). Example: 0.5 assigns half of the weight " 
@@ -93,33 +114,6 @@ def parse_args():
                        help="Number of AA composition buckets to run concurrently.")
    return parser.parse_args()
 
-def _stream_root(vdglib_dir):
-    # Root for AA composition streaming buckets.
-    # Tries $TMPDIR, /scratch, /tmp, and vdglib_dir as fallback.
-    user = os.environ.get("USER") or getpass.getuser() or "unknown"
-    vdglib_tag = os.path.basename(os.path.abspath(vdglib_dir.rstrip(os.sep)))
-    tmpdir_env = os.environ.get("TMPDIR")
-    if tmpdir_env:
-        root = os.path.join(tmpdir_env, f"vdg_stream_{vdglib_tag}")
-    elif os.path.isdir("/scratch"):
-        root = os.path.join("/scratch", user, f"vdg_stream_{vdglib_tag}")
-    elif os.path.isdir("/tmp"):
-        root = os.path.join("/tmp", user, f"vdg_stream_{vdglib_tag}")
-    else:
-        root = os.path.join(vdglib_dir, "stream_tmp")
-    os.makedirs(root, exist_ok=True)
-    return root
-
-def _aa_tmp_dir(vdglib_dir, size_subset):
-    # Write per-AA-bucket records to disk to free memory
-    return os.path.join(_stream_root(vdglib_dir), str(size_subset))
-
-def _aa_tmp_path(vdglib_dir, size_subset, aa_key):
-    # AA bucket file name is based on AA key plus a short SHA1 suffix
-    h = hashlib.sha1(aa_key.encode()).hexdigest()[:16]
-    fname = f"{aa_key[:80]}__{h}.jsonl.gz"
-    return os.path.join(_aa_tmp_dir(vdglib_dir, size_subset), fname)
-
 def _spill_record(vdglib_dir, size_subset, reordered_aas, record):
     '''
     Append one vdG record to its AA bucket file (gzip JSONL).
@@ -130,7 +124,7 @@ def _spill_record(vdglib_dir, size_subset, reordered_aas, record):
           "bbcoords":  [ [[Nx,Ny,Nz],[CAx,CAy,CAz],[Cx,Cy,Cz]],  ... ],
           "flankseqs": [ ["-2AA","-1AA","vdm","+1AA","+2AA"], ... ],
           "flankCAs":  [ [[x,y,z],...], ... ],
-          "pdbpath":   "vdg pdb path",
+          "pdbpath":   "source identifier (e.g. biounit_envID)",
           "scrr":      [ [seg, chain, resnum, resname], ... ]
         }
     '''
@@ -188,12 +182,12 @@ def _extract_env(all_cg_coords, all_vdmbb_coords, all_flankseqs, all_flankCAs,
             "scrr": scrrs,}
 
 def _bucket_npz_path(vdglib_dir, size_subset, reordered_AAs):
+    # Place each AA bucket's npz in nr_vdgs/<size_subset>/<AA_bucket>.npz
     aa_label = "_".join(reordered_AAs)
     nr_root = os.path.join(vdglib_dir, "nr_vdgs")
     size_dir = os.path.join(nr_root, str(size_subset))
-    aa_dir = os.path.join(size_dir, aa_label)
-    os.makedirs(aa_dir, exist_ok=True)
-    return os.path.join(aa_dir, f"{aa_label}.npz")
+    os.makedirs(size_dir, exist_ok=True)
+    return os.path.join(size_dir, f"{aa_label}.npz")
 
 def _write_bucket_npz(vdglib_dir, size_subset, reordered_AAs, clusters):
     """
@@ -428,9 +422,14 @@ def _run_one_bucket_strict(args):
          all_AA_perm_vdm_scrr) = get_vdg_AA_permutations(reordered_AAs, _vdgs)
 
         (all_cg_coords, all_vdmbb_coords, all_flankseqs, all_flankCAs, all_pdbpaths,
-         all_scrr_cg_perm) = clust.get_vdg_AA_and_cg_perms(all_AA_perm_cg_coords,
-         all_AA_perm_vdm_bbcoords, all_AA_perm_flankingseqs, all_AA_perm_flankingCAs,
-         all_AA_perm_pdbpaths, all_AA_perm_vdm_scrr, symmetry_classes,)
+         all_scrr_cg_perm) = clust.get_vdg_AA_and_cg_perms(
+            all_AA_perm_cg_coords,
+            all_AA_perm_vdm_bbcoords,
+            all_AA_perm_flankingseqs,
+            all_AA_perm_flankingCAs,
+            all_AA_perm_pdbpaths,
+            all_AA_perm_vdm_scrr,
+            symmetry_classes,)
 
         # Combined coordinates + flattened flanking info for clustering.
         all_cgvdmbb_coords = combine_cg_and_vdmbb_coords(
@@ -481,10 +480,12 @@ def _run_one_bucket_strict(args):
                 [clus_flat_flankseqs, clus_flat_flankCAs],
                 ['flankseq', 'flankbb'],)
 
-            flankingseq_and_bb_cluster_assignments, flankingseq_and_bb_clus_centroids = \
-                clust.get_leader_clusters(flankseq_and_bb_to_clus, 
+            (flankingseq_and_bb_cluster_assignments,
+             flankingseq_and_bb_clus_centroids) = clust.get_leader_clusters(
+                flankseq_and_bb_to_clus, 
                 flankseq_and_bb_thresh, reordered_AAs_str, len(reordered_AAs), 
-                vdglib_dir, final_exact_medoid_pass=True, final_reassign_once=True,)
+                vdglib_dir, final_exact_medoid_pass=True,
+                final_reassign_once=True,)
 
             # Each Stage 2 cluster = final vdG cluster.
             for sub_clus_num, local_indices in \
@@ -508,13 +509,17 @@ def _run_one_bucket_strict(args):
                 # Cap at 29 stored members per cluster
                 member_global_indices = member_global_indices[:29]
 
-                centroid_env = _extract_env(all_cg_coords, all_vdmbb_coords,
+                centroid_env = _extract_env(
+                    all_cg_coords, all_vdmbb_coords,
                     all_flankseqs, all_flankCAs, all_pdbpaths, all_scrr_cg_perm,
                     global_centroid_idx,)
 
-                member_envs = [_extract_env(all_cg_coords, all_vdmbb_coords,
-                    all_flankseqs, all_flankCAs, all_pdbpaths, all_scrr_cg_perm,
-                    g_idx,) for g_idx in member_global_indices]
+                member_envs = [
+                    _extract_env(
+                        all_cg_coords, all_vdmbb_coords,
+                        all_flankseqs, all_flankCAs, all_pdbpaths,
+                        all_scrr_cg_perm, g_idx,)
+                    for g_idx in member_global_indices]
 
                 clusters_out.append({
                     "cluster_id": cluster_counter,
@@ -537,35 +542,143 @@ def _run_one_bucket_strict(args):
             f"[WORKER ERROR] AA bucket: {aa_label}\n"
             f"Exception: {e}\nTraceback:\n{tb}")
 
-def normalize_rmsd(num_atoms, atoms):
-    ''' Return a size-normalized RMSD threshold (Å) for the given atom set
-    ('cgvdmbb' or 'flankbb'). The threshold scales linearly with the number
-    of atoms between 8 and 15:
-        flankbb: 0.5 Å → 1.5 Å
-        cgvdmbb: 0.5 Å → 1.0 Å
-    Below 8 atoms, use the minimum; above 15, use the maximum.
-    '''
+def _get_atomgroup_for_env(environment, pdb_dir, cg, cg_match_dict,
+                           align_atoms, logfile):
+    #Reconstruct the local environment AtomGroup for one fingerprint environment.
+    biounit = environment[0][0]
+    middle_two = biounit[1:3].lower()
+    pdb_file = os.path.join(pdb_dir, middle_two, biounit + '.pdb')
 
-    if atoms == 'flankbb':
-        max_threshold = 1.5
-        min_threshold = 0.5
-    elif atoms == 'cgvdmbb':
-        max_threshold = 1.0
-        min_threshold = 0.5
-    else:
-        raise ValueError(f"Unknown atom set for normalize_rmsd: {atoms}")
+    whole_struct = pr.parsePDB(pdb_file)
 
-    min_atoms = 8
-    max_atoms = 15
+    scrs = [(tup[1], tup[2], '`{}`'.format(tup[3])) if tup[3] < 0 else 
+            (tup[1], tup[2], tup[3]) for tup in environment]
+    selstr_template = '(segment {} and chain {} and resnum {})'
+    selstr_template_noseg = '(chain {} and resnum {})'
+    selstrs = [selstr_template.format(*scr) if len(scr[0]) else
+               selstr_template_noseg.format(*scr[1:]) for scr in scrs]
+    sel = whole_struct.select(
+        'same residue as within 5 of ({})'.format(' or '.join(selstrs[1:])))
+    if sel is None:  # neighborhood selection empty; skip environment
+        return None, None, None
+    struct = sel.toAtomGroup()
+    resnames = []
+    align_coords = np.zeros((3, 3))
 
-    if num_atoms < min_atoms:
-        return min_threshold
-    if num_atoms > max_atoms:
-        return max_threshold
+    # Track how many distinct residues we actually map each environment SCR to.
+    for i, (scr, selstr) in enumerate(zip(scrs, selstrs)):
+        try:
+            substruct = struct.select(selstr)
+            if substruct is None:  # selection empty; skip env
+                return None, None, None
+            resnames.append(substruct.getResnames()[0])
 
-    scaling_factor = (num_atoms - min_atoms) / (max_atoms - min_atoms)
-    threshold = min_threshold + scaling_factor * (max_threshold - min_threshold)
-    return threshold
+            # Count unique residue indices for this SCR selection to detect duplication.
+            unique_res_indices = np.unique(substruct.getResindices())
+            if len(unique_res_indices) != 1:
+                log_warning(
+                    f'[WARNING] Ambiguous residue selection in {biounit} chain {scr[1]} '
+                    f'resnum {scr[2]} (maps to >1 residue); skipping environment.\n',
+                    logfile,)
+                return None, None, None
+
+            if i == 0:
+                if cg in cg_atoms.keys():
+                    atom_names_list = cg_atoms[cg][resnames[0]]
+                else:
+                    key = (biounit, scrs[0][0], scrs[0][1],
+                           str(scrs[0][2]), resnames[0])
+
+                    match_list = cg_match_dict.get(key)
+                    match_idx = environment[0][4] - 1  # 1-based index in env --> 0-based
+
+                    if match_list is None:  # no CG match; possibly missing density; skip
+                        return None, None, None
+
+                    if not (0 <= match_idx < len(match_list)):  # out of range; possibly 
+                                                                 # obabel issue; skip
+                        return None, None, None
+
+                    atom_names_list = match_list[match_idx]
+ 
+                # Two-pass selection for CG atoms with ambiguity (a PDB with >2 atoms 
+                # of the same CG atom name in the same residue)
+                cg_atom_selstrs = ['name ' + atom_name for atom_name in atom_names_list]
+
+                # First pass: collect selections and record non-ambiguous atoms
+                sel_list = []
+                unambig_atoms = []  # atoms with a single unique match
+
+                for j, cg_selstr in enumerate(cg_atom_selstrs):
+                    atom_sel = substruct.select(cg_selstr)
+
+                    if atom_sel is None or atom_sel.numAtoms() == 0:  # no atoms; skip
+                        return None, None, None
+
+                    sel_list.append(atom_sel)
+                    if atom_sel.numAtoms() == 1:
+                        unambig_atoms.append(atom_sel[0])
+
+                # Compute COM over all unambiguous CG atoms in case they're needed for 
+                # disambiguation of atom names belonging to >1 atom
+                com = None
+                if len(unambig_atoms) > 0:
+                    coords_list = []
+                    for a in unambig_atoms:
+                        c = np.asarray(a.getCoords())
+                        # ProDy may return shape (3,) or (1, 3); normalize
+                        c = c[0] if c.ndim == 2 else c
+                        coords_list.append(c)
+                    com = np.mean(coords_list, axis=0)
+
+                for j, atom_sel in enumerate(sel_list):
+                    atom_name = atom_names_list[j]
+                    candidates = [atom for atom in atom_sel]
+                    resname = resnames[0]
+                    chain = scrs[0][1]
+                    resnum = scrs[0][2]
+
+                    chosen_atom = _pick_atom_by_com(
+                        candidates, com, biounit, resname, chain, resnum, atom_name)
+
+                    # If COM check failed (e.g., best_dist > 8 Å), skip this environment.
+                    if chosen_atom is None:
+                        return None, None, None
+
+                    # Set the CG-encoding occupancy for this chosen atom
+                    chosen_atom.setOccupancy(3.0 + j * 0.1)
+
+                    # Fill alignment coordinates for the chosen CG atoms
+                    if j in align_atoms:
+                        c = np.asarray(chosen_atom.getCoords())
+                        c = c[0] if c.ndim == 2 else c
+                        align_coords[align_atoms.index(j)] = c
+
+            else:
+                # Non-CG residues: mark them differently
+                substruct.setOccupancies(2.0)
+
+        except Exception:
+            # Environment skipped due to exception in selection processing.
+            return None, None, None
+
+    # Build local frame from align_coords
+    if not align_coords_sanity_check(align_coords):  # returns T or F
+        # Environment skipped: degenerate local frame.
+        return None, None, None
+
+    d01 = align_coords[0] - align_coords[1]
+    d21 = align_coords[2] - align_coords[1]
+    e01 = d01 / np.linalg.norm(d01)
+    e21 = d21 / np.linalg.norm(d21)
+    e1 = (e01 + e21) / np.linalg.norm(e01 + e21)
+    e3 = np.cross(e01, e21) / np.linalg.norm(np.cross(e01, e21))
+    e2 = np.cross(e3, e1)
+    R = np.array([e1, e2, e3])
+    t = align_coords[1]
+    coords_transformed = np.dot(struct.getCoords() - t, R.T)
+    struct.setCoords(coords_transformed)
+    return struct, resnames, whole_struct
 
 def main():
     start_time = time.time()
@@ -580,68 +693,119 @@ def main():
     max_num_to_clus = args.max_num_vdgs_to_clus
     logfile = args.logfile
     align_cg_weight = args.align_cg_weight
+    pdb_dir = args.pdb_dir
+    fingerprints_root = args.fingerprints_dir
+    cg_match_dict_pkl = args.cg_match_dict_pkl
 
     if align_cg_weight < 0 or align_cg_weight > 1:
         raise ValueError('align_cg_weight must be a float between 0 and 1.')
 
     vdglib_dir = args.vdglib_dir
-    vdg_pdbs_dir = os.path.join(vdglib_dir, 'vdg_pdbs')
-    if not os.path.isdir(vdg_pdbs_dir):
-        sys.exit(f"[ERROR] Missing directory: {vdg_pdbs_dir}")
     out_dir = os.path.join(vdglib_dir, 'nr_vdgs')
 
-    # Iterate over the PDBs and CGs that were identified as containing the SMARTS group.
-    # Spill each AA bucket to disk instead of holding all in memory.
-    vdg_pdbs_in_dir = sorted(os.listdir(vdg_pdbs_dir))
-    for pdbname in vdg_pdbs_in_dir:
-        pdbpath = os.path.join(vdg_pdbs_dir, pdbname)
-        try:
-            prody_obj = pr.parsePDB(pdbpath)
-        except Exception:
-            with open(logfile, 'a') as file:
-                file.write(f"Could not parse {pdbpath} \n")
+    # Load CG match dict for non-proteinaceous CGs (if applicable).
+    if cg_match_dict_pkl is not None:
+        with open(cg_match_dict_pkl, 'rb') as f:
+            cg_match_dict = pickle.load(f)
+    else:
+        cg_match_dict = {}
+
+    # Deterministic align-atom order (as in fingerprints_to_pdbs.py)
+    align_atoms = [1, 0, 2]  # arbitrary, b/c they'll be re-aligned in clustering
+
+    # Scan fingerprints: reconstruct vdG environments and stream to AA buckets.
+    fingerprints_dir = os.path.join(fingerprints_root, "fingerprints")
+    if not os.path.isdir(fingerprints_dir):
+        sys.exit(f"[ERROR] Missing fingerprints dir: {fingerprints_dir}")
+
+    num_environments_attempted = 0
+
+    # Build a deterministic, sorted list of input fingerprint files.
+    all_fp_files = []
+    for subdir in sorted(os.listdir(fingerprints_dir)):
+        if '.txt' in subdir:
+            continue
+        full = os.path.join(fingerprints_dir, subdir)
+        if not os.path.isdir(full):
+            continue
+        for file in sorted(os.listdir(full)):
+            if file.endswith('_fingerprints.npy'):
+                all_fp_files.append((subdir, file))
+
+    # Iterate over all fingerprint sets; for each environment, reconstruct the local
+    # AtomGroup, extract vdGs of size `size_subset`, and stream them to AA buckets.
+    for subdir, file in all_fp_files:
+        env_path = os.path.join(
+            fingerprints_dir, subdir,
+            file.replace('_fingerprints.npy', '_environments.txt'))
+        if not os.path.isfile(env_path):
             continue
 
-        cg_coords = get_cg_coords(prody_obj, pdbpath)
-        if cg_coords is None:  # already logged reason inside get_cg_coords()
-            continue
+        with open(env_path, 'r') as f_env:
+            for env_idx, line in enumerate(f_env):
+                environment = eval(line.strip())
+                num_environments_attempted += 1
 
-        # Define symmetry class if it's None so it's compatible with downstream
-        # CG-labelling logic (informational; clustering is orientation-invariant).
-        if symmetry_classes is None:
-            symmetry_classes = [i for i in range(len(cg_coords))]  # global mutation intentional
+                # This is the identifier we used previously for vdg_pdbs filenames.
+                pdb_name = '_'.join([str(el) for el in environment[0]])
+                pdb_label = pdb_name  # used as "pdbpath" string for downstream code
 
-        # Characterize the vdM residues (bb coords, flanking residues, pdb paths, etc.)
-        vdms_dict = clust.get_vdm_res_features(prody_obj, pdbpath, num_flanking)
+                # Reconstruct local environment AtomGroup aligned in CG frame.
+                atomgroup, resnames, _ = _get_atomgroup_for_env(
+                    environment, pdb_dir, CG, cg_match_dict, align_atoms, logfile)
+                if atomgroup is None:
+                    continue
 
-        # Determine the vdM combinations, up to size_subset residues.
-        vdm_resinds = list(vdms_dict.keys())
-        vdg_subsets = get_vdg_subsets(vdm_resinds, size_subset)
+                # Resolve duplicate ligand occupancies using COM; skip env if it
+                # cannot be resolved into a clean CG encoding.
+                atomgroup = _resolve_duplicate_ligand_occupancies(atomgroup, pdb_label)
+                if atomgroup is None:
+                    continue
 
-        # Iterate over subsets of residue indices
-        for vdg_subset in vdg_subsets:
-            # Record these features in the same order as in vdg_subset. Then, sort all
-            # based on alphabetical order of the vdM AAs. If you find a bb-only vdM,
-            # assign the vdM resname as "bb".
-            (re_ordered_aas, re_ordered_bbcoords, re_ordered_flankingseqs,
-             re_ordered_CAs, re_ordered_scrr) = clust.reorder_vdg_subset(vdg_subset,
-             vdms_dict, prody_obj.select('occupancy > 2.9 and not element H'),
-             prody_obj,)  # exclude H when determining bb vs sc vdM
+                # Extract CG coordinates from the environment AtomGroup.
+                cg_coords = get_cg_coords(atomgroup, pdb_label)
+                if cg_coords is None:  # already logged reason inside get_cg_coords()
+                    continue
 
-            # AA bucket stream: spill a single vdG record to its AA-bucket file on disk.
-            rec = {"cg_coords": np.asarray(cg_coords).tolist(),
-                   "bbcoords": [np.asarray(x).tolist() for x in re_ordered_bbcoords],
-                   "flankseqs": re_ordered_flankingseqs,
-                   "flankCAs": [np.asarray(x).tolist() for x in re_ordered_CAs],
-                   "pdbpath": str(pdbpath),
-                   "scrr": [[str(s), str(ch), int(r), str(rn)]
-                            for (s, ch, r, rn) in re_ordered_scrr],}
+                # Define symmetry class if it's None so it's compatible with downstream
+                # CG-labelling logic (informational; clustering is orientation-invariant).
+                if symmetry_classes is None:
+                    symmetry_classes = [i for i in range(len(cg_coords))]  # global mutation intentional
 
-            _spill_record(vdglib_dir, size_subset, re_ordered_aas, rec)
+                # Characterize the vdM residues (bb coords, flanking residues, etc.)
+                vdms_dict = clust.get_vdm_res_features(atomgroup, pdb_label, num_flanking)
+
+                # Determine the vdM combinations, up to size_subset residues.
+                vdm_resinds = list(vdms_dict.keys())
+                vdg_subsets = get_vdg_subsets(vdm_resinds, size_subset)
+
+                # Iterate over subsets of residue indices
+                for vdg_subset in vdg_subsets:
+                    # Record these features in the same order as in vdg_subset. Then, sort all
+                    # based on alphabetical order of the vdM AAs. If you find a bb-only vdM,
+                    # assign the vdM resname as "bb".
+                    (re_ordered_aas, re_ordered_bbcoords, re_ordered_flankingseqs,
+                     re_ordered_CAs, re_ordered_scrr) = clust.reorder_vdg_subset(
+                        vdg_subset,
+                        vdms_dict,
+                        atomgroup.select('occupancy > 2.9 and not element H'),
+                        atomgroup,)  # exclude H when determining bb vs sc vdM
+
+                    # AA bucket stream: spill a single vdG record to its AA-bucket file on disk.
+                    rec = {
+                        "cg_coords": np.asarray(cg_coords).tolist(),
+                        "bbcoords": [np.asarray(x).tolist() for x in re_ordered_bbcoords],
+                        "flankseqs": re_ordered_flankingseqs,
+                        "flankCAs": [np.asarray(x).tolist() for x in re_ordered_CAs],
+                        "pdbpath": str(pdb_label),
+                        "scrr": [[str(s), str(ch), int(r), str(rn)]
+                                 for (s, ch, r, rn) in re_ordered_scrr],}
+
+                    _spill_record(vdglib_dir, size_subset, re_ordered_aas, rec)
 
     # Evaluate the collection of vdGs of size_subset and determine redundancy.
     # Each per-AA bucket is processed independently in parallel.
-    stream_dir = _aa_tmp_dir(vdglib_dir, size_subset)
+    stream_dir = _aa_tmp_dir(vdglib_dir, size_subset) # $TMPDIR or /scratch
     if not os.path.isdir(stream_dir):
         with open(logfile, 'a') as f:
             f.write(f"\t[STREAM ERROR] No buckets found at {stream_dir}\n")
@@ -681,7 +845,7 @@ def main():
             f.write(f'\t[STREAM WARNING]: Failed to remove {stream_dir}: {_e}\n')
 
     # Delete parent stream_root only if empty (i.e., last -n job).
-    stream_root = _stream_root(vdglib_dir)
+    stream_root = _stream_root(vdglib_dir) # $TMPDIR or /scratch
     try:
         os.rmdir(stream_root)
     except FileNotFoundError:
@@ -695,23 +859,37 @@ def main():
     minutes = int((s % 3600) // 60)
     seconds = round(s % 60, 2)
 
-    num_vdg_pdbs = len(vdg_pdbs_in_dir)
+    # "nonredundant vdGs"  = number of clusters = len(cluster_id)
+    # "input environments" = sum of cluster_size over all clusters
+    vdglib_dir = args.vdglib_dir
+    out_dir = os.path.join(vdglib_dir, "nr_vdgs")
     nr_dir_of_size_subset = os.path.join(out_dir, str(size_subset))
 
-    # Count only centroids (i.e., clusters) as "nonredundant vdGs"
-    num_centroids_of_size_subset = 0
+    num_centroids_of_size_subset = 0   # number of final clusters
+    num_input_envs_of_size_subset = 0  # total members across all clusters
 
     if os.path.isdir(nr_dir_of_size_subset):
-        for aa_label in os.listdir(nr_dir_of_size_subset):
-            aa_dir = os.path.join(nr_dir_of_size_subset, aa_label)
-            npz_path = os.path.join(aa_dir, f"{aa_label}.npz")
+        for fname in os.listdir(nr_dir_of_size_subset):
+            if not fname.endswith(".npz"):
+                continue
+
+            npz_path = os.path.join(nr_dir_of_size_subset, fname)
             if not os.path.isfile(npz_path):
                 continue
+
             try:
                 data = np.load(npz_path)
-                # One centroid per cluster: cluster_id has shape (C,)
-                num_centroids_of_size_subset += data["cluster_id"].shape[0]
+                # One centroid per cluster
+                cluster_ids = data["cluster_id"]
+                cluster_sizes = data["cluster_size"]
+
+                num_centroids_of_size_subset += int(cluster_ids.shape[0])
+                # cluster_size is the number of environments in each cluster
+                num_input_envs_of_size_subset += int(cluster_sizes.sum())
             except Exception:
+                # If anything is wrong with this npz, just skip it and continue.
+                with open(logfile, 'a') as f:
+                    f.write(f'\t[WARNING] Failed to read npz file {npz_path}; skipping.\n')
                 continue
 
     with open(logfile, 'a') as file:
@@ -720,7 +898,8 @@ def main():
             f"in {hours} h, {minutes} mins, and {seconds} secs.\n")
         file.write(
             f"\t{num_centroids_of_size_subset} nonredun. vdgs (cluster centroids) of "
-            f"subset size {size_subset} out of {num_vdg_pdbs} input vdgs.\n")
+            f"subset size {size_subset} from {num_input_envs_of_size_subset} "
+            f"input environments.\n")
 
     current, peak = tracemalloc.get_traced_memory()
     peak_mem = np.round(peak / (1024 * 1024 * 1024), 2)
