@@ -1,3 +1,4 @@
+# clus_and_deduplicate_vdgs.py
 '''
 Removes redundant vdGs from the vdG library.
 A vdG is considered redundant if it meets both criteria after clustering:
@@ -17,7 +18,9 @@ A vdG is considered redundant if it meets both criteria after clustering:
 Workflow Overview
 
 1. **Scan & stream**  
-   Parse each PDB, extract vdGs, and write AA-combo buckets to disk.
+   Parse each PDB, extract vdGs, and write AA-combo buckets to disk (JSONL gzip).
+   Each record is a vdG environment (CG + vdM backbone + flanking seq/CA) written
+   to a per–AA–composition bucket file in scratch.
 
 2. **Primary clustering (pose)**  
    Within each AA bucket, cluster on RMSD of [CG + vdM backbone] using a size-scaled cutoff.
@@ -28,12 +31,13 @@ Workflow Overview
    using the threshold defined above.  The flank window is controlled by `--flank`.
 
 4. **De-duplication & output**  
-   Merge AA/CG-permutation duplicates, retain cluster centroids, and output resulting PDBs.
-   Optionally keep intermediate clustered PDBs.
+   Merge AA/CG-permutation duplicates, and retain cluster centroids and a few additional 
+   cluster members for manual inspection. Cluster centroids are considered nr vdGs.
+   PDBs can be reconstructed later from these output arrays.
 
-5. **Cleanup**  
-   Remove temporary stream and clustering directories.
-'''
+5. **Cleanup**
+   Remove temporary streaming directories.
+''' 
 
 import os
 import sys
@@ -60,9 +64,6 @@ def parse_args():
                        help="SMARTS pattern of the fragment/CG/FG. Informational only.")
    parser.add_argument('-v', "--vdglib-dir", type=str, required=True,
                        help="Directory for the vdms of this CG.")
-   parser.add_argument('-k', "--keep-clustered-pdbs", action='store_true', 
-                       help="Keep the `clusters/flankseq_and_bb/` dir. to keep track of "
-                       "which clusters each nr_pdb came from.")
    parser.add_argument('-w', "--align-cg-weight", type=float, default=0.99, 
                        help="Weight assigned to CG atoms when superposing output vdGs "
                        "(not for clustering). Example: 0.5 assigns half of the weight " 
@@ -84,577 +85,649 @@ def parse_args():
                        "of this arg is for parallelization (running with different "
                        "-n values concurrently).")
    parser.add_argument('-l', "--logfile", type=str, default='log', help="Path to log.")
-   parser.add_argument('-x', "--print-flankbb", action='store_true', 
-                       help="Include flanking bb residues when writing out PDB.")
    parser.add_argument('-m', "--max-num-vdgs-to-clus", default=2500, type=int, 
-                       help="Cap on # samples per AA-composition bucket to cluster.")
+                       help="Cap on # samples per AA-composition bucket to cluster. The cap "
+                       "applies to distinct PDB IDs; a single PDB can still contribute "
+                       "multiple vdGs after this filter.")
    parser.add_argument('--num-procs', type=int, default=10,
                        help="Number of AA composition buckets to run concurrently.")
    return parser.parse_args()
 
-'''
-Characterize all subsets of vdMs within each vdG. First, scan the parent dataset to 
-identify and record all vdGs with the SMARTS pattern.  Each vdG record is immediately 
-written ("spilled") to a temporary, per–AA–composition file on disk rather than stored 
-in memory.  After the scan completes, those per–AA–bucket files are processed 
-independently in parallel: each bucket is loaded, clustered by CG alignment and sequence 
-similarity, and de-duplicated.
-
-Contents of bucket JSONL (one vdG per line): 
-{
-  "cg_coords": [[x,y,z], ...],
-  "bbcoords":  [ [[Nx,Ny,Nz],[CAx,CAy,CAz],[Cx,Cy,Cz]],  ... ],
-  "flankseqs": [ ["-2AA","-1AA","vdm","+1AA","+2AA"], ... ],
-  "flankCAs":  [ [[x,y,z],...], ... ],
-  "pdbpath":   "vdg pdb path",
-  "scrr":      [ [seg, chain, resnum, resname], ... ]
-}
-
-Each record contains several per-vdM lists that are kept strictly index-aligned: (AA 
-identities, vdM backbone coords, flanking sequences, flanking CA coords, and vdM
-identifiers (seg, chain, resnum, resname)). The i-th element across these lists refers 
-to the same vdM residue. When we reorder vdMs (e.g., by AA name) or apply AA/CG 
-permutations, we apply the same permutation to all lists, so downstream clustering can 
-safely match elements by index.
-'''
-
-def _run_one_bucket_strict(args):
-   # Run one AA-composition bucket per process; let any exceptions propagate back to 
-   # parent to hard-fail and abort the entire run instead of being swallowed by the worker
-
-   (bucket_path, seq_sim_thresh, _reordered_AAs, symmetry_classes,
-     vdglib_dir, align_cg_weight, num_flanking, logfile, print_flankbb,
-     max_num_to_clus, keep_clustered_pdbs) = args
-
-   _vdgs = _load_bucket(bucket_path) 
-
-   # Filter out any vdGs with NaN or inf CG coords
-   filtered_vdgs = []
-   for (cg_coords, bbcoords, flankseqs, flankCAs, pdbpath, scrr) in _vdgs:
-      if not np.isfinite(cg_coords).all():
-         with open(logfile, 'a') as f:
-            f.write(f'[WARNING] dropping vdG from {pdbpath} from bucket '
-                    f'{tuple(_reordered_AAs)} due to NaN or inf CG coords.\n')
-         continue
-      filtered_vdgs.append([cg_coords, bbcoords, flankseqs, flankCAs, pdbpath, scrr])
-
-   _vdgs = filtered_vdgs
-
-   # Cluster vdG subsets with identical vdM AA compositions to identify redundancy. 
-   # If there are > max_num_to_clus samples, select only the PDBs with highest PDB ID
-   # diversity. Note that a single PDB can contribute multiple vdGs, so even after  
-   # applying the max_num_to_clus cap (which limits PDBs, not vdGs), the resulting num. 
-   # of vdGs may still exceed max_num_to_clus.
-   if len(_vdgs) > max_num_to_clus:
-      orig_num_vdgs = len(_vdgs)
-      pdbIDs = [z[-2].split('/')[-1][:4] for z in _vdgs]
-      diverse_pdbIDs = select_diverse_pdbIDs(pdbIDs, max_num_to_clus)
-      _vdgs = [z for z in _vdgs if z[-2].split('/')[-1][:4] in diverse_pdbIDs]
-      if orig_num_vdgs != len(_vdgs):
-         with open(logfile, 'a') as file:
-            file.write(f'\tThere are {orig_num_vdgs} vdgs for the {tuple(_reordered_AAs)} '
-               f'subset, so only {len(_vdgs)} vdgs with maximum PDB ID '
-               f'diversity were selected.\n')
-      # Note that len(_vdgs) may be > max_num_to_clus because >1 vdgs might 
-      # belong to the same PDB.
-
-   try:
-      atomgroup_dict = {} # {pdb_path: prody.AtomGroup}
-
-      # Cluster + write out for this AA bucket
-      cluster_vdgs_of_same_AA_comp(
-         _vdgs, seq_sim_thresh, _reordered_AAs, symmetry_classes, vdglib_dir,
-         align_cg_weight, num_flanking, atomgroup_dict, keep_clustered_pdbs,
-         print_flankbb=print_flankbb, logfile=logfile)
-
-      # Copy centroids to nr output dir for this bucket
-      copy_nr_to_outdir(vdglib_dir, os.path.join(vdglib_dir, 'nr_vdgs'), _reordered_AAs)
-      return ('_'.join(_reordered_AAs), len(_vdgs))
-
-   except Exception as e:
-      aa_label = '_'.join(_reordered_AAs) if _reordered_AAs else 'UNKNOWN_AAs'
-      tb = traceback.format_exc()
-      raise RuntimeError(
-         f"[WORKER ERROR] AA bucket: {aa_label} | count={len(_vdgs)}\n"
-         f"Exception: {e}\nTraceback:\n{tb}")
-
 def _stream_root(vdglib_dir):
-   # Root for AA composition streaming buckets.
-   # Tries $TMPDIR, /scratch, /tmp, and vdglib_dir as fallback
-
-   user = os.environ.get("USER") or getpass.getuser() or "unknown"
-   vdglib_tag = os.path.basename(os.path.abspath(vdglib_dir.rstrip(os.sep)))
-
-   tmpdir_env = os.environ.get("TMPDIR")
-   if tmpdir_env:
-      root = os.path.join(tmpdir_env, f"vdg_stream_{vdglib_tag}")
-   elif os.path.isdir("/scratch"):
-      root = os.path.join("/scratch", user, f"vdg_stream_{vdglib_tag}")
-   elif os.path.isdir("/tmp"):
-      root = os.path.join("/tmp", user, f"vdg_stream_{vdglib_tag}")
-   else:
-      root = os.path.join(vdglib_dir, "stream_tmp")
-
-   os.makedirs(root, exist_ok=True)
-   return root
+    # Root for AA composition streaming buckets.
+    # Tries $TMPDIR, /scratch, /tmp, and vdglib_dir as fallback.
+    user = os.environ.get("USER") or getpass.getuser() or "unknown"
+    vdglib_tag = os.path.basename(os.path.abspath(vdglib_dir.rstrip(os.sep)))
+    tmpdir_env = os.environ.get("TMPDIR")
+    if tmpdir_env:
+        root = os.path.join(tmpdir_env, f"vdg_stream_{vdglib_tag}")
+    elif os.path.isdir("/scratch"):
+        root = os.path.join("/scratch", user, f"vdg_stream_{vdglib_tag}")
+    elif os.path.isdir("/tmp"):
+        root = os.path.join("/tmp", user, f"vdg_stream_{vdglib_tag}")
+    else:
+        root = os.path.join(vdglib_dir, "stream_tmp")
+    os.makedirs(root, exist_ok=True)
+    return root
 
 def _aa_tmp_dir(vdglib_dir, size_subset):
-   # Write per-AA-bucket records to disk to free memory
-   return os.path.join(_stream_root(vdglib_dir), str(size_subset))
+    # Write per-AA-bucket records to disk to free memory
+    return os.path.join(_stream_root(vdglib_dir), str(size_subset))
 
 def _aa_tmp_path(vdglib_dir, size_subset, aa_key):
-   h = hashlib.sha1(aa_key.encode()).hexdigest()[:16]
-   fname = f"{aa_key[:80]}__{h}.jsonl.gz"
-   return os.path.join(_aa_tmp_dir(vdglib_dir, size_subset), fname)
-
-def _flank_tmp_size_root(vdglib_dir, size_subset):
-   # Follows same priority as in _stream_root()
-   user = os.environ.get("USER") or getpass.getuser() or "unknown"
-   vdglib_tag = os.path.basename(os.path.abspath(vdglib_dir.rstrip(os.sep)))
-
-   tmpdir_env = os.environ.get("TMPDIR")
-   if tmpdir_env:
-      root = os.path.join(tmpdir_env, f"vdg_flankseq_{vdglib_tag}", str(size_subset))
-   elif os.path.isdir("/scratch"):
-      root = os.path.join("/scratch", user, f"vdg_flankseq_{vdglib_tag}", str(size_subset))
-   elif os.path.isdir("/tmp"):
-      root = os.path.join("/tmp", user, f"vdg_flankseq_{vdglib_tag}", str(size_subset))
-   else:
-      root = os.path.join(vdglib_dir, "clusters", "flankseq_and_bb", str(size_subset))
-
-   os.makedirs(root, exist_ok=True)
-   return root
-
-def _flank_tmp_dir(vdglib_dir, size_subset, aa_label):
-   root = _flank_tmp_size_root(vdglib_dir, size_subset)
-   path = os.path.join(root, aa_label)
-   os.makedirs(path, exist_ok=True)
-   return path
-
-def _persist_flank_clusters_from_tmp(vdglib_dir, size_subset, logfile):
-   '''
-   Copy flankseq_and_bb clusters for this subset size from scratch TMPDIR
-   to persistent storage under:
-       <vdglib_dir>/clusters/flankseq_and_bb/<size_subset>/
-   '''
-   tmpdir_env = os.environ.get("TMPDIR")
-   if not tmpdir_env and not os.path.isdir("/scratch") and not os.path.isdir("/tmp"):
-      return
-
-   tmp_root = _flank_tmp_size_root(vdglib_dir, size_subset)
-   # If _flank_tmp_size_root fell back into vdglib_dir already, no need to persist
-   persistent_root = os.path.join(vdglib_dir, "clusters", "flankseq_and_bb", str(size_subset))
-   if os.path.abspath(tmp_root).startswith(os.path.abspath(persistent_root)):
-      return
-
-   if not os.path.isdir(tmp_root):
-      return
-   
-   if not any(os.scandir(tmp_root)):
-      return
-
-   dest_root = persistent_root
-   os.makedirs(dest_root, exist_ok=True)
-
-   # We want to merge tmp_root into dest_root, not replace dest_root.
-   for entry in os.listdir(tmp_root):
-      src = os.path.join(tmp_root, entry)
-      dst = os.path.join(dest_root, entry)
-      if os.path.isdir(src):
-         shutil.copytree(src, dst, dirs_exist_ok=True)
-      else:
-         shutil.copy2(src, dst)
+    # AA bucket file name is based on AA key plus a short SHA1 suffix
+    h = hashlib.sha1(aa_key.encode()).hexdigest()[:16]
+    fname = f"{aa_key[:80]}__{h}.jsonl.gz"
+    return os.path.join(_aa_tmp_dir(vdglib_dir, size_subset), fname)
 
 def _spill_record(vdglib_dir, size_subset, reordered_aas, record):
-   # Append one vdG record to its AA bucket file (gzip JSONL)
-   aa_key = "_".join(reordered_aas)
-   path = _aa_tmp_path(vdglib_dir, size_subset, aa_key)
-   os.makedirs(os.path.dirname(path), exist_ok=True)
-   with gzip.open(path, "at", encoding="utf-8") as f:
-      f.write(json.dumps(record) + "\n")
+    '''
+    Append one vdG record to its AA bucket file (gzip JSONL).
+
+    Contents of each record:
+        {
+          "cg_coords": [[x,y,z], ...],
+          "bbcoords":  [ [[Nx,Ny,Nz],[CAx,CAy,CAz],[Cx,Cy,Cz]],  ... ],
+          "flankseqs": [ ["-2AA","-1AA","vdm","+1AA","+2AA"], ... ],
+          "flankCAs":  [ [[x,y,z],...], ... ],
+          "pdbpath":   "vdg pdb path",
+          "scrr":      [ [seg, chain, resnum, resname], ... ]
+        }
+    '''
+    aa_key = "_".join(reordered_aas)
+    path = _aa_tmp_path(vdglib_dir, size_subset, aa_key)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with gzip.open(path, "at", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
 
 def _load_bucket(path):
-   # Load a whole AA bucket
-   _vdgs = []
-   with gzip.open(path, "rt", encoding="utf-8") as f:
-      for line in f:
-         rec = json.loads(line)
-         _vdgs.append([
-            np.asarray(rec["cg_coords"]),
-            [np.asarray(r) for r in rec["bbcoords"]],
-            rec["flankseqs"],
-            [np.asarray(r) for r in rec["flankCAs"]],
-            rec["pdbpath"],
-            rec["scrr"],])
-   return _vdgs
+    '''
+    Load a whole AA bucket JSONL.gz into memory.
+    Each vdG entry becomes:
+        [cg_coords, bbcoords, flankseqs, flankCAs, pdbpath, scrr]
+    '''
+    _vdgs = []
+    with gzip.open(path, "rt", encoding="utf-8") as f:
+        for line in f:
+            rec = json.loads(line)
+            _vdgs.append([np.asarray(rec["cg_coords"]),
+                         [np.asarray(r) for r in rec["bbcoords"]],
+                         rec["flankseqs"],
+                         [np.asarray(r) for r in rec["flankCAs"]],
+                         rec["pdbpath"],
+                         rec["scrr"],])
+    return _vdgs
 
-def main():
-   start_time = time.time()
-   tracemalloc.start()
-   args = parse_args()
-   CG = args.cg
-   seq_sim_thresh = args.seq
-   num_flanking = args.flank
-   symmetry_classes = args.symmetry_classes
-   print_flankbb = args.print_flankbb
-   keep_clustered_pdbs = args.keep_clustered_pdbs
-   size_subset = args.size_subset
-   max_num_to_clus = args.max_num_vdgs_to_clus
-   logfile = args.logfile
-   align_cg_weight = args.align_cg_weight
-   if align_cg_weight < 0 or align_cg_weight > 1:
-      raise ValueError('align_cg_weight must be a float between 0 and 1.')
-   vdglib_dir = args.vdglib_dir
-   vdg_pdbs_dir = os.path.join(vdglib_dir, 'vdg_pdbs')
-   if not os.path.isdir(vdg_pdbs_dir):
-      sys.exit(f"[ERROR] Missing directory: {vdg_pdbs_dir}")
-   out_dir = os.path.join(vdglib_dir, 'nr_vdgs')
-   
-   # Iterate over the PDBs and CGs that were identified as containing the SMARTS group
-   # Spill each AA bucket to disk instead of holding all in memory.
-   vdg_pdbs_in_dir = sorted(os.listdir(vdg_pdbs_dir))
-   for pdbname in vdg_pdbs_in_dir:
-      pdbpath = os.path.join(vdg_pdbs_dir, pdbname)
-      try:
-         prody_obj = pr.parsePDB(pdbpath)
-      except:
-         with open(logfile, 'a') as file:
-              file.write(f"Could not parse {pdbpath} \n")
-         continue
-      cg_coords = get_cg_coords(prody_obj, pdbpath)
-      if cg_coords is None: # already logged reason inside get_cg_coords()
-         continue
-      # Define symmetry class if it's None so it's compatible with pdb output naming
-      if symmetry_classes is None: 
-         symmetry_classes = [i for i in range(len(cg_coords))] # global mutation is intentional
-      # Characterize the vdM residues (bb coords, flanking residues, pdb paths, etc.)
-      vdms_dict = clust.get_vdm_res_features(prody_obj, pdbpath, num_flanking)
-      # Determine the vdM combinations, up to 4 residues
-      vdm_resinds = list(vdms_dict.keys())
-      vdg_subsets = get_vdg_subsets(vdm_resinds, size_subset)
-      # Iterate over subsets of resinds
-      for vdg_subset in vdg_subsets:
-         # Record these features in the same order as in vdg_subset. Then, sort all 
-         # based on alphabetical order of the vdm AAs. If you find a bb-only vdm, 
-         # assign the vdm resname as "bb".
-         re_ordered_aas, re_ordered_bbcoords, re_ordered_flankingseqs, \
-            re_ordered_CAs, re_ordered_scrr = clust.reorder_vdg_subset(
-            vdg_subset, vdms_dict, prody_obj.select('occupancy > 2.9 and not element H'), 
-            prody_obj) # exclude H b/c calculating dist to AA to determine bb or sc vdm
-         
-         # AA bucket stream: spill a single vdG record to its AA-bucket file to disk
-         rec = {
-            "cg_coords": np.asarray(cg_coords).tolist(),
-            "bbcoords":  [np.asarray(x).tolist() for x in re_ordered_bbcoords],
-            "flankseqs": re_ordered_flankingseqs,  # strings already fine
-            "flankCAs":  [np.asarray(x).tolist() for x in re_ordered_CAs],
-            "pdbpath":   str(pdbpath),
-            "scrr":      [[str(s), str(ch), int(r), str(rn)] for (s, ch, r, rn) in 
-                          re_ordered_scrr],
-         }
+def _extract_env(all_cg_coords, all_vdmbb_coords, all_flankseqs, all_flankCAs,
+                 all_pdbpaths, all_scrr_cg_perm, idx):
+    """
+    Extract a single vdG environment (centroid or member) from the global
+    arrays built after AA+CG permutations.
 
-         _spill_record(vdglib_dir, size_subset, re_ordered_aas, rec)
+    Returns a dict with:
+      {
+        "cg_coords": (n_cg, 3),
+        "vdm_bb_coords": (num_vdms, 3, 3),
+        "flank_CA_coords": (num_vdms, L, 3),
+        "flank_seq": (num_vdms, L) list-of-lists,
+        "pdbpath": str,
+        "scrr": [ [seg, chain, resnum, resname], ... ],  # one per vdM
+      }
+    """
+    cg_coords = np.asarray(all_cg_coords[idx], dtype=np.float64)
+    vdm_bb_coords = np.asarray(all_vdmbb_coords[idx], dtype=np.float64)
+    flank_CAs = np.asarray(all_flankCAs[idx], dtype=np.float64)
+    flank_seq = all_flankseqs[idx]
+    pdbpath = all_pdbpaths[idx]
+    scrrs, _cg_perm_label = all_scrr_cg_perm[idx]   # cg_perm label is informational
+    return {"cg_coords": cg_coords,
+            "vdm_bb_coords": vdm_bb_coords,
+            "flank_CA_coords": flank_CAs,
+            "flank_seq": flank_seq,
+            "pdbpath": pdbpath,
+            "scrr": scrrs,}
 
-   # Evaluate the collection of vdGs of size_subset and determine redundancy. 
-   # Each per-AA bucket is processed independently in parallel.
-   stream_dir = _aa_tmp_dir(vdglib_dir, size_subset)
-   if not os.path.isdir(stream_dir):
-      with open(logfile, 'a') as f:
-         f.write(f"\t[STREAM ERROR] No buckets found at {stream_dir}\n")
-   else:
-      jobs = []
-      for fname in sorted(os.listdir(stream_dir)):
-         if not fname.endswith(".jsonl.gz"):
+def _bucket_npz_path(vdglib_dir, size_subset, reordered_AAs):
+    aa_label = "_".join(reordered_AAs)
+    nr_root = os.path.join(vdglib_dir, "nr_vdgs")
+    size_dir = os.path.join(nr_root, str(size_subset))
+    aa_dir = os.path.join(size_dir, aa_label)
+    os.makedirs(aa_dir, exist_ok=True)
+    return os.path.join(aa_dir, f"{aa_label}.npz")
+
+def _write_bucket_npz(vdglib_dir, size_subset, reordered_AAs, clusters):
+    """
+    clusters: list of
+      {"cluster_id": int,
+       "cluster_size": int,
+       "first_stage_cluster_id": int,
+       "second_stage_cluster_id": int,
+       "centroid": env_dict,
+       "members": [env_dict, ... up to 29],}
+    env_dict as returned by _extract_env.
+    """
+    if len(clusters) == 0:
+        # No clusters for this AA bucket; nothing to write.
+        return
+
+    C = len(clusters)
+    first_centroid = clusters[0]["centroid"]
+
+    n_cg = first_centroid["cg_coords"].shape[0]
+    num_vdms = first_centroid["vdm_bb_coords"].shape[0]
+    # Use central vdM flanking length as canonical L
+    L = len(first_centroid["flank_seq"][0])
+
+    # Member dimension: up to 29, but allow zero if cluster sizes are 1 everywhere.
+    max_members = max(len(c["members"]) for c in clusters)
+    M = max_members
+
+    # Core cluster arrays
+    cluster_id = np.empty((C,), dtype=int)
+    cluster_size = np.empty((C,), dtype=int)
+    first_stage_cluster_id = np.empty((C,), dtype=int)
+    second_stage_cluster_id = np.empty((C,), dtype=int)
+
+    centroid_cg_coords = np.empty((C, n_cg, 3), dtype=np.float64)
+    centroid_vdm_bb_coords = np.empty((C, num_vdms, 3, 3), dtype=np.float64)
+    centroid_flank_CA_coords = np.empty((C, num_vdms, L, 3), dtype=np.float64)
+    centroid_flank_seq = np.empty((C, num_vdms, L), dtype="U4")
+    centroid_parent_pdb_path = np.empty((C,), dtype="U256")
+    centroid_scrr_seg = np.empty((C, num_vdms), dtype="U8")
+    centroid_scrr_chain = np.empty((C, num_vdms), dtype="U2")
+    centroid_scrr_resnum = np.empty((C, num_vdms), dtype=int)
+    centroid_scrr_resname = np.empty((C, num_vdms), dtype="U4")
+
+    # Member arrays (may have M = 0; that's fine for numpy)
+    if M > 0:
+        member_cg_coords = np.full((C, M, n_cg, 3), np.nan, dtype=np.float64)
+        member_vdm_bb_coords = np.full((C, M, num_vdms, 3, 3), np.nan, dtype=np.float64)
+        member_flank_CA_coords = np.full((C, M, num_vdms, L, 3), np.nan, dtype=np.float64)
+        member_flank_seq = np.empty((C, M, num_vdms, L), dtype="U4")
+        member_parent_pdb_path = np.empty((C, M), dtype="U256")
+        member_scrr_seg = np.empty((C, M, num_vdms), dtype="U8")
+        member_scrr_chain = np.empty((C, M, num_vdms), dtype="U2")
+        member_scrr_resnum = np.empty((C, M, num_vdms), dtype=int)
+        member_scrr_resname = np.empty((C, M, num_vdms), dtype="U4")
+    else:
+        member_cg_coords = None
+        member_vdm_bb_coords = None
+        member_flank_CA_coords = None
+        member_flank_seq = None
+        member_parent_pdb_path = None
+        member_scrr_seg = None
+        member_scrr_chain = None
+        member_scrr_resnum = None
+        member_scrr_resname = None
+
+    member_count = np.zeros((C,), dtype=int)
+
+    # Fill arrays
+    for i, clus in enumerate(clusters):
+        cluster_id[i] = clus["cluster_id"]
+        cluster_size[i] = clus["cluster_size"]
+        first_stage_cluster_id[i] = clus["first_stage_cluster_id"]
+        second_stage_cluster_id[i] = clus["second_stage_cluster_id"]
+
+        cent = clus["centroid"]
+        cg = cent["cg_coords"]
+        vbb = cent["vdm_bb_coords"]
+        fCA = cent["flank_CA_coords"]
+        fseq = cent["flank_seq"]
+        pdbpath = cent["pdbpath"]
+        scrr = cent["scrr"]
+
+        centroid_cg_coords[i] = cg
+        centroid_vdm_bb_coords[i] = vbb
+        centroid_flank_CA_coords[i] = fCA
+        centroid_flank_seq[i] = np.array(fseq, dtype="U4")
+        centroid_parent_pdb_path[i] = pdbpath
+
+        # scrr: list of [seg, chain, resnum, resname]
+        segs = []
+        chains = []
+        resnums = []
+        resnames = []
+        for seg, ch, resnum, resname in scrr:
+            segs.append(str(seg))
+            chains.append(str(ch))
+            resnums.append(int(resnum))
+            resnames.append(str(resname))
+        centroid_scrr_seg[i] = np.array(segs, dtype="U8")
+        centroid_scrr_chain[i] = np.array(chains, dtype="U2")
+        centroid_scrr_resnum[i] = np.array(resnums, dtype=int)
+        centroid_scrr_resname[i] = np.array(resnames, dtype="U4")
+
+        # Members
+        members = clus["members"]
+        mcount = len(members)
+        member_count[i] = mcount
+
+        if M == 0 or mcount == 0:
             continue
-         # recover AA key (the part before "__")
-         aa_key = fname.split("__")[0]
-         _reordered_AAs = aa_key.split("_")
-         path = os.path.join(stream_dir, fname)
 
-         jobs.append((
-            path, seq_sim_thresh, list(_reordered_AAs), symmetry_classes,
-            vdglib_dir, align_cg_weight, num_flanking, logfile,
-            print_flankbb, max_num_to_clus, keep_clustered_pdbs))
+        for j, mem in enumerate(members):
+            if j >= M:
+                break
+            mcg = mem["cg_coords"]
+            mvbb = mem["vdm_bb_coords"]
+            mfCA = mem["flank_CA_coords"]
+            mfseq = mem["flank_seq"]
+            mpdb = mem["pdbpath"]
+            mscrr = mem["scrr"]
 
-      # Clean, isolated processes
-      ctx = mp.get_context("spawn")
-      try:
-         with ctx.Pool(processes=int(args.num_procs), maxtasksperchild=1) as pool:
-            # Do not swallow exceptions - any worker error should abort run
-            for _ in pool.imap_unordered(_run_one_bucket_strict, jobs, chunksize=1):
-               pass
-      except Exception as e:
-         err_text = f'[FATAL ERROR] Worker failed with exception:\n{e}\n'
-         with open(logfile, 'a') as f:
-            f.write(err_text)
-         print(err_text, file=sys.stderr) # ensure it shows up in stdout/stderr
-         sys.exit(1) # hard-fail the whole run if any worker fails
+            member_cg_coords[i, j] = mcg
+            member_vdm_bb_coords[i, j] = mvbb
+            member_flank_CA_coords[i, j] = mfCA
+            member_flank_seq[i, j] = np.array(mfseq, dtype="U4")
+            member_parent_pdb_path[i, j] = mpdb
 
-   # Remove only this run's temp files so concurrent -n runs don't clobber each other
-   try:
-       stream_dir = _aa_tmp_dir(vdglib_dir, size_subset)
-       if os.path.isdir(stream_dir):
-           shutil.rmtree(stream_dir)
-   except Exception as _e:
-       with open(logfile, 'a') as f:
-           f.write(f'\t[STREAM WARNING]: Failed to remove {stream_dir}: {_e}\n')
-   
-   # Clean up the entire output from clus_and_deduplicate_vdgs.py. The final stage of 
-   # clustering can be preserved using the --keep-clustered-pdbs flag. The retained 
-   # clustered output is in the form: 
-   # clusters/flankseq_and_bb/size_subset/vdg_AAs/cgvdmbb_clusnum/flankseq_and_bb_clusnum 
-   # to easily trace clustering steps.
+            m_segs = []
+            m_chains = []
+            m_resnums = []
+            m_resnames = []
+            for seg, ch, resnum, resname in mscrr:
+                m_segs.append(str(seg))
+                m_chains.append(str(ch))
+                m_resnums.append(int(resnum))
+                m_resnames.append(str(resname))
+            member_scrr_seg[i, j] = np.array(m_segs, dtype="U8")
+            member_scrr_chain[i, j] = np.array(m_chains, dtype="U2")
+            member_scrr_resnum[i, j] = np.array(m_resnums, dtype=int)
+            member_scrr_resname[i, j] = np.array(m_resnames, dtype="U4")
 
-   # Persist flankseq_and_bb clusters from scratch to global disk if requested
-   if keep_clustered_pdbs:
-      try:
-         _persist_flank_clusters_from_tmp(vdglib_dir, size_subset, logfile)
-      except Exception as e:
-         with open(logfile, 'a') as f:
-            f.write(f"\t[WARNING] Failed to persist flankseq_and_bb "
-                    f"for size_subset {size_subset}: {e}\n")
+    npz_path = _bucket_npz_path(vdglib_dir, size_subset, reordered_AAs)
+    # Save everything in a self-describing npz for downstream materialization.
+    save_kwargs = dict(
+        cluster_id=cluster_id,
+        cluster_size=cluster_size,
+        first_stage_cluster_id=first_stage_cluster_id,
+        second_stage_cluster_id=second_stage_cluster_id,
+        centroid_cg_coords=centroid_cg_coords,
+        centroid_vdm_bb_coords=centroid_vdm_bb_coords,
+        centroid_flank_CA_coords=centroid_flank_CA_coords,
+        centroid_flank_seq=centroid_flank_seq,
+        centroid_parent_pdb_path=centroid_parent_pdb_path,
+        centroid_scrr_seg=centroid_scrr_seg,
+        centroid_scrr_chain=centroid_scrr_chain,
+        centroid_scrr_resnum=centroid_scrr_resnum,
+        centroid_scrr_resname=centroid_scrr_resname,
+        member_count=member_count,)
 
-   delete_clusterdirs(vdglib_dir, logfile, size_subset, keep_clustered_pdbs)
-   if not keep_clustered_pdbs:
-       tmp_root = _flank_tmp_size_root(vdglib_dir, size_subset)
-       if os.path.isdir(tmp_root):
-           shutil.rmtree(tmp_root)
+    if M > 0:
+        save_kwargs.update(
+            member_cg_coords=member_cg_coords,
+            member_vdm_bb_coords=member_vdm_bb_coords,
+            member_flank_CA_coords=member_flank_CA_coords,
+            member_flank_seq=member_flank_seq,
+            member_parent_pdb_path=member_parent_pdb_path,
+            member_scrr_seg=member_scrr_seg,
+            member_scrr_chain=member_scrr_chain,
+            member_scrr_resnum=member_scrr_resnum,
+            member_scrr_resname=member_scrr_resname,)
 
-   # Delete temporary stream dirs. Usually, these jobs are run concurrently with 
-   # different -n args, so remove the parent stream_tmp/ dir only when it's the last 
-   # process. Use os.rmdir b/c it will only be successful if it's the last one.
-   stream_root = _stream_root(vdglib_dir)
-   try:
-      os.rmdir(stream_root) # succeeds only if empty (i.e., the last process)
-   except FileNotFoundError: 
-      # another process deleted it immediately after the os.rmdir() call
-      pass
-   except OSError:
-      # not empty (other -n jobs still running); leave it
-      pass
-    
-   # Print out time elapsed
-   s = time.time() - start_time
-   hours = int(s // 3600)
-   minutes = int((s % 3600) // 60)
-   seconds = round(s % 60, 2)
-    
-   # Write out results to log file
-   with open(logfile, 'a') as file:
-      num_vdg_pdbs = len(vdg_pdbs_in_dir)
-      nr_dir_of_size_subset = os.path.join(out_dir, str(size_subset))
-      num_vdgs_of_size_subset = 0
-      if not os.path.exists(nr_dir_of_size_subset):
-         pass
-      else:
-         for aa_subset in os.listdir(nr_dir_of_size_subset):
-            aa_subset_len = len(os.listdir(os.path.join(nr_dir_of_size_subset, aa_subset)))
-            num_vdgs_of_size_subset += aa_subset_len
-      
-      file.write(f"\nCompleted clus_and_deduplicate_vdgs.py for subset size {size_subset} ")
-      file.write(f"in {hours} h, {minutes} mins, and {seconds} secs. \n")
-      file.write(f'\t{num_vdgs_of_size_subset} nonredun. vdgs of subset size '
-                 f'{size_subset} out of {num_vdg_pdbs} vdgs.\n')
-   
-   current, peak = tracemalloc.get_traced_memory()
-   peak_mem = np.round(peak / (1024 * 1024 * 1024), 2)
-   if peak_mem > 20:
-      print(f"Peak memory usage at end of script for clustering subset size {size_subset}: "
-            f"{peak_mem} GB")
-   tracemalloc.stop()
+    np.savez(npz_path, **save_kwargs)
 
-def copy_nr_to_outdir(vdglib_dir, nr_dir, reordered_AAs):
-   size_subset = len(reordered_AAs)
-   aa_label = '_'.join(reordered_AAs)
+def _run_one_bucket_strict(args):
+    """
+    Run clustering for one AA-composition bucket in a separate process.
 
-   # Clusters now live in scratch (or fallback location)
-   clustersdir = _flank_tmp_dir(vdglib_dir, size_subset, aa_label)
+    args:
+        (bucket_path, seq_sim_thresh, reordered_AAs, symmetry_classes,
+         vdglib_dir, align_cg_weight, num_flanking, logfile, size_subset,
+         max_num_to_clus)
+    """
+    (bucket_path, seq_sim_thresh, reordered_AAs, symmetry_classes,
+     vdglib_dir, align_cg_weight, num_flanking, logfile, size_subset,
+     max_num_to_clus) = args
 
-   nr_dir = os.path.join(nr_dir, str(size_subset), aa_label)
-   utils.handle_existing_files(nr_dir)
-   os.makedirs(nr_dir, exist_ok=True)
-   for cgvdmbbclus in os.listdir(clustersdir):
-      cgvdmbbclusdir = os.path.join(clustersdir, cgvdmbbclus)
-      for flankseq_and_bb_dir in os.listdir(cgvdmbbclusdir):
-         flankseqandbbclusdir = os.path.join(cgvdmbbclusdir, flankseq_and_bb_dir)
-         # make sure there's only 1 pdb in flankseqandbbclusdir that has 'centroid' in 
-         # the name
-         _centroid_pdbs = [pdb for pdb in os.listdir(flankseqandbbclusdir) 
-                          if 'centroid' in pdb]
-         if len(_centroid_pdbs) != 1:
-            raise ValueError(f"Expected 1 centroid pdb in {flankseqandbbclusdir}, "
-                             f"but found {len(_centroid_pdbs)}.")
+    _vdgs = _load_bucket(bucket_path)
 
-         pdb = _centroid_pdbs[0]
-         # copy the centroid to the output dir
-         biounit = '_'.join(pdb.split('_')[1:6]).replace('.pdb.gz', '')
-         vdmscrr_list = pdb.split('_')[6:-3]
-         # remove resnames for conciseness
-         vdmscrr_list = [vdmscrr_list[i] for i in range(len(vdmscrr_list)) 
-                         if (i + 1) % 4 != 0] 
-         vdmscrr_str = '_'.join(vdmscrr_list)
-         newname = f'{biounit}_{vdmscrr_str}.pdb.gz'
-         newpath = os.path.join(nr_dir, newname)
-         if os.path.exists(newpath):
-            raise FileExistsError(f"{newpath} already exists - investigate why.")
-         # attempt to copy it to the newpath, but sge sometimes gives a 
-         # communication send error when there's lag, so allow 100 attempts
-         try:
-            shutil.copy(os.path.join(flankseqandbbclusdir, pdb), newpath) 
-         except: # retry
-            for attempt in range(100):
-               try:
-                  shutil.copy(os.path.join(flankseqandbbclusdir, pdb), newpath) 
-                  break
-               except Exception as e:  
-                  if attempt < 99:
-                     time.sleep(10)  # wait before retrying
-                  else:
-                     print(f"[WARNING] clus_and_deduplicate failed to create "
-                           f"{os.path.join(flankseqandbbclusdir, pdb)}: {e}")
+    # Filter out any vdGs with NaN or inf CG coords
+    filtered_vdgs = []
+    for (cg_coords, bbcoords, flankseqs, flankCAs, pdbpath, scrr) in _vdgs:
+        if not np.isfinite(cg_coords).all():
+            with open(logfile, 'a') as f:
+                f.write(f'[WARNING] dropping vdG from {pdbpath} from bucket '
+                        f'{tuple(reordered_AAs)} due to NaN or inf CG coords.\n')
+            continue
+        filtered_vdgs.append([cg_coords, bbcoords, flankseqs, flankCAs, pdbpath, scrr])
 
-def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs, 
-   symmetry_classes, vdglib_dir, align_cg_weight, num_flanking,
-   atomgroup_dict, keep_clustered_pdbs, print_flankbb, logfile):
-   # Cluster vdG subsets with identical vdm AA compositions to identify redundancies. 
-   # First, get all AA permutations for identical AAs. For example, if the vdms are 
-   # [Ala1, Ala2, Glu], then we need to sample [Ala1, Ala2, Glu] and [Ala2, Ala1, 
-   # Glu]. The easiest way to get the permutations is to label the index of the 
-   # ordered AAs
-   reordered_AAs_str = '_'.join(reordered_AAs)
-   
-   # Include all AA permutations (for identical AAs) of the vdgs.
-   all_AA_perm_cg_coords, all_AA_perm_vdm_bbcoords, \
-      all_AA_perm_flankingseqs, all_AA_perm_flankingCAs, \
-      all_AA_perm_pdbpaths, all_AA_perm_vdm_scrr = \
-      get_vdg_AA_permutations(reordered_AAs, _vdgs)
+    _vdgs = filtered_vdgs
 
-   # Add in permutations of symmetric CG atoms.
-   all_AA_cg_perm_cg_coords, all_AA_cg_perm_vdm_bbcoords, \
-      all_AA_cg_perm_flankingseqs, all_AA_cg_perm_flankingCAs, \
-      all_AA_cg_perm_pdbpaths, all_AA_cg_perm_vdm_scrr_cg_perm = \
-      clust.get_vdg_AA_and_cg_perms(all_AA_perm_cg_coords, all_AA_perm_vdm_bbcoords, 
-         all_AA_perm_flankingseqs, all_AA_perm_flankingCAs, all_AA_perm_pdbpaths, 
-         all_AA_perm_vdm_scrr, symmetry_classes)
-   
-   all_AA_cg_perm_cg_and_vdmbb_coords = combine_cg_and_vdmbb_coords(
-      all_AA_cg_perm_cg_coords, all_AA_cg_perm_vdm_bbcoords)
-   all_AA_cg_perm_flat_flankingseqs = flatten_flanking_seqs(
-      all_AA_cg_perm_flankingseqs)
-   all_AA_cg_perm_flat_flankCAs = flatten_flanking_CAs(
-      all_AA_cg_perm_flankingCAs)
-   # Count # of cg vdm bb atoms
-   num_cg_atoms = len(all_AA_cg_perm_cg_coords[0])
-   num_vdmbb_res = len(all_AA_cg_perm_vdm_bbcoords[0]) 
-   num_vdmbb_atoms = num_vdmbb_res * 3 
-   num_cgvdmbb_atoms = num_cg_atoms + num_vdmbb_atoms
+    # Cluster vdG subsets with identical vdM AA compositions to identify redundancy.
+    # If there are > max_num_to_clus samples, select only the PDBs with highest PDB
+    # ID diversity. Note that a single PDB can contribute multiple vdGs, so even
+    # after applying the max_num_to_clus cap (which limits PDB IDs, not vdGs), the
+    # resulting num. of vdGs may still exceed max_num_to_clus.
+    if len(_vdgs) == 0:
+        return ('_'.join(reordered_AAs), 0)
 
-   # First, cluster on rmsd of the cg and vdmbb atoms.
-   # `cluster_assignments` dict: each key is a clus number, and each value
-   # is a list of the indices belong to that cluster. Indexing is the relative position
-   # in all_AA_cg_perm_cg_coords, all_AA_cg_perm_vdm_bbcoords, etc.).
-   cgvdmbb_rmsd_cut = normalize_rmsd(num_cgvdmbb_atoms, 'cgvdmbb') 
-   cgvdmbb_data_to_clus = zip([all_AA_cg_perm_cg_and_vdmbb_coords], ['cgvdmbb'])
-   cgvdmbb_clus_assignments, cgvdmbb_clus_centroids = clust.get_leader_clusters(
-      cgvdmbb_data_to_clus, cgvdmbb_rmsd_cut, reordered_AAs_str, len(reordered_AAs), 
-      vdglib_dir, final_exact_medoid_pass=True, final_reassign_once=True)
-   cgvdmbb_weights = clust.get_weights(num_cg_atoms, num_vdmbb_atoms, align_cg_weight)
-   first_pdb_out = None          # will be set when writing flankseq_and_bb PDBs
-   first_pdb_cg_vdmbb_coords = False
+    if len(_vdgs) > max_num_to_clus:
+        orig_num_vdgs = len(_vdgs)
+        pdbIDs = [os.path.basename(z[4])[:4] for z in _vdgs]
+        diverse_pdbIDs = select_diverse_pdbIDs(pdbIDs, max_num_to_clus)
+        _vdgs = [z for z in _vdgs if os.path.basename(z[4])[:4] in diverse_pdbIDs]
+        if orig_num_vdgs != len(_vdgs):
+            with open(logfile, 'a') as file:
+                file.write(
+                    f'\tThere are {orig_num_vdgs} vdgs for the {tuple(reordered_AAs)} '
+                    f'subset, so only {len(_vdgs)} vdgs with maximum PDB ID '
+                    f'diversity were selected for clustering.\n')
 
-   # Merge degenerate vdGs (diff AA and CG perms of the same PDB) and reassign cluster 
-   # numbers by size. 
-   reassigned_cgvdmbb_clus = clust.reassign_cgvdmbb_clusters(cgvdmbb_clus_assignments, 
-      all_AA_cg_perm_pdbpaths, all_AA_cg_perm_vdm_scrr_cg_perm)
+    # If still empty after diversity selection, nothing to cluster.
+    if len(_vdgs) == 0:
+        return ('_'.join(reordered_AAs), 0)
 
-   # Next, further subdivide each cluster on rmsd of the bb stretches flanking the vdms 
-   # + their sequences. 
-   for cgvdmbb_clusnum, indices_of_elements_in_cgvdmbb_cluster in \
-      reassigned_cgvdmbb_clus.items():
-      # Select the data belonging to this cgvdmbb cluster.
-      (cgvdmbb_clus_cg_coords, cgvdmbb_clus_vdmbb_coords, 
-         cgvdmbb_clus_cgvdmbb_coords, cgvdmbb_clus_flat_flankingseqs, 
-         cgvdmbb_clus_flat_flankingCAs, cgvdmbb_clus_pdbpaths, 
-         cgvdmbb_clus_vdm_scrr_cg_perm) = clust.elements_in_clusters(
-         indices_of_elements_in_cgvdmbb_cluster, all_AA_cg_perm_cg_coords, 
-         all_AA_cg_perm_vdm_bbcoords, all_AA_cg_perm_cg_and_vdmbb_coords,
-         all_AA_cg_perm_flat_flankingseqs, all_AA_cg_perm_flat_flankCAs, 
-         all_AA_cg_perm_pdbpaths, 
-         all_AA_cg_perm_vdm_scrr_cg_perm)   
+    try:
+        # Expand vdGs over AA perms (identical AAs) and CG symm perms.
+        reordered_AAs_str = '_'.join(reordered_AAs)
 
-      flankseq_and_bb_to_clus = zip([cgvdmbb_clus_flat_flankingseqs,
-                        cgvdmbb_clus_flat_flankingCAs], ['flankseq', 'flankbb'])
-      num_flank_bb_coords = len(cgvdmbb_clus_flat_flankingCAs[0])
-      flankbb_rmsd_cut = normalize_rmsd(num_flank_bb_coords, 'flankbb')
-      # Then, do secondary clustering on a metric and threshold that combines rmsd and seq
-      flankseq_and_bb_thresh = flankbb_rmsd_cut + (1 - seq_sim_thresh) / 2
-      flankingseq_and_bb_cluster_assignments, flankingseq_and_bb_clus_centroids \
-         = clust.get_leader_clusters(flankseq_and_bb_to_clus, flankseq_and_bb_thresh, 
-         reordered_AAs_str, len(reordered_AAs), vdglib_dir, 
-         final_exact_medoid_pass=True, final_reassign_once=True)
-            
-      # Output the flankseq+bb clusters
-      size_subset = len(reordered_AAs)
-      flank_root_for_aa = _flank_tmp_dir(vdglib_dir, size_subset, reordered_AAs_str)
-      flankseq_and_bb_clusdir_for_this_cgvdmbb_clus = os.path.join(
-          flank_root_for_aa, f'cgvdmbb_{cgvdmbb_clusnum}')
-      utils.handle_existing_files(flankseq_and_bb_clusdir_for_this_cgvdmbb_clus)
-      
-      write_out_flankbb_clusters = bool(keep_clustered_pdbs)
-      first_pdb_out, first_pdb_cg_vdmbb_coords, failed_pdbs = clust.write_out_clusters(
-         flankseq_and_bb_clusdir_for_this_cgvdmbb_clus, 
-         flankingseq_and_bb_cluster_assignments, flankingseq_and_bb_clus_centroids,
-         cgvdmbb_clus_cg_coords, cgvdmbb_clus_pdbpaths, cgvdmbb_clus_vdm_scrr_cg_perm, 
-         cgvdmbb_clus_cgvdmbb_coords, cgvdmbb_clus_flat_flankingCAs, num_flanking, 
-         first_pdb_out, first_pdb_cg_vdmbb_coords, cgvdmbb_weights, atomgroup_dict, 
-         print_flankbb, symmetry_classes, reordered_AAs, 
-         write_cluster_members=write_out_flankbb_clusters, clusterlabel='flankseq_and_bb')
+        (all_AA_perm_cg_coords, all_AA_perm_vdm_bbcoords, all_AA_perm_flankingseqs,
+         all_AA_perm_flankingCAs, all_AA_perm_pdbpaths,
+         all_AA_perm_vdm_scrr) = get_vdg_AA_permutations(reordered_AAs, _vdgs)
 
-      if len(failed_pdbs) > 0:
-         with open(logfile, 'a') as file:
-            for fail in failed_pdbs:
-               file.write(f'\t[WARNING] Failed to parse {fail}.\n')
-               file.flush()
-               os.fsync(file.fileno()) # force os flush b/c of lag
+        (all_cg_coords, all_vdmbb_coords, all_flankseqs, all_flankCAs, all_pdbpaths,
+         all_scrr_cg_perm) = clust.get_vdg_AA_and_cg_perms(all_AA_perm_cg_coords,
+         all_AA_perm_vdm_bbcoords, all_AA_perm_flankingseqs, all_AA_perm_flankingCAs,
+         all_AA_perm_pdbpaths, all_AA_perm_vdm_scrr, symmetry_classes,)
 
-def delete_clusterdirs(vdglib_dir, logfile, size_subset, keep_clustered_pdbs):
-   with open(logfile, 'a') as file:
-      all_clusters = os.path.join(vdglib_dir, 'clusters')
+        # Combined coordinates + flattened flanking info for clustering.
+        all_cgvdmbb_coords = combine_cg_and_vdmbb_coords(
+            all_cg_coords, all_vdmbb_coords)
+        all_flat_flankseqs = flatten_flanking_seqs(all_flankseqs)
+        all_flat_flankCAs = flatten_flanking_CAs(all_flankCAs)
 
-      # delete flankseq_and_bb unless keep_clustered_pdbs is True
-      if not keep_clustered_pdbs:
-         flank_dir = os.path.join(all_clusters, 'flankseq_and_bb', str(size_subset))
-         if os.path.exists(flank_dir):
-            shutil.rmtree(flank_dir)
+        num_cg_atoms = len(all_cg_coords[0])
+        num_vdmbb_res = len(all_vdmbb_coords[0])
+        num_vdmbb_atoms = num_vdmbb_res * 3
+        num_cgvdmbb_atoms = num_cg_atoms + num_vdmbb_atoms
+
+        # Stage 1: cluster on RMSD of [CG + vdM backbone]
+        cgvdmbb_rmsd_cut = normalize_rmsd(num_cgvdmbb_atoms, 'cgvdmbb')
+        cgvdmbb_data_to_clus = zip([all_cgvdmbb_coords], ['cgvdmbb'])
+
+        cgvdmbb_clus_assignments, cgvdmbb_clus_centroids = clust.get_leader_clusters(
+            cgvdmbb_data_to_clus, cgvdmbb_rmsd_cut, reordered_AAs_str,
+            len(reordered_AAs), vdglib_dir, final_exact_medoid_pass=True,
+            final_reassign_once=True,)
+
+        # Merge degenerate vdGs (different AA/CG perms of the same PDB + SCRR)
+        reassigned_cgvdmbb_clus = clust.reassign_cgvdmbb_clusters(
+            cgvdmbb_clus_assignments, all_pdbpaths, all_scrr_cg_perm,)
+
+        # Stage 2: within each pose cluster, cluster on residues flanking vdm
+        clusters_out = []
+        cluster_counter = 0
+
+        for cgvdmbb_clusnum, indices_in_cgvdmbb_cluster in \
+                reassigned_cgvdmbb_clus.items():
+
+            indices_in_cgvdmbb_cluster = list(indices_in_cgvdmbb_cluster)
+            if len(indices_in_cgvdmbb_cluster) == 0:
+                continue
+
+            # Build cluster-specific flattened flanking arrays for Stage 2.
+            clus_flat_flankseqs = [all_flat_flankseqs[i]
+                                   for i in indices_in_cgvdmbb_cluster]
+            clus_flat_flankCAs = [all_flat_flankCAs[i]
+                                  for i in indices_in_cgvdmbb_cluster]
+
+            num_flank_bb_coords = len(clus_flat_flankCAs[0])
+            flankbb_rmsd_cut = normalize_rmsd(num_flank_bb_coords, 'flankbb')
+            flankseq_and_bb_thresh = flankbb_rmsd_cut + (1.0 - seq_sim_thresh) / 2.0
+
+            flankseq_and_bb_to_clus = zip(
+                [clus_flat_flankseqs, clus_flat_flankCAs],
+                ['flankseq', 'flankbb'],)
+
+            flankingseq_and_bb_cluster_assignments, flankingseq_and_bb_clus_centroids = \
+                clust.get_leader_clusters(flankseq_and_bb_to_clus, 
+                flankseq_and_bb_thresh, reordered_AAs_str, len(reordered_AAs), 
+                vdglib_dir, final_exact_medoid_pass=True, final_reassign_once=True,)
+
+            # Each Stage 2 cluster = final vdG cluster.
+            for sub_clus_num, local_indices in \
+                    flankingseq_and_bb_cluster_assignments.items():
+                if len(local_indices) == 0:
+                    continue
+
+                cluster_counter += 1
+                centroid_local_idx = flankingseq_and_bb_clus_centroids[sub_clus_num]
+                cluster_size = len(local_indices)
+
+                # Map local indices -> global indices into all_* arrays
+                global_centroid_idx = indices_in_cgvdmbb_cluster[centroid_local_idx]
+                member_global_indices = [
+                    indices_in_cgvdmbb_cluster[li]
+                    for li in local_indices
+                    if li != centroid_local_idx]
+
+                # Deduplicate in original order
+                member_global_indices = list(dict.fromkeys(member_global_indices))
+                # Cap at 29 stored members per cluster
+                member_global_indices = member_global_indices[:29]
+
+                centroid_env = _extract_env(all_cg_coords, all_vdmbb_coords,
+                    all_flankseqs, all_flankCAs, all_pdbpaths, all_scrr_cg_perm,
+                    global_centroid_idx,)
+
+                member_envs = [_extract_env(all_cg_coords, all_vdmbb_coords,
+                    all_flankseqs, all_flankCAs, all_pdbpaths, all_scrr_cg_perm,
+                    g_idx,) for g_idx in member_global_indices]
+
+                clusters_out.append({
+                    "cluster_id": cluster_counter,
+                    "cluster_size": cluster_size,
+                    # Track both stages explicitly so we can trace evolution
+                    "first_stage_cluster_id": int(cgvdmbb_clusnum),
+                    "second_stage_cluster_id": int(sub_clus_num),
+                    "centroid": centroid_env,
+                    "members": member_envs,})
+
+        # Write this AA bucket summary to npz
+        _write_bucket_npz(vdglib_dir, size_subset, reordered_AAs, clusters_out)
+        total_vdgs = sum(c["cluster_size"] for c in clusters_out)
+        return ('_'.join(reordered_AAs), total_vdgs)
+
+    except Exception as e:
+        aa_label = '_'.join(reordered_AAs) if reordered_AAs else 'UNKNOWN_AAs'
+        tb = traceback.format_exc()
+        raise RuntimeError(
+            f"[WORKER ERROR] AA bucket: {aa_label}\n"
+            f"Exception: {e}\nTraceback:\n{tb}")
 
 def normalize_rmsd(num_atoms, atoms):
-   ''' Return a size-normalized RMSD threshold (Å) for the given atom set ('cgvdmbb' or 
-   'flankbb'). The threshold scales linearly with the number of atoms between 8 and 15:
-      flankbb: 0.5 Å → 1.5 Å
-      cgvdmbb: 0.5 Å → 1.0 Å
-   Below 8 atoms, use the minimum; above 15, use the maximum.'''
+    ''' Return a size-normalized RMSD threshold (Å) for the given atom set
+    ('cgvdmbb' or 'flankbb'). The threshold scales linearly with the number
+    of atoms between 8 and 15:
+        flankbb: 0.5 Å → 1.5 Å
+        cgvdmbb: 0.5 Å → 1.0 Å
+    Below 8 atoms, use the minimum; above 15, use the maximum.
+    '''
 
-   if atoms == 'flankbb':
-      max_threshold = 1.5
-      min_threshold = 0.5
-   elif atoms == 'cgvdmbb':
-      max_threshold = 1
-      min_threshold = 0.5
+    if atoms == 'flankbb':
+        max_threshold = 1.5
+        min_threshold = 0.5
+    elif atoms == 'cgvdmbb':
+        max_threshold = 1.0
+        min_threshold = 0.5
+    else:
+        raise ValueError(f"Unknown atom set for normalize_rmsd: {atoms}")
 
-   # Smoothly scale rmsd threshold (Å) by the number of atoms.
-   min_atoms = 8
-   max_atoms = 15
-   
-   if num_atoms < min_atoms:
-      return min_threshold  # below 8 atoms, use the minimum threshold (0.5 Å)
-   if num_atoms > max_atoms:
-      return max_threshold  # above 15 atoms, use the maximum threshold
-   
-   # Linear scaling for atoms 
-   scaling_factor = (num_atoms - min_atoms) / (max_atoms - min_atoms)
-   threshold = min_threshold + scaling_factor * (max_threshold - min_threshold)
-   
-   return threshold
+    min_atoms = 8
+    max_atoms = 15
+
+    if num_atoms < min_atoms:
+        return min_threshold
+    if num_atoms > max_atoms:
+        return max_threshold
+
+    scaling_factor = (num_atoms - min_atoms) / (max_atoms - min_atoms)
+    threshold = min_threshold + scaling_factor * (max_threshold - min_threshold)
+    return threshold
+
+def main():
+    start_time = time.time()
+    tracemalloc.start()
+    args = parse_args()
+
+    CG = args.cg
+    seq_sim_thresh = args.seq
+    num_flanking = args.flank
+    symmetry_classes = args.symmetry_classes
+    size_subset = args.size_subset
+    max_num_to_clus = args.max_num_vdgs_to_clus
+    logfile = args.logfile
+    align_cg_weight = args.align_cg_weight
+
+    if align_cg_weight < 0 or align_cg_weight > 1:
+        raise ValueError('align_cg_weight must be a float between 0 and 1.')
+
+    vdglib_dir = args.vdglib_dir
+    vdg_pdbs_dir = os.path.join(vdglib_dir, 'vdg_pdbs')
+    if not os.path.isdir(vdg_pdbs_dir):
+        sys.exit(f"[ERROR] Missing directory: {vdg_pdbs_dir}")
+    out_dir = os.path.join(vdglib_dir, 'nr_vdgs')
+
+    # Iterate over the PDBs and CGs that were identified as containing the SMARTS group.
+    # Spill each AA bucket to disk instead of holding all in memory.
+    vdg_pdbs_in_dir = sorted(os.listdir(vdg_pdbs_dir))
+    for pdbname in vdg_pdbs_in_dir:
+        pdbpath = os.path.join(vdg_pdbs_dir, pdbname)
+        try:
+            prody_obj = pr.parsePDB(pdbpath)
+        except Exception:
+            with open(logfile, 'a') as file:
+                file.write(f"Could not parse {pdbpath} \n")
+            continue
+
+        cg_coords = get_cg_coords(prody_obj, pdbpath)
+        if cg_coords is None:  # already logged reason inside get_cg_coords()
+            continue
+
+        # Define symmetry class if it's None so it's compatible with downstream
+        # CG-labelling logic (informational; clustering is orientation-invariant).
+        if symmetry_classes is None:
+            symmetry_classes = [i for i in range(len(cg_coords))]  # global mutation intentional
+
+        # Characterize the vdM residues (bb coords, flanking residues, pdb paths, etc.)
+        vdms_dict = clust.get_vdm_res_features(prody_obj, pdbpath, num_flanking)
+
+        # Determine the vdM combinations, up to size_subset residues.
+        vdm_resinds = list(vdms_dict.keys())
+        vdg_subsets = get_vdg_subsets(vdm_resinds, size_subset)
+
+        # Iterate over subsets of residue indices
+        for vdg_subset in vdg_subsets:
+            # Record these features in the same order as in vdg_subset. Then, sort all
+            # based on alphabetical order of the vdM AAs. If you find a bb-only vdM,
+            # assign the vdM resname as "bb".
+            (re_ordered_aas, re_ordered_bbcoords, re_ordered_flankingseqs,
+             re_ordered_CAs, re_ordered_scrr) = clust.reorder_vdg_subset(vdg_subset,
+             vdms_dict, prody_obj.select('occupancy > 2.9 and not element H'),
+             prody_obj,)  # exclude H when determining bb vs sc vdM
+
+            # AA bucket stream: spill a single vdG record to its AA-bucket file on disk.
+            rec = {"cg_coords": np.asarray(cg_coords).tolist(),
+                   "bbcoords": [np.asarray(x).tolist() for x in re_ordered_bbcoords],
+                   "flankseqs": re_ordered_flankingseqs,
+                   "flankCAs": [np.asarray(x).tolist() for x in re_ordered_CAs],
+                   "pdbpath": str(pdbpath),
+                   "scrr": [[str(s), str(ch), int(r), str(rn)]
+                            for (s, ch, r, rn) in re_ordered_scrr],}
+
+            _spill_record(vdglib_dir, size_subset, re_ordered_aas, rec)
+
+    # Evaluate the collection of vdGs of size_subset and determine redundancy.
+    # Each per-AA bucket is processed independently in parallel.
+    stream_dir = _aa_tmp_dir(vdglib_dir, size_subset)
+    if not os.path.isdir(stream_dir):
+        with open(logfile, 'a') as f:
+            f.write(f"\t[STREAM ERROR] No buckets found at {stream_dir}\n")
+    else:
+        jobs = []
+        for fname in sorted(os.listdir(stream_dir)):
+            if not fname.endswith(".jsonl.gz"):
+                continue
+            aa_key = fname.split("__")[0]
+            _reordered_AAs = aa_key.split("_")
+            path = os.path.join(stream_dir, fname)
+
+            jobs.append((path, seq_sim_thresh, list(_reordered_AAs), symmetry_classes, 
+                vdglib_dir, align_cg_weight, num_flanking, logfile, size_subset,
+                max_num_to_clus,))
+
+        # Clean, isolated processes
+        ctx = mp.get_context("spawn")
+        try:
+            with ctx.Pool(processes=int(args.num_procs), maxtasksperchild=1) as pool:
+                for _ in pool.imap_unordered(_run_one_bucket_strict, jobs, chunksize=1):
+                    pass
+        except Exception as e:
+            err_text = f'[FATAL ERROR] Worker failed with exception:\n{e}\n'
+            with open(logfile, 'a') as f:
+                f.write(err_text)
+            print(err_text, file=sys.stderr)
+            sys.exit(1) # hard-fail the whole run if any worker fails
+
+    # Remove only this run's temp stream dir so concurrent -n runs don't clobber
+    # each other.
+    try:
+        if os.path.isdir(stream_dir):
+            shutil.rmtree(stream_dir)
+    except Exception as _e:
+        with open(logfile, 'a') as f:
+            f.write(f'\t[STREAM WARNING]: Failed to remove {stream_dir}: {_e}\n')
+
+    # Delete parent stream_root only if empty (i.e., last -n job).
+    stream_root = _stream_root(vdglib_dir)
+    try:
+        os.rmdir(stream_root)
+    except FileNotFoundError:
+        pass  # another process already deleted it
+    except OSError:
+        pass  # not empty; other -n jobs still running
+
+    # Log summary
+    s = time.time() - start_time
+    hours = int(s // 3600)
+    minutes = int((s % 3600) // 60)
+    seconds = round(s % 60, 2)
+
+    num_vdg_pdbs = len(vdg_pdbs_in_dir)
+    nr_dir_of_size_subset = os.path.join(out_dir, str(size_subset))
+
+    # Count only centroids (i.e., clusters) as "nonredundant vdGs"
+    num_centroids_of_size_subset = 0
+
+    if os.path.isdir(nr_dir_of_size_subset):
+        for aa_label in os.listdir(nr_dir_of_size_subset):
+            aa_dir = os.path.join(nr_dir_of_size_subset, aa_label)
+            npz_path = os.path.join(aa_dir, f"{aa_label}.npz")
+            if not os.path.isfile(npz_path):
+                continue
+            try:
+                data = np.load(npz_path)
+                # One centroid per cluster: cluster_id has shape (C,)
+                num_centroids_of_size_subset += data["cluster_id"].shape[0]
+            except Exception:
+                continue
+
+    with open(logfile, 'a') as file:
+        file.write(
+            f"\nCompleted clus_and_deduplicate_vdgs.py for subset size {size_subset} "
+            f"in {hours} h, {minutes} mins, and {seconds} secs.\n")
+        file.write(
+            f"\t{num_centroids_of_size_subset} nonredun. vdgs (cluster centroids) of "
+            f"subset size {size_subset} out of {num_vdg_pdbs} input vdgs.\n")
+
+    current, peak = tracemalloc.get_traced_memory()
+    peak_mem = np.round(peak / (1024 * 1024 * 1024), 2)
+    if peak_mem > 20:
+        print(f"Peak memory usage at end of script for clustering subset size "
+              f"{size_subset}: {peak_mem} GB")
+    tracemalloc.stop()
 
 if __name__ == "__main__":
-   main()
+    main()
