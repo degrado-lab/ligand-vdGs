@@ -8,105 +8,15 @@ import gc
 import prody as pr
 import time
 from functools import lru_cache
+from clus_helpers import (kabsch, calc_seq_similarity, get_res_iden, found_chain_break,
+                          get_AA_and_CA_coords, get_bb_coords, determine_flank_resnums, 
+                          get_clus_pdb_outpath)
 
 _RMSD_CACHE_MAXSIZE = 100_000
 _SEQ_CACHE_MAXSIZE  = 50_000
 _ATOMGROUP_CACHE_MAXSIZE = 1000
 
 EPS = 1e-9   # strict-improvement epsilon for reassignment; tune to 1e-8 if needed
-
-def get_vdg_AA_permutations(reordered_AAs, _vdgs):
-   permuted_indices = permute_AA_duplicates(reordered_AAs)
-   all_AA_cg_perm_cg_coords = []
-   all_AA_cg_perm_vdm_bbcoords = []
-   all_AA_cg_perm_flankingseqs = []
-   all_AA_cg_perm_flankingCAs = []
-   all_AA_cg_perm_pdbpaths = []
-   all_AA_cg_perm_vdm_scrr = []
-
-   # Iterate over all AA permutations of each vdg
-   for _vdg in _vdgs:
-      # CG coords and pdbpaths remain unchanged, but vdmbbs, flankingseqs, 
-      # flankingCAs, and scrrs need to be permuted.
-      for permutation in permuted_indices:
-         all_AA_cg_perm_cg_coords.append(_vdg[0])
-         all_AA_cg_perm_pdbpaths.append(_vdg[4])
-         nonpermuted_vdmbb = _vdg[1]
-         nonpermuted_flankingseqs = _vdg[2]
-         nonpermuted_flankingCAs = _vdg[3]
-         nonpermuted_vdm_scrr = _vdg[5]
-         vdmbb_permutation = [nonpermuted_vdmbb[ix] for ix in permutation]
-         flankingseqs_permutation = [nonpermuted_flankingseqs[ix] for ix in 
-                                     permutation]
-         flankingCAs_permutation = [nonpermuted_flankingCAs[ix] for ix in permutation]
-         vdm_scrrs_permutation = [nonpermuted_vdm_scrr[ix] for ix in permutation]
-         all_AA_cg_perm_vdm_bbcoords.append(vdmbb_permutation)
-         all_AA_cg_perm_flankingseqs.append(flankingseqs_permutation)
-         all_AA_cg_perm_flankingCAs.append(flankingCAs_permutation)
-         all_AA_cg_perm_vdm_scrr.append(vdm_scrrs_permutation)
-
-   return all_AA_cg_perm_cg_coords, all_AA_cg_perm_vdm_bbcoords, \
-      all_AA_cg_perm_flankingseqs, all_AA_cg_perm_flankingCAs, \
-         all_AA_cg_perm_pdbpaths, all_AA_cg_perm_vdm_scrr
-
-def permute_AA_duplicates(seq):
-   # Dictionary to store indices for each element in the sequence
-   seen = {}
-   for i, item in enumerate(seq):
-      if item not in seen:
-         seen[item] = []
-      seen[item].append(i)
-
-   permute_groups = [] # list of all index groups that have duplicates
-   for indices in seen.values():
-      if len(indices) > 1:  # only interested in elements with duplicates
-         permute_groups.append(indices)
-
-   if not permute_groups: # no duplicates, so return the original index list
-      return [list(range(len(seq)))]
-
-   # generate all possible permutations of indices within each group of duplicates
-   permuted_idx_lists = []
-   for perm_combination in product(*[permutations(group) for group in 
-                                    permute_groups]):
-      # start with the list of original indices
-      permuted_idx = list(range(len(seq)))
-
-      # flatten the product of permutations and assign them to the corresponding 
-      # positions
-      for group_idx, perm in zip(permute_groups, perm_combination):
-         for orig_idx, new_idx in zip(group_idx, perm):
-            permuted_idx[orig_idx] = new_idx
-
-      permuted_idx_lists.append(permuted_idx)
-   
-   return permuted_idx_lists
-
-def combine_cg_and_vdmbb_coords(all_AA_cg_perm_cg_coords, 
-                                all_AA_cg_perm_vdm_bbcoords):
-   all_cg_and_vdmbb_coords = []
-   for _cg, _vdmbb_per_res in zip(all_AA_cg_perm_cg_coords, 
-                                  all_AA_cg_perm_vdm_bbcoords):
-      flattened_cg_coords = np.array(flatten_cg_coords(_cg))
-      flattened_vdmbbs =    np.array(flatten_vdg_bbs(_vdmbb_per_res))
-      cg_and_vdmbb = np.vstack([flattened_cg_coords, flattened_vdmbbs])
-      all_cg_and_vdmbb_coords.append(cg_and_vdmbb)
-   return all_cg_and_vdmbb_coords
-
-def flatten_cg_coords(_cg):
-   coords = []
-   for atom in _cg:
-      coords.append(atom)
-   return coords
-
-def flatten_vdg_bbs(_vdmbb):
-   # Flatten backbones to a single list where each element is a numpy array of the 
-   # x, y, z coords of each vdm backbone atom
-   bbs = []
-   for res in _vdmbb:
-      for atom in res:
-         bbs.append(atom)
-   return bbs
 
 def get_leader_clusters(
    data_to_clus, threshold, AA_subset, size_subset, vdglib_dir,
@@ -139,7 +49,7 @@ def get_leader_clusters(
       @lru_cache(maxsize=_SEQ_CACHE_MAXSIZE)
       def _seqsim_cached(ds_id, i, j):
           seq = get_leader_clusters._SEQ_DATASETS[ds_id]
-          return calc_seq_similarity(seq[i], seq[j])
+          return calc_seq_similarity(seq[i], seq[j]) # returns percent identity
 
       # cache RMSD by metric and dataset identity
       @lru_cache(maxsize=_RMSD_CACHE_MAXSIZE)
@@ -303,70 +213,6 @@ def get_leader_clusters(
    centroids        = {cnum+1: reps[cnum] for cnum in range(len(reps))}
    return clus_assignments, centroids
 
-def kabsch(X, Y, chunk_size=30000):
-   """
-   Rotate and translate X into Y to minimize SSD (Kabsch, 1976).
-   X, Y: arrays of shape [M, N, 3]
-   Returns:
-       R:   [M, 3, 3]
-       t:   [M, 3]
-       ssd: [M]
-   """
-   R_chunks, t_chunks, ssd_chunks = [], [], []
-   M = len(X)
-
-   for start in range(0, M, chunk_size):
-      stop = min(start + chunk_size, M)
-      Xc_in = X[start:stop]
-      Yc_in = Y[start:stop]
-
-      mask = np.logical_or(np.isnan(Xc_in), np.isnan(Yc_in))
-      valid_atom = ~np.any(mask, axis=2)
-      N_atoms = np.sum(valid_atom, axis=1, keepdims=True)
-      zero_rows = (N_atoms == 0).squeeze(-1)
-      safeN = np.where(N_atoms == 0, 1, N_atoms)
-
-      X_nonan = np.where(mask, 0.0, Xc_in).astype(np.float32)
-      Y_nonan = np.where(mask, 0.0, Yc_in).astype(np.float32)
-
-      valid_coords = np.repeat(valid_atom[:, :, None], 3, axis=2)
-      Xbar = (np.sum(X_nonan * valid_coords, axis=1, keepdims=True) /
-              safeN[:, None, :].astype(np.float32))
-      Ybar = (np.sum(Y_nonan * valid_coords, axis=1, keepdims=True) /
-              safeN[:, None, :].astype(np.float32))
-
-      Xc = X_nonan - Xbar
-      Yc = Y_nonan - Ybar
-      Xc[mask] = 0.0
-      Yc[mask] = 0.0
-
-      H = np.matmul(np.transpose(Xc, (0, 2, 1)), Yc)
-      U, S, Vt = np.linalg.svd(H, full_matrices=False)
-      d = np.sign(np.linalg.det(np.matmul(U, Vt))).astype(np.float32)
-
-      D = np.zeros((H.shape[0], 3, 3), dtype=np.float32)
-      D[:, 0, 0] = 1.0
-      D[:, 1, 1] = 1.0
-      D[:, 2, 2] = d
-
-      R = np.matmul(U.astype(np.float32), np.matmul(D, Vt.astype(np.float32)))
-      t = (Ybar - np.matmul(Xbar, R)).reshape(-1, 3)
-
-      XRmY = np.matmul(Xc, R) - Yc
-      ssd = np.sum(XRmY ** 2, axis=(1, 2)).astype(np.float64)
-
-      if np.any(zero_rows):
-         ssd[zero_rows] = np.inf
-
-      R_chunks.append(R)
-      t_chunks.append(t.astype(np.float32))
-      ssd_chunks.append(ssd)
-
-   R = np.concatenate(R_chunks) if R_chunks else np.empty((0, 3, 3), np.float32)
-   t = np.concatenate(t_chunks) if t_chunks else np.empty((0, 3), np.float32)
-   ssd = np.concatenate(ssd_chunks) if ssd_chunks else np.empty((0,), np.float64)
-   return R, t, ssd
-
 def _rmsd_pair(X, Y,):
    '''RMSD between two coordinate arrays (N,3)'''
    X = np.asarray(X, dtype=np.float64)
@@ -378,29 +224,6 @@ def _rmsd_pair(X, Y,):
    n_atoms = X.shape[0]
    return float(np.sqrt(ssd[0] / n_atoms))
 
-def calc_seq_similarity(list1, list2):
-   # Percent identity of flanking residue names after dropping positions labeled 'vdm' 
-   # or 'X'. Returns identity=0 (max dissimilarity) if all positions drop.
-   list1 = [i for i in list1 if i != 'vdm']
-   list2 = [i for i in list2 if i != 'vdm']
-   assert len(list1) == len(list2)
-   # Exclude residues if at least one of them is an "X"
-   indices_to_exclude = []
-   for ind in range(len(list1)):
-      if list1[ind] == 'X' or list2[ind] == 'X':
-         indices_to_exclude.append(ind)
-   list1 = [item for idx, item in enumerate(list1) if idx not in indices_to_exclude]
-   list2 = [item for idx, item in enumerate(list2) if idx not in indices_to_exclude]
-   matches = sum(1 for a, b in zip(list1, list2) if a == b)
-
-   # Calculate the percentage of matches. If all residues were dropped out, 
-   # it should be treated as max dissimilarity.
-   if len(list1) == 0:
-      match_percentage = 0
-   else:
-      match_percentage = (matches / len(list1)) * 100
-   return match_percentage
-
 def get_vdm_res_features(prody_obj, pdbpath, num_flanking):
    # Identify the vdM residues (occ == 2). To be safe, select > 1.5 and < 2.5.
    vdm_residues = prody_obj.select('(occupancy) > 1.5 and (occupancy < 2.5)')
@@ -411,7 +234,7 @@ def get_vdm_res_features(prody_obj, pdbpath, num_flanking):
       vdm_obj = vdm_residues.select(f'resindex {vdm_resind}')
       # BB coords
       bb_coords = get_bb_coords(vdm_obj)
-      if bb_coords is None:
+      if bb_coords is None: # missing N, CA, and/or C
          continue
 
       # Sequence of (contiguous) flanking residues
@@ -446,6 +269,8 @@ def get_vdm_res_features(prody_obj, pdbpath, num_flanking):
                prev_CA = central_vdm_CA
             curr_CA = flanking_seq_dict[ind][1]
             if np.any(np.isnan(curr_CA)): # curr_CA is None:
+               # If chain break, overwrite the residues preceding (if N-term) or 
+               # succeeding (if C-term) the chain break as AA "X".
                flanking_seq_dict = found_chain_break(flanking_seq_dict, ind)
                break 
             dist = pr.calcDistance(np.array(prev_CA), np.array(curr_CA))
@@ -463,126 +288,6 @@ def get_vdm_res_features(prody_obj, pdbpath, num_flanking):
       assert vdm_resind not in list(vdms_dict.keys())
       vdms_dict[vdm_resind] = [vdm_AA, vdm_descript]
    return vdms_dict
-
-def get_res_iden(vdm_obj):
-   seg =     list(set(vdm_obj.getSegnames()))
-   chain =   list(set(vdm_obj.getChids()))
-   resnum =  list(set(vdm_obj.getResnums()))
-   resname = list(set(vdm_obj.getResnames()))
-   assert len(seg) == 1
-   assert len(chain) == 1
-   assert len(resnum) == 1
-   assert len(resname) == 1
-   return seg[0], chain[0], resnum[0], resname[0]
-
-def found_chain_break(flanking_seq_dict, chain_break_ind):
-   # If a chain break is found, overwrite all the subsequent (or preceding) flanking
-   # residues beyond the chain break as AA "X".
-   flank_indices = list(flanking_seq_dict.keys())
-   if chain_break_ind > 0 :
-      inds_to_overwrite = [n for n in flank_indices if n >= chain_break_ind]
-   elif chain_break_ind < 0:
-      inds_to_overwrite = [n for n in flank_indices if n <= chain_break_ind]
-   
-   for overwrite_ind in inds_to_overwrite:
-      flanking_seq_dict[overwrite_ind] = \
-         ['X', np.array([np.nan, np.nan, np.nan])] # ['X', None]
-   return flanking_seq_dict
-
-def get_AA_and_CA_coords(prody_obj, current_resindex):
-   '''
-   Return (AA, CA_coords) for a residue index.
-   If residue is missing/non-protein, returns AA='X' and CA_coords = [nan, nan, nan].
-   '''
-   # Build selection for this residue index
-   if current_resindex < 0: 
-      sel_str = f'resindex `{current_resindex}`'
-   else:
-      sel_str = f'resindex {current_resindex}'
-
-   curr_resindex_obj = prody_obj.select(sel_str)
-   if curr_resindex_obj is None or curr_resindex_obj.protein is None:
-      return 'X', np.array([np.nan, np.nan, np.nan])
-
-   # Resolve residue name
-   curr_res_AA = list(set(curr_resindex_obj.getResnames()))
-   if len(curr_res_AA) != 1:
-      print(f'[WARNING] get_AA_and_CA_coords: \nResindex {current_resindex} in '
-            f'{prody_obj.getTitle()} contains >1 AA: {curr_res_AA}. Defaulting to AA="X".')
-      return 'X', np.array([np.nan, np.nan, np.nan])
-   AA = curr_res_AA[0]
-
-   # Select CA(s)
-   CA_sel = curr_resindex_obj.select(sel_str + ' and name CA')
-   if CA_sel is None or len(CA_sel) == 0:
-      return 'X', np.array([np.nan, np.nan, np.nan])
-
-   try:
-      ca_atom = _pick_single_ca(CA_sel, prev_ca=None)
-      CA_coords = ca_atom.getCoords()
-      # Ensure shape is (3,)
-      CA_coords = np.asarray(CA_coords, dtype=float).reshape(3,)
-   except Exception:
-      print(f'[WARNING] Could not resolve CA for resindex {current_resindex} in '
-            f'{prody_obj.getTitle()}. Defaulting to AA="X".')
-      return 'X', np.array([np.nan, np.nan, np.nan])
-
-   return AA, CA_coords
-
-def get_cg_coords(prody_obj, pdbpath):
-   # The CG atoms have their occupancies set to >= 3.0, with unique values (e.g., 
-   # 3.0, 3.1, 3.2, etc.) to allow a 1:1 correspondence of equivalent atoms between 
-   # different ligands.
-   cg = prody_obj.select('occupancy > 2.9')
-
-   if cg is None or len(cg) == 0:
-      print(f'[WARNING] get_cg_coords: no atoms with occupancy > 2.9 in {pdbpath}')
-      return None
-
-   num_atoms = len(cg)
-   cg_coords = []
-   for ind in range(num_atoms):
-      occ = f'3.{ind}'
-      atom = cg.select(f'occupancy == {occ}')
-      if atom is None or len(atom) != 1:
-         print(f'[WARNING] get_cg_coords: {0 if atom is None else len(atom)} atoms '
-               f'are occupancy {occ} in {pdbpath}.')
-         return None
-      atom_coords = atom.getCoords()[0]
-      cg_coords.append(atom_coords)
-
-   cg_coords = np.asarray(cg_coords, dtype=float)
-
-   if not np.isfinite(cg_coords).all(): # reject NaN or inf coords
-      return None
-
-   return cg_coords
-
-def get_bb_coords(obj):
-   bb_coords = []
-   for atom in ['N', 'CA', 'C']:
-      atom_obj = obj.select(f'name {atom}')
-      if atom_obj is None:
-         return None
-      if len(atom_obj) > 1: # not sure why, but sometimes each atom is duplicated,
-                            # despite having identical coords.
-         ambiguous_coords = None
-         for atom in atom_obj:
-            if ambiguous_coords is None:
-               ambiguous_coords = atom.getCoords()
-            else:
-               dist = pr.calcDistance(ambiguous_coords, atom.getCoords())
-               if dist > 0.2:
-                  return None
-      coord = atom_obj.getCoords()[0]
-      bb_coords.append(coord)
-   return bb_coords
-
-def get_vdg_subsets(input_list, target_size):
-    # Generate combos of residues containing `target_size` elements.
-   if len(input_list) < target_size:
-        return []  
-   return list(combinations(input_list, target_size)) 
 
 def add_vdgs_to_dict(vdm_combos, vdg_subset, re_ordered_aas, re_ordered_bbcoords, 
                      re_ordered_flankingseqs, re_ordered_CAs, re_ordered_scrr, 
@@ -949,18 +654,6 @@ def write_out_subsequent_clus_pdbs(pr_obj, pdb_outpath, scrrs, print_flankbb, tr
    del pr_obj_copy  # sometimes, deep copying leaves open handles 
    gc.collect()     
 
-def get_clus_pdb_outpath(clusnum, clusnum_dir, pdbpath, scrr_cg_perm, clusmem_ind, 
-                         is_centroid):
-   pdbname = os.path.basename(pdbpath).removesuffix('.pdb')
-   scrrs, perm = scrr_cg_perm
-   perm = perm.removeprefix('cg_perm_')
-   vdg_scrr_str = '_'.join(['_'.join([str(z) for z in v_s]) for v_s in scrrs])
-   if is_centroid:
-      pdb_str = f'clus{clusnum}_{pdbname}_{vdg_scrr_str}_CGperm{perm}_ix{clusmem_ind}_centroid.pdb.gz'
-   else:
-      pdb_str = f'clus{clusnum}_{pdbname}_{vdg_scrr_str}_CGperm{perm}_ix{clusmem_ind}.pdb.gz'
-
-   return os.path.join(clusnum_dir, pdb_str)
 
 def manually_write_pdb(outpath, pr_obj):
    # Workaround because of sge's "Too many open files" error.
@@ -1188,11 +881,13 @@ def add_flank_obj_for_cluslevel_flank(par, vdm_scrr, num_flanking, pdbpath):
    # Then, start at vdm again and walk down, breaking if chain break.
    # walk up
    walk_up_resnums = [i for i in range(resnum+1, resnum+num_flanking+1)]
-   walk_up_consec_res = determine_flank_resnums(par, walk_up_resnums, s, c, vdm_ca)
+   walk_up_consec_res = determine_flank_resnums(par, walk_up_resnums, s, c, 
+                     vdm_ca) # determine_flank_resnums detects and handles chain breaks
    resnums_to_print.extend(walk_up_consec_res) 
    # walk down
    walk_down_resnums = [i for i in range(resnum-1, resnum-num_flanking-1, -1)]
-   walk_down_consec_res = determine_flank_resnums(par, walk_down_resnums, s, c, vdm_ca)
+   walk_down_consec_res = determine_flank_resnums(par, walk_down_resnums, s, c, 
+                     vdm_ca) # determine_flank_resnums detects and handles chain breaks
    resnums_to_print.extend(walk_down_consec_res)
    assert len(resnums_to_print) == len(set(resnums_to_print))
    resnums_to_print = [f'`{i}`' if i < 0 else str(i) for i in resnums_to_print]
@@ -1252,77 +947,6 @@ def get_weights(num_cg_atoms, num_bb_atoms, align_cg_weight):
    if not np.abs(weights.sum() - 1.) < 1e-8:
       raise ValueError('Weights do not sum to 1.')
    return weights
-
-def _pick_single_ca(ca_sel, prev_ca):
-   # Return a single CA atom object from a ProDy selection, handling altlocs/dups
-   if len(ca_sel) == 1:
-      return ca_sel[0]
-
-   # If we have multiple CAs (altlocs/dups), prefer the one closest to prev_ca.
-   if prev_ca is None:
-      return ca_sel[0]
-
-   best_atom, best_dist = None, float('inf')
-   for atom in ca_sel:
-      d = pr.calcDistance(prev_ca, atom)
-      if d < best_dist:
-         best_atom, best_dist = atom, d
-   return best_atom
-
-def determine_flank_resnums(par, list_resnums, s, c, vdm_ca):
-   # Determine which flanking residues to add to pr obj based on chain breaks. 
-   resnums_to_include = []
-   assert len(vdm_ca) == 1
-   vdm_ca = vdm_ca[0]
-   prev_ca = vdm_ca
-   # Iterate over resnums 
-   for r in list_resnums:
-      res_sel = f'resnum `{r}`' if r < 0 else f'resnum {r}'
-      if s == '':
-         ca_sel = par.select(f'chain {c} and {res_sel} and name CA')
-      else:
-         ca_sel = par.select(f'segment {s} and chain {c} and {res_sel} and name CA')
-
-      # If missing, stop (chain break).
-      if ca_sel is None or len(ca_sel) == 0:
-         return resnums_to_include
-
-      # Collapse to one CA robustly
-      try:
-         curr_ca = _pick_single_ca(ca_sel, prev_ca)
-      except Exception:
-         return resnums_to_include
-
-      # Check chain break distance to previous CA
-      dist = pr.calcDistance(prev_ca, curr_ca)
-      if dist > 4.5:  # chain break
-          return resnums_to_include
-
-      resnums_to_include.append(r)
-      prev_ca = curr_ca
-
-   return resnums_to_include
-
-def flatten_flanking_CAs(cgvdmbb_clus_flankingCAs):
-   cgvdmbb_clus_flat_flankCAs = []
-   for vdg_flankingCAs in cgvdmbb_clus_flankingCAs:
-      # `vdg_flankingCAs` is a list of vdm residues, so flatten it
-      flat_flanking_CAs = []
-      for res in vdg_flankingCAs:
-         for CA_coord in res:
-            flat_flanking_CAs.append(CA_coord)
-      cgvdmbb_clus_flat_flankCAs.append(flat_flanking_CAs)
-   return cgvdmbb_clus_flat_flankCAs
-
-def flatten_flanking_seqs(flankingCAs_clus_flankingseqs):
-   flattened_flankingseqs_for_vdgs_in_flankingCA_clus = []
-   for vdg_flankingseq in flankingCAs_clus_flankingseqs:
-      flat_vdg_flankingseq = []
-      for vdm_res in vdg_flankingseq:
-         flat_vdg_flankingseq += vdm_res
-      flattened_flankingseqs_for_vdgs_in_flankingCA_clus.append(
-         flat_vdg_flankingseq)
-   return flattened_flankingseqs_for_vdgs_in_flankingCA_clus
 
 def reset_occs(pr_obj_copy, scrrs):
    """

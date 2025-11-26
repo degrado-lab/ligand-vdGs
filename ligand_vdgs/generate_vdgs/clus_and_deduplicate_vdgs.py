@@ -42,7 +42,6 @@ import time
 import tracemalloc
 import shutil
 import numpy as np
-from numba import njit
 import prody as pr
 import multiprocessing as mp
 import json, gzip, hashlib
@@ -51,6 +50,9 @@ import getpass
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'functions'))
 import align_and_cluster as clust
 import utils
+from clus_helpers import (get_vdg_AA_permutations, combine_cg_and_vdmbb_coords, 
+   flatten_flanking_seqs, flatten_flanking_CAs, get_cg_coords, get_vdg_subsets, 
+   select_diverse_pdbIDs)
 
 def parse_args():
    parser = argparse.ArgumentParser()
@@ -176,9 +178,6 @@ def _run_one_bucket_strict(args):
          f"[WORKER ERROR] AA bucket: {aa_label} | count={len(_vdgs)}\n"
          f"Exception: {e}\nTraceback:\n{tb}")
 
-def _aa_key_str(reordered_aas):
-   return "_".join(reordered_aas)
-
 def _stream_root(vdglib_dir):
    # Root for AA composition streaming buckets.
    # Tries $TMPDIR, /scratch, /tmp, and vdglib_dir as fallback
@@ -268,7 +267,7 @@ def _persist_flank_clusters_from_tmp(vdglib_dir, size_subset, logfile):
 
 def _spill_record(vdglib_dir, size_subset, reordered_aas, record):
    # Append one vdG record to its AA bucket file (gzip JSONL)
-   aa_key = _aa_key_str(reordered_aas)
+   aa_key = "_".join(reordered_aas)
    path = _aa_tmp_path(vdglib_dir, size_subset, aa_key)
    os.makedirs(os.path.dirname(path), exist_ok=True)
    with gzip.open(path, "at", encoding="utf-8") as f:
@@ -286,8 +285,7 @@ def _load_bucket(path):
             rec["flankseqs"],
             [np.asarray(r) for r in rec["flankCAs"]],
             rec["pdbpath"],
-            rec["scrr"],
-         ])
+            rec["scrr"],])
    return _vdgs
 
 def main():
@@ -323,11 +321,8 @@ def main():
          with open(logfile, 'a') as file:
               file.write(f"Could not parse {pdbpath} \n")
          continue
-      cg_coords = clust.get_cg_coords(prody_obj, pdbpath)
-      if cg_coords is None:
-         with open(logfile, 'a') as file:
-            file.write(f'[WARNING] get_cg_coords: NaN or inf CG coords in {pdbpath}; '
-                       f'skipping.\n')
+      cg_coords = get_cg_coords(prody_obj, pdbpath)
+      if cg_coords is None: # already logged reason inside get_cg_coords()
          continue
       # Define symmetry class if it's None so it's compatible with pdb output naming
       if symmetry_classes is None: 
@@ -336,7 +331,7 @@ def main():
       vdms_dict = clust.get_vdm_res_features(prody_obj, pdbpath, num_flanking)
       # Determine the vdM combinations, up to 4 residues
       vdm_resinds = list(vdms_dict.keys())
-      vdg_subsets = clust.get_vdg_subsets(vdm_resinds, size_subset)
+      vdg_subsets = get_vdg_subsets(vdm_resinds, size_subset)
       # Iterate over subsets of resinds
       for vdg_subset in vdg_subsets:
          # Record these features in the same order as in vdg_subset. Then, sort all 
@@ -532,7 +527,7 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
    all_AA_perm_cg_coords, all_AA_perm_vdm_bbcoords, \
       all_AA_perm_flankingseqs, all_AA_perm_flankingCAs, \
       all_AA_perm_pdbpaths, all_AA_perm_vdm_scrr = \
-      clust.get_vdg_AA_permutations(reordered_AAs, _vdgs)
+      get_vdg_AA_permutations(reordered_AAs, _vdgs)
 
    # Add in permutations of symmetric CG atoms.
    all_AA_cg_perm_cg_coords, all_AA_cg_perm_vdm_bbcoords, \
@@ -542,11 +537,11 @@ def cluster_vdgs_of_same_AA_comp(_vdgs, seq_sim_thresh, reordered_AAs,
          all_AA_perm_flankingseqs, all_AA_perm_flankingCAs, all_AA_perm_pdbpaths, 
          all_AA_perm_vdm_scrr, symmetry_classes)
    
-   all_AA_cg_perm_cg_and_vdmbb_coords = clust.combine_cg_and_vdmbb_coords(
+   all_AA_cg_perm_cg_and_vdmbb_coords = combine_cg_and_vdmbb_coords(
       all_AA_cg_perm_cg_coords, all_AA_cg_perm_vdm_bbcoords)
-   all_AA_cg_perm_flat_flankingseqs = clust.flatten_flanking_seqs(
+   all_AA_cg_perm_flat_flankingseqs = flatten_flanking_seqs(
       all_AA_cg_perm_flankingseqs)
-   all_AA_cg_perm_flat_flankCAs = clust.flatten_flanking_CAs(
+   all_AA_cg_perm_flat_flankCAs = flatten_flanking_CAs(
       all_AA_cg_perm_flankingCAs)
    # Count # of cg vdm bb atoms
    num_cg_atoms = len(all_AA_cg_perm_cg_coords[0])
@@ -660,61 +655,6 @@ def normalize_rmsd(num_atoms, atoms):
    threshold = min_threshold + scaling_factor * (max_threshold - min_threshold)
    
    return threshold
-
-def select_diverse_pdbIDs(strings, k): # k = max num to select
-   # Greedy max–min Hamming selection over equal-length strings (PDB IDs)
-   # to promote dataset diversity. Assumes PDB IDs are 4 characters long.
-   ascii_array = strings_to_ascii_array(strings)
-   selected_indices = select_diverse_subset_greedy(ascii_array, k)
-   return [strings[i] for i in selected_indices]
-
-def strings_to_ascii_array(strings):
-   return np.array([[ord(c) for c in s] for s in strings], dtype=np.uint8)
-
-@njit
-def hamming(s1, s2):
-   dist = 0
-   for i in range(len(s1)):
-      if s1[i] != s2[i]:
-         dist += 1
-   return dist
-
-@njit
-def update_min_dists(data, selected_idx, selected_mask, min_dists):
-   n = data.shape[0]
-   for i in range(n):
-      if selected_mask[i] == 0:
-         dist = hamming(data[selected_idx], data[i])
-         if dist < min_dists[i]:
-            min_dists[i] = dist
-
-def select_diverse_subset_greedy(data, k):
-   n = data.shape[0]
-   selected = [0]  # start with first point
-   selected_mask = np.zeros(n, dtype=np.uint8)
-   selected_mask[0] = 1
-   min_dists = np.full(n, 255, dtype=np.uint8)
-
-   # Initial distance pass
-   for i in range(1, n):
-      min_dists[i] = hamming(data[0], data[i])
-
-   for _ in range(1, min(n, k)):
-      # Select max of min distances
-      max_idx = -1
-      max_val = -1
-      for i in range(n):
-         if selected_mask[i] == 0 and min_dists[i] > max_val:
-            max_val = min_dists[i]
-            max_idx = i
-
-      selected.append(max_idx)
-      selected_mask[max_idx] = 1
-
-      # Parallel update of min distances
-      update_min_dists(data, max_idx, selected_mask, min_dists)
-
-   return selected
 
 if __name__ == "__main__":
    main()
