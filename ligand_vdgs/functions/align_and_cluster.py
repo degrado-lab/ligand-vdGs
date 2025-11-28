@@ -232,6 +232,12 @@ def get_vdm_res_features(prody_obj, pdbpath, num_flanking):
       if bb_coords is None: # missing N, CA, and/or C
          continue
 
+      # Add heavy atoms for this vdM residue
+      vdm_heavy_sel = vdm_obj.select('not element H D')
+      if vdm_heavy_sel is None or len(vdm_heavy_sel) == 0:
+         continue
+      vdm_heavy_coords = vdm_heavy_sel.getCoords().astype(float)
+
       # Sequence of (contiguous) flanking residues
       flanking_seq_dict = {} # key = relative flank num (-1, +1, etc.), 
                              # value = list(AA identity, CA coords)
@@ -278,7 +284,8 @@ def get_vdm_res_features(prody_obj, pdbpath, num_flanking):
       # Get this vdm resind's PDB identifier (seg, chain, resnum)
       vdm_seg_chain_resnum_resname = get_res_iden(vdm_obj)
       # Store all into dict
-      vdm_descript = [vdm_seg_chain_resnum_resname, bb_coords, flanking_seq_dict]
+      vdm_descript = [vdm_seg_chain_resnum_resname, bb_coords, flanking_seq_dict,
+                      vdm_heavy_coords]
       vdm_AA = vdm_seg_chain_resnum_resname[-1]
       assert vdm_resind not in list(vdms_dict.keys())
       vdms_dict[vdm_resind] = [vdm_AA, vdm_descript]
@@ -293,11 +300,15 @@ def reorder_vdg_subset(vdg_subset, vdms_dict, cg_obj, prody_obj):
    flankingseqs_of_vdms_in_order = []
    flanking_CA_coords_of_vdms_in_order = []
    seg_ch_res_of_vdms_in_order = []
+   vdm_heavycoords_of_vdms_in_order = []
+
    for _vdmresind in vdg_subset:
       vdmAA, vdm_features = vdms_dict[_vdmresind]
-      vdm_seg_chain_resnum_resname, bb_coords, flanking_seq_dict = vdm_features
+      vdm_seg_chain_resnum_resname, bb_coords, flanking_seq_dict, vdm_heavy_coords = vdm_features
       seg_ch_res_of_vdms_in_order.append(vdm_seg_chain_resnum_resname)
       bb_coords_of_vdms_in_order.append(bb_coords)
+      vdm_heavycoords_of_vdms_in_order.append(vdm_heavy_coords)
+
       flankingseqs = []
       flankingCAs = []
       sorted_flank_indices = sorted(list(flanking_seq_dict.keys()))
@@ -373,9 +384,12 @@ def reorder_vdg_subset(vdg_subset, vdms_dict, cg_obj, prody_obj):
    
    assert len(aas_of_vdms_in_order) == len(bb_coords_of_vdms_in_order)
    # Then, re-order based on alphabetical order
-   super_list = [aas_of_vdms_in_order, bb_coords_of_vdms_in_order, 
-      flankingseqs_of_vdms_in_order, flanking_CA_coords_of_vdms_in_order, 
-      seg_ch_res_of_vdms_in_order]
+   super_list = [aas_of_vdms_in_order,
+                 bb_coords_of_vdms_in_order, 
+                 flankingseqs_of_vdms_in_order,
+                 flanking_CA_coords_of_vdms_in_order, 
+                 seg_ch_res_of_vdms_in_order,
+                 vdm_heavycoords_of_vdms_in_order]
    return sort_vdGs_by_AA(super_list)
 
 def sort_vdGs_by_AA(super_list):
@@ -427,12 +441,17 @@ def permute_on_indices(symmetry_classes, coords_to_permute):
 
 def get_vdg_AA_and_cg_perms(all_AA_perm_cg_coords,    all_AA_perm_vdm_bbcoords, 
                             all_AA_perm_flankingseqs, all_AA_perm_flankingCAs, 
-                            all_AA_perm_pdbpaths,     all_AA_perm_vdm_scrr, 
+                            all_AA_perm_pdbpaths,     all_AA_perm_vdm_scrr,
+                            all_AA_perm_vdm_heavycoords,
                             symmetry_classes):
    if symmetry_classes is None:
-      return [all_AA_perm_cg_coords, all_AA_perm_vdm_bbcoords,          
-              all_AA_perm_flankingseqs, all_AA_perm_flankingCAs, 
-              all_AA_perm_pdbpaths, all_AA_perm_vdm_scrr]
+      return [all_AA_perm_cg_coords,
+              all_AA_perm_vdm_bbcoords,
+              all_AA_perm_flankingseqs,
+              all_AA_perm_flankingCAs, 
+              all_AA_perm_pdbpaths,
+              all_AA_perm_vdm_scrr,
+              all_AA_perm_vdm_heavycoords]
 
    # Recompile the vdgs with the permuted symmetric cg indices
    all_AA_cg_perm_cg_coords = []
@@ -441,11 +460,17 @@ def get_vdg_AA_and_cg_perms(all_AA_perm_cg_coords,    all_AA_perm_vdm_bbcoords,
    all_AA_cg_perm_flankingCAs = []
    all_AA_cg_perm_pdbpaths = []
    all_AA_cg_perm_vdm_scrr_cg_perm = []
+   all_AA_cg_perm_vdm_heavycoords = []
    
-   for cgcoords, vdmcoords, seq, CAs, pdbpath, scrr in zip(all_AA_perm_cg_coords,
-            all_AA_perm_vdm_bbcoords, all_AA_perm_flankingseqs, 
-            all_AA_perm_flankingCAs, all_AA_perm_pdbpaths, all_AA_perm_vdm_scrr):
-      
+   for (cgcoords, vdmcoords, seq, CAs, pdbpath, scrr, vdm_heavycoords) in zip(
+           all_AA_perm_cg_coords,
+           all_AA_perm_vdm_bbcoords,
+           all_AA_perm_flankingseqs,
+           all_AA_perm_flankingCAs,
+           all_AA_perm_pdbpaths,
+           all_AA_perm_vdm_scrr,
+           all_AA_perm_vdm_heavycoords):
+
       perms = permute_on_indices(symmetry_classes, cgcoords)
 
       for perm_ind, perm in enumerate(perms):
@@ -457,10 +482,17 @@ def get_vdg_AA_and_cg_perms(all_AA_perm_cg_coords,    all_AA_perm_vdm_bbcoords,
          # add permutation index to the scrr label
          vdm_scrr_perm = [scrr, f'cg_perm_{perm_ind+1}']
          all_AA_cg_perm_vdm_scrr_cg_perm.append(vdm_scrr_perm)
+         # heavy-atom coords are per-vdM residue and unaffected by CG permutations
+         all_AA_cg_perm_vdm_heavycoords.append(vdm_heavycoords)
    
-   return [all_AA_cg_perm_cg_coords,    all_AA_cg_perm_vdm_bbcoords, 
-           all_AA_cg_perm_flankingseqs, all_AA_cg_perm_flankingCAs, 
-           all_AA_cg_perm_pdbpaths,     all_AA_cg_perm_vdm_scrr_cg_perm]
+   return [all_AA_cg_perm_cg_coords,
+           all_AA_cg_perm_vdm_bbcoords, 
+           all_AA_cg_perm_flankingseqs,
+           all_AA_cg_perm_flankingCAs, 
+           all_AA_cg_perm_pdbpaths,
+           all_AA_cg_perm_vdm_scrr_cg_perm,
+           all_AA_cg_perm_vdm_heavycoords]
+
 
 def reassign_cgvdmbb_clusters(cgvdmbb_clus_assignments,
     all_pdbpaths, all_scrr_cg_perm):

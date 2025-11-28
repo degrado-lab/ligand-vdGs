@@ -1,3 +1,5 @@
+# clus_helpers.py
+
 import os
 import numpy as np
 import prody as pr
@@ -7,6 +9,12 @@ import hashlib
 import getpass
 
 def get_vdg_AA_permutations(reordered_AAs, _vdgs):
+    """
+    Expand vdGs over AA permutations (for duplicated AAs).
+
+    Each _vdg is:
+        [cg_coords, bbcoords, flankseqs, flankCAs, pdbpath, scrr, vdm_heavycoords]
+    """
     permuted_indices = permute_AA_duplicates(reordered_AAs)
     all_AA_cg_perm_cg_coords = []
     all_AA_cg_perm_vdm_bbcoords = []
@@ -14,31 +22,41 @@ def get_vdg_AA_permutations(reordered_AAs, _vdgs):
     all_AA_cg_perm_flankingCAs = []
     all_AA_cg_perm_pdbpaths = []
     all_AA_cg_perm_vdm_scrr = []
+    all_AA_cg_perm_vdm_heavycoords = []
 
     # Iterate over all AA permutations of each vdg
     for _vdg in _vdgs:
         # CG coords and pdbpaths remain unchanged, but vdmbbs, flankingseqs, 
-        # flankingCAs, and scrrs need to be permuted.
+        # flankingCAs, scrrs, and vdm_heavycoords need to be permuted.
         for permutation in permuted_indices:
             all_AA_cg_perm_cg_coords.append(_vdg[0])
             all_AA_cg_perm_pdbpaths.append(_vdg[4])
+
             nonpermuted_vdmbb = _vdg[1]
             nonpermuted_flankingseqs = _vdg[2]
             nonpermuted_flankingCAs = _vdg[3]
             nonpermuted_vdm_scrr = _vdg[5]
+            nonpermuted_vdm_heavy = _vdg[6]
+
             vdmbb_permutation = [nonpermuted_vdmbb[ix] for ix in permutation]
-            flankingseqs_permutation = [nonpermuted_flankingseqs[ix] for ix in 
-                                        permutation]
+            flankingseqs_permutation = [nonpermuted_flankingseqs[ix] for ix in permutation]
             flankingCAs_permutation = [nonpermuted_flankingCAs[ix] for ix in permutation]
             vdm_scrrs_permutation = [nonpermuted_vdm_scrr[ix] for ix in permutation]
+            vdm_heavy_permutation = [nonpermuted_vdm_heavy[ix] for ix in permutation]
+
             all_AA_cg_perm_vdm_bbcoords.append(vdmbb_permutation)
             all_AA_cg_perm_flankingseqs.append(flankingseqs_permutation)
             all_AA_cg_perm_flankingCAs.append(flankingCAs_permutation)
             all_AA_cg_perm_vdm_scrr.append(vdm_scrrs_permutation)
+            all_AA_cg_perm_vdm_heavycoords.append(vdm_heavy_permutation)
 
-    return all_AA_cg_perm_cg_coords, all_AA_cg_perm_vdm_bbcoords, \
-        all_AA_cg_perm_flankingseqs, all_AA_cg_perm_flankingCAs, \
-        all_AA_cg_perm_pdbpaths, all_AA_cg_perm_vdm_scrr
+    return (all_AA_cg_perm_cg_coords,
+            all_AA_cg_perm_vdm_bbcoords,
+            all_AA_cg_perm_flankingseqs,
+            all_AA_cg_perm_flankingCAs,
+            all_AA_cg_perm_pdbpaths,
+            all_AA_cg_perm_vdm_scrr,
+            all_AA_cg_perm_vdm_heavycoords)
 
 def permute_AA_duplicates(seq):
     # Dictionary to store indices for each element in the sequence
@@ -318,7 +336,7 @@ def get_bb_coords(obj):
                     print(
                         f"[WARNING] Ambiguous coordinates for {obj.getTitle()} resnum "
                         f"{set(obj.getResnums())} atom {atom_name} are {dist} apart; "
-                        f"using first occurrence, but investigate why.")
+                        f"using first occurrence.")
                     break
 
         # Scenarios: clean structure w/ 1 atom, duplicate atoms < 0.2A apart are 
