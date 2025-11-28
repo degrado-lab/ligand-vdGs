@@ -24,11 +24,6 @@ def parse_args():
     parser.add_argument('--symmetry-classes', nargs='+', type=str,
                         help='Integers representing the symmetry classes of the CG '
                         'atoms on which clustering is to be performed.')
-    parser.add_argument('-w', "--align-cg-weight", type=float, default=0.99, 
-                        help="Fraction of weights to assign to CG atoms (collectively) "
-                        "when superposing output vdGs. Not weights for clustering. "
-                        "Example: 0.5 means 1/2 of weight is assigned to CG atoms and "
-                        "the remaining 1/2 goes to the vdM backbone atoms. Defaults to 0.99.")
     parser.add_argument('-m', "--max-num-vdgs-to-clus", default=2500, type=int, 
                         help="Maximum number of PDBs w/ vdgs of the same AA compositions "
                         "to cluster.")
@@ -44,7 +39,6 @@ def main():
     pdb_dir = args.pdb_dir
     probe_dir = args.probe_dir
     out_dir = args.out_dir
-    align_cg_weight = args.align_cg_weight
     symm_classes = args.symmetry_classes
     if symm_classes is not None:
         symm_classes = ' '.join(symm_classes)
@@ -71,7 +65,6 @@ def main():
     write_out_commandline_params(logfile, smarts, cg, pdb_dir, probe_dir, out_dir,
                                  symm_classes, logdir=None,  # not used now
                                  max_num_to_clus= max_num_to_clus,
-                                 align_cg_weight= align_cg_weight,
                                  num_procs=num_procs)
 
     # Set up temporary outdir for fingerprints 
@@ -138,7 +131,7 @@ def main():
             f'-P "{pdb_dir}" -F "{fingerprints_dir}" '
             f'--cg-match-dict-pkl "{match_pkl}" '
             f'-s {symm_classes} -l "{logfile}" '
-            f'-w {align_cg_weight} -m {max_num_to_clus} '
+            f'-m {max_num_to_clus} '
             f'--num-procs {num_procs}')
     else:
         deduplicate_template = (
@@ -146,7 +139,7 @@ def main():
             f'-c "{cg}" -v "{out_dir}" '
             f'-P "{pdb_dir}" -F "{fingerprints_dir}" '
             f'--cg-match-dict-pkl "{match_pkl}" '
-            f'-l "{logfile}" -w {align_cg_weight} '
+            f'-l "{logfile}" '
             f'-m {max_num_to_clus} --num-procs {num_procs}')
 
     # Run for subset sizes n = 1, 2
@@ -209,13 +202,12 @@ def run_gen_fingerprints(job_index, num_procs, fingerprints_cmd):
 
 def write_out_commandline_params(logfile, smarts, cg, pdb_dir, probe_dir, out_dir, 
                                  symm_classes, logdir, max_num_to_clus, 
-                                 align_cg_weight, num_procs):
+                                 num_procs):
     # logdir no longer used; logfile lives directly in out_dir
     with open(logfile, 'w') as _log:
         _log.write(f'SMARTS: {smarts} \n')
         _log.write(f'CG: {cg} \n')
         _log.write(f'Symmetry classes: {symm_classes} \n')
-        _log.write(f'Weight to align CGs: {align_cg_weight} \n')
         _log.write(f'Max num vdgs to cluster: {max_num_to_clus} \n')
         _log.write(f'Parent PDB dir: {pdb_dir} \n')
         _log.write(f'Probe dir: {probe_dir} \n')

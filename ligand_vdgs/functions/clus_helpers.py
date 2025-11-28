@@ -4,6 +4,7 @@ import prody as pr
 from itertools import permutations, product, combinations
 from numba import njit
 import hashlib
+import getpass
 
 def get_vdg_AA_permutations(reordered_AAs, _vdgs):
     permuted_indices = permute_AA_duplicates(reordered_AAs)
@@ -72,31 +73,13 @@ def permute_AA_duplicates(seq):
    
     return permuted_idx_lists
 
-def combine_cg_and_vdmbb_coords(all_AA_cg_perm_cg_coords, 
-                                all_AA_cg_perm_vdm_bbcoords):
-    all_cg_and_vdmbb_coords = []
-    for _cg, _vdmbb_per_res in zip(all_AA_cg_perm_cg_coords, 
-                                   all_AA_cg_perm_vdm_bbcoords):
-        flattened_cg_coords = np.array(flatten_cg_coords(_cg))
-        flattened_vdmbbs =    np.array(flatten_vdg_bbs(_vdmbb_per_res))
-        cg_and_vdmbb = np.vstack([flattened_cg_coords, flattened_vdmbbs])
-        all_cg_and_vdmbb_coords.append(cg_and_vdmbb)
-    return all_cg_and_vdmbb_coords
-
-def flatten_cg_coords(_cg):
-    coords = []
-    for atom in _cg:
-       coords.append(atom)
-    return coords
-
-def flatten_vdg_bbs(_vdmbb):
-    # Flatten backbones to a single list where each element is a numpy array of the 
-    # x, y, z coords of each vdm backbone atom
-    bbs = []
-    for res in _vdmbb:
-       for atom in res:
-          bbs.append(atom)
-    return bbs
+def combine_cg_and_vdmbb_coords(all_cg, all_vdmbb):
+    out = []
+    for _cg, _vdmbb in zip(all_cg, all_vdmbb):
+        flattened_cg = np.asarray(_cg)
+        flattened_vdmbb = np.asarray([atom for res in _vdmbb for atom in res])
+        out.append(np.vstack([flattened_cg, flattened_vdmbb]))
+    return out
 
 def flatten_flanking_CAs(cgvdmbb_clus_flankingCAs):
     cgvdmbb_clus_flat_flankCAs = []
@@ -317,40 +300,6 @@ def get_cg_coords(prody_obj, pdbpath):
 
     return cg_coords
 
-def determine_flank_resnums(par, list_resnums, s, c, vdm_ca):
-    # Determine which flanking residues to add to pr obj based on chain breaks. 
-    resnums_to_include = []
-    assert len(vdm_ca) == 1
-    vdm_ca = vdm_ca[0]
-    prev_ca = vdm_ca
-    # Iterate over resnums 
-    for r in list_resnums:
-        res_sel = f'resnum `{r}`' if r < 0 else f'resnum {r}'
-        if s == '':
-            ca_sel = par.select(f'chain {c} and {res_sel} and name CA')
-        else:
-            ca_sel = par.select(f'segment {s} and chain {c} and {res_sel} and name CA')
-
-        # If missing, stop (chain break).
-        if ca_sel is None or len(ca_sel) == 0:
-            return resnums_to_include
-
-        # Collapse to one CA robustly
-        try:
-            curr_ca = _pick_single_ca(ca_sel, prev_ca)
-        except Exception:
-            return resnums_to_include
-
-        # Check chain break distance to previous CA
-        dist = pr.calcDistance(prev_ca, curr_ca)
-        if dist > 4.5:  # chain break
-            return resnums_to_include
-
-        resnums_to_include.append(r)
-        prev_ca = curr_ca
-
-    return resnums_to_include
-
 def get_bb_coords(obj):
     bb_coords = []
     for atom_name in ['N', 'CA', 'C']:
@@ -383,19 +332,6 @@ def get_vdg_subsets(input_list, target_size):
     if len(input_list) < target_size:
         return []  
     return list(combinations(input_list, target_size)) 
-
-def get_clus_pdb_outpath(clusnum, clusnum_dir, pdbpath, scrr_cg_perm, clusmem_ind, 
-                         is_centroid):
-    pdbname = os.path.basename(pdbpath).removesuffix('.pdb')
-    scrrs, perm = scrr_cg_perm
-    perm = perm.removeprefix('cg_perm_')
-    vdg_scrr_str = '_'.join(['_'.join([str(z) for z in v_s]) for v_s in scrrs])
-    if is_centroid:
-        pdb_str = f'clus{clusnum}_{pdbname}_{vdg_scrr_str}_CGperm{perm}_ix{clusmem_ind}_centroid.pdb.gz'
-    else:
-        pdb_str = f'clus{clusnum}_{pdbname}_{vdg_scrr_str}_CGperm{perm}_ix{clusmem_ind}.pdb.gz'
-
-    return os.path.join(clusnum_dir, pdb_str)
 
 def select_diverse_pdbIDs(strings, k): # k = max num to select
    # Greedy max–min Hamming selection over equal-length strings (PDB IDs)
