@@ -13,7 +13,8 @@ def get_vdg_AA_permutations(reordered_AAs, _vdgs):
     Expand vdGs over AA permutations (for duplicated AAs).
 
     Each _vdg is:
-        [cg_coords, bbcoords, flankseqs, flankCAs, pdbpath, scrr, vdm_heavycoords]
+        [cg_coords, bbcoords, flankseqs, flankCAs, pdbpath, scrr, vdm_heavycoords,
+         cg_names, cg_elements, cg_seg, cg_chain, cg_resnum, cg_resname]
     """
     permuted_indices = permute_AA_duplicates(reordered_AAs)
     all_AA_cg_perm_cg_coords = []
@@ -23,6 +24,12 @@ def get_vdg_AA_permutations(reordered_AAs, _vdgs):
     all_AA_cg_perm_pdbpaths = []
     all_AA_cg_perm_vdm_scrr = []
     all_AA_cg_perm_vdm_heavycoords = []
+    all_AA_cg_perm_cg_names = []
+    all_AA_cg_perm_cg_elements = []
+    all_AA_cg_perm_cg_seg = []
+    all_AA_cg_perm_cg_chain = []
+    all_AA_cg_perm_cg_resnum = []
+    all_AA_cg_perm_cg_resname = []
 
     # Iterate over all AA permutations of each vdg
     for _vdg in _vdgs:
@@ -49,14 +56,18 @@ def get_vdg_AA_permutations(reordered_AAs, _vdgs):
             all_AA_cg_perm_flankingCAs.append(flankingCAs_permutation)
             all_AA_cg_perm_vdm_scrr.append(vdm_scrrs_permutation)
             all_AA_cg_perm_vdm_heavycoords.append(vdm_heavy_permutation)
+            all_AA_cg_perm_cg_names.append(_vdg[7])
+            all_AA_cg_perm_cg_elements.append(_vdg[8])
+            all_AA_cg_perm_cg_seg.append(_vdg[9])
+            all_AA_cg_perm_cg_chain.append(_vdg[10])
+            all_AA_cg_perm_cg_resnum.append(_vdg[11])
+            all_AA_cg_perm_cg_resname.append(_vdg[12])
 
-    return (all_AA_cg_perm_cg_coords,
-            all_AA_cg_perm_vdm_bbcoords,
-            all_AA_cg_perm_flankingseqs,
-            all_AA_cg_perm_flankingCAs,
-            all_AA_cg_perm_pdbpaths,
-            all_AA_cg_perm_vdm_scrr,
-            all_AA_cg_perm_vdm_heavycoords)
+    return (all_AA_cg_perm_cg_coords, all_AA_cg_perm_vdm_bbcoords, 
+        all_AA_cg_perm_flankingseqs, all_AA_cg_perm_flankingCAs, all_AA_cg_perm_pdbpaths,
+        all_AA_cg_perm_vdm_scrr, all_AA_cg_perm_vdm_heavycoords, all_AA_cg_perm_cg_names,
+        all_AA_cg_perm_cg_elements, all_AA_cg_perm_cg_seg, all_AA_cg_perm_cg_chain,
+        all_AA_cg_perm_cg_resnum, all_AA_cg_perm_cg_resname)
 
 def permute_AA_duplicates(seq):
     # Dictionary to store indices for each element in the sequence
@@ -94,8 +105,9 @@ def permute_AA_duplicates(seq):
 def combine_cg_and_vdmbb_coords(all_cg, all_vdmbb):
     out = []
     for _cg, _vdmbb in zip(all_cg, all_vdmbb):
-        flattened_cg = np.asarray(_cg)
-        flattened_vdmbb = np.asarray([atom for res in _vdmbb for atom in res])
+        flattened_cg = np.asarray(_cg, dtype=np.float32)
+        flattened_vdmbb = np.asarray([atom for res in _vdmbb for atom in res],
+            dtype=np.float32,)
         out.append(np.vstack([flattened_cg, flattened_vdmbb]))
     return out
 
@@ -106,7 +118,7 @@ def flatten_flanking_CAs(cgvdmbb_clus_flankingCAs):
         flat_flanking_CAs = []
         for res in vdg_flankingCAs:
             for CA_coord in res:
-                flat_flanking_CAs.append(CA_coord)
+                flat_flanking_CAs.append(np.asarray(CA_coord, dtype=np.float32))
         cgvdmbb_clus_flat_flankCAs.append(flat_flanking_CAs)
     return cgvdmbb_clus_flat_flankCAs
 
@@ -261,62 +273,79 @@ def get_AA_and_CA_coords(prody_obj, current_resindex):
 
     curr_resindex_obj = prody_obj.select(sel_str)
     if curr_resindex_obj is None or curr_resindex_obj.protein is None:
-        return 'X', np.array([np.nan, np.nan, np.nan])
+        return 'X', np.array([np.nan, np.nan, np.nan], dtype=np.float32)
 
     # Resolve residue name
     curr_res_AA = list(set(curr_resindex_obj.getResnames()))
     if len(curr_res_AA) != 1:
         print(f'[WARNING] get_AA_and_CA_coords: \nResindex {current_resindex} in '
               f'{prody_obj.getTitle()} contains >1 AA: {curr_res_AA}. Defaulting to AA="X".')
-        return 'X', np.array([np.nan, np.nan, np.nan])
+        return 'X', np.array([np.nan, np.nan, np.nan], dtype=np.float32)
     AA = curr_res_AA[0]
 
     # Select CA(s)
     CA_sel = curr_resindex_obj.select(sel_str + ' and name CA')
     if CA_sel is None or len(CA_sel) == 0:
-        return 'X', np.array([np.nan, np.nan, np.nan])
+        return 'X', np.array([np.nan, np.nan, np.nan], dtype=np.float32)
 
     try:
         ca_atom = _pick_single_ca(CA_sel, prev_ca=None)
-        CA_coords = ca_atom.getCoords()
-        # Ensure shape is (3,)
-        CA_coords = np.asarray(CA_coords, dtype=float).reshape(3,)
+        CA_coords = np.asarray(ca_atom.getCoords(), dtype=np.float32)
     except Exception:
         print(f'[WARNING] Could not resolve CA for resindex {current_resindex} in '
               f'{prody_obj.getTitle()}. Defaulting to AA="X".')
-        return 'X', np.array([np.nan, np.nan, np.nan])
+        return 'X', np.array([np.nan, np.nan, np.nan], dtype=np.float32)
 
     return AA, CA_coords
 
-def get_cg_coords(prody_obj, pdbpath):
-    # The CG atoms have their occupancies set to >= 3.0, with unique values (e.g., 
-    # 3.0, 3.1, 3.2, etc.) to allow a 1:1 correspondence of equivalent atoms between 
-    # different ligands.
+def get_cg_atoms(prody_obj, pdbpath):
     cg = prody_obj.select('occupancy > 2.9')
-
     if cg is None or len(cg) == 0:
-        print(f'[WARNING] get_cg_coords: no atoms with occupancy > 2.9 in {pdbpath}')
+        print(f'[WARNING] get_cg_atoms: no atoms with occupancy > 2.9 in {pdbpath}')
         return None
-
     num_atoms = len(cg)
-    cg_coords = []
+    coords, names, elements, segs, chains, resnums, resnames = [], [], [], [], [], [], []
     for ind in range(num_atoms):
         occ = f'3.{ind}'
         atom = cg.select(f'occupancy == {occ}')
         if atom is None or len(atom) != 1:
-            print(f'[WARNING] get_cg_coords: {0 if atom is None else len(atom)} atoms '
+            print(f'[WARNING] get_cg_atoms: {0 if atom is None else len(atom)} atoms '
                   f'are occupancy {occ} in {pdbpath}.')
             return None
-        atom_coords = atom.getCoords()[0]
-        cg_coords.append(atom_coords)
+        a = atom[0]
 
-    cg_coords = np.asarray(cg_coords, dtype=float)
+        #c = np.asarray(a.getCoords(), dtype=float)
+        #if c.ndim == 2:
+        #    # e.g. shape (1, 3)
+        #    c = c[0]
+        #if c.shape != (3,):
+        #    print(f'[WARNING] get_cg_atoms: unexpected coord shape {c.shape} for '
+        #          f'{pdbpath}; skipping CG.')
+        #    return None
 
-    if  not np.isfinite(cg_coords).all(): # reject NaN or inf coords
-            print(f'[WARNING] get_cg_coords: NaN or inf CG coords in {pdbpath}.')
-            return None
+        coords.append(a.getCoords())
+        names.append(a.getName())
+        elements.append(a.getElement())
+        segs.append(a.getSegname())
+        chains.append(a.getChid())
+        resnums.append(int(a.getResnum()))
+        resnames.append(a.getResname())
+    return (np.asarray(coords, dtype=np.float32),
+            names, elements, segs, chains, resnums, resnames)
 
-    return cg_coords
+def get_cg_coords(prody_obj, pdbpath):
+    out = get_cg_atoms(prody_obj, pdbpath)
+    if out is None:
+        return None
+    coords, _, _, _, _, _, _ = out
+    return coords
+
+def get_cg_atom_metadata(prody_obj, pdbpath):
+    out = get_cg_atoms(prody_obj, pdbpath)
+    if out is None:
+        return None
+    _, names, elements, segs, chains, resnums, resnames = out
+    return (names, elements, segs, chains, resnums, resnames)
 
 def get_bb_coords(obj):
     bb_coords = []
@@ -341,7 +370,7 @@ def get_bb_coords(obj):
 
         # Scenarios: clean structure w/ 1 atom, duplicate atoms < 0.2A apart are 
         # likely benign, and duplicate atoms > 0.2A possibly harmful, so log warning. 
-        bb_coords.append(first_coord)
+        bb_coords.append(np.asarray(first_coord, dtype=np.float32))
 
     return bb_coords
 

@@ -26,8 +26,8 @@ log_dir = '/wynton/home/degradolab/skt/docking/frag_sge_logs'
 pdb_parent_dir = '/wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2/'
 probe_dir = '/wynton/group/degradolab/skt/docking/databases/probe_output/'
 max_num_clus = '5000' # max number of vdgs to cluster for each vdg subset
-h_rt = '150:00:00 '
-num_procs = '10'
+h_rt = '300:00:00 '
+num_procs = '20'
 # Provide a file with smiles to run (one per line), or set to None
 smiles_to_run_file = '/wynton/home/degradolab/skt/logs/needed_frags.txt'
 
