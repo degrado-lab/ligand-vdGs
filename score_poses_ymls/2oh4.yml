@@ -1,8 +1,0 @@
-rmsd_threshold: 0.75 
-query_pdb_paths: ['/wynton/home/degradolab/skt/docking/query_structs/2oh4.pdb']
-lig_smiles: 'COC(=O)Nc1[nH]c2ccc(cc2n1)Oc3ccc(cc3)NC(=O)Nc4cc(ccc4F)C(F)(F)F'
-vdg_lib_dir: '/wynton/group/degradolab/skt/docking/databases/frag_vdg_lib'
-outdir: '/wynton/home/degradolab/skt/docking/vdg_matches'
-frags_to_exclude: [] 
-frags_to_include: 'all'
-overwrite_existing: True
