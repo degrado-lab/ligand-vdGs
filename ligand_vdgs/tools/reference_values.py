@@ -43,16 +43,23 @@ AA_background_freq = \
            'TYR': 0.03489372480131626,
            'VAL': 0.07244700673477375}
 
-def avg_size_aa():
+def avg_aa_size_unweighted():
+    '''Unweighted mean heavy-atom count across the 20 canonical AAs.'''
     return np.mean(list(AA_size.values()))
 
-def avg_size_of_aa_pair():
-    size_aa_pairs = {}
-    for aa1 in set(AA_size):
-        for aa2 in set(AA_size):
-            sorted_aa_pair = tuple(sorted([aa1, aa2])) # ensure only upper triangle
-            pair_size = AA_size[aa1] + AA_size[aa2]
-            if sorted_aa_pair not in size_aa_pairs.keys():
-                size_aa_pairs[sorted_aa_pair] = pair_size
-    avg_size_of_aa_pair = np.mean(list(size_aa_pairs.values()))
-    return avg_size_of_aa_pair
+def avg_aa_size_bg_weighted():
+    '''Background-frequency-weighted mean heavy-atom count.
+    Use as the normalization denominator so that size-adjusted enrichment = 0
+    when an AA's count is fully explained by its background frequency and size.'''
+    return sum(AA_background_freq[aa] * AA_size[aa] for aa in AA_size)
+
+def avg_aa_pair_size_unweighted():
+    '''Unweighted mean combined heavy-atom count across all 210 unique AA pairs.
+    Equals 2 × avg_aa_size_unweighted() by linearity of expectation.'''
+    return 2 * avg_aa_size_unweighted()
+
+def avg_aa_pair_size_bg_weighted():
+    '''Expected combined heavy-atom count for a pair of AAs drawn independently
+    from the background frequency distribution.
+    = E[size(aa1) + size(aa2)] = 2 * avg_aa_size_bg_weighted() by linearity.'''
+    return 2 * avg_aa_size_bg_weighted()

@@ -27,7 +27,7 @@ This guide explains how to generate a van der Graph (vdG) database for small mol
 
 Before running any pipeline steps, you need a preprocessed PDB database to extract vdGs from. You can use any collection of PDB structures — your own custom set or a mirror of the RCSB PDB. Once you have your source PDBs, complete Steps 1–4 in order before moving on to Steps 5–6.
 
-- **Step 1: Format the directory layout.** Structures must be organized in RCSB mirror format: each file is named `XXXX.pdb` (4-character code) and placed in a subdirectory named after the inner 2 characters of the code. For example, `1ABC.pdb` → `AB/1ABC.pdb`. Use [`ligand-vdGs/tools/format_parent_database.py`](../tools/format_parent_database.py) to reformat an existing directory.
+- **Step 1: Format the directory layout.** Structures must be organized in RCSB mirror format: each file is named `XXXX.pdb` (4-character code) and placed in a subdirectory named after the inner 2 characters of the code. For example, `1ABC.pdb` → `AB/1ABC.pdb`. Use [`ligand-vdGs/scripts/format_parent_database.py`](../scripts/format_parent_database.py) to reformat an existing directory.
 
 - **Step 2: Prune the database (optional, recommended).** Run [`ligand-vdGs/ligand_vdgs/preprocessing/s01_trim_database.py`](../ligand_vdgs/preprocessing/s01_trim_database.py) to filter by ligand b-factor and extract 10 Å binding-site regions, reducing database size and removing redundant structures. The pipeline works without this step, but skipping it means running on full PDB files (slower, larger, and noisier). If you run it, use the output as `-p` in Step 6 below; otherwise use the formatted database from Step 1.
 

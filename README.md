@@ -7,9 +7,13 @@ This package builds upon https://github.com/degrado-lab/vdG-miner by Rian Kormos
 For prerequisites and detailed instructions on obtaining a vdG database, please refer to the [Database Generation Guide](docs/database_generation_guide.md) located in `ligand-vdGs/docs/`.
 
 
+## Bioisostere Identification
+
+Compute amino acid interaction profiles for CGs in the fragment library and compare them to identify candidate bioisosteres. See [docs/bioisostere_identification.md](docs/bioisostere_identification.md).
+
 ## Quick Start
 ### Set up the conda environment for this package.
-From the `vdG-ligands` top-level directory, run 
+From the `ligand-vdGs` top-level directory, run 
 ```bash
 conda env create -f environment.yml
 conda activate vdg_env

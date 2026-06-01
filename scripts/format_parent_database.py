@@ -13,7 +13,7 @@ Usage:
     >> cd $YOUR_LIGAND-VDGS_DIR
     >> pip install -e . # for debugging and developing
     >> pip install .    # for users
-    >> python -m ligand_vdgs.tools.format_parent_database \
+    >> python scripts/format_parent_database.py \
         --pdb-input-dir <input_dir> \
         --pdb-output-dir <output_dir>
 '''

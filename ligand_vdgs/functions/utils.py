@@ -492,3 +492,18 @@ def smiles_to_job_name(smiles):
     '''Encode SMILES into a string safe for SGE job names (encodes # which truncates directives).'''
     return ''.join(_SMILES_TO_JOB_NAME.get(c, c) for c in smiles)
 
+def resolve_cg(vdglib_dir, smiles):
+    '''
+    Return the frag_lib subdirectory name whose SMILES is canonically equivalent
+    to `smiles`. Raises FileNotFoundError if no match is found.
+    Use this to map a user-provided SMILES to its canonical library entry.
+    The returned name is the raw directory name as it exists on disk (already
+    encoded by smiles_to_filename at library-creation time).
+    '''
+    for dirname in os.listdir(vdglib_dir):
+        if os.path.isdir(os.path.join(vdglib_dir, dirname)):
+            if smiles_equiv(dirname, smiles, check_atom_order=False):
+                return dirname
+    raise FileNotFoundError(
+        f'No frag_lib entry matches SMILES "{smiles}" in {vdglib_dir}')
+

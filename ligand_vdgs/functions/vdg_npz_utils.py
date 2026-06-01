@@ -8,15 +8,12 @@ import utils
 def _append_full_ligand_from_parent(all_coords, names, resnames, resnums, chids, segnames, 
     elements, occupancies, parent_pdb_path, cg_coords, cg_chain, cg_resnum, cg_names):
     "Add non-CG ligand atoms from parent PDB, mapped into cg_coords frame, occ=4.0."
-    print("\n--- DEBUG: entering _append_full_ligand_from_parent ---")
-    print("Parent PDB:", parent_pdb_path)
-
     if not parent_pdb_path:
         return
     try:
         pdb = pr.parsePDB(parent_pdb_path)
     except Exception as e:
-        print(f"[DEBUG] parsePDB failed: {e}")
+        print(f"[WARNING] parsePDB failed for {parent_pdb_path}: {e}")
         return
 
     cg_coords = np.asarray(cg_coords, float)
@@ -32,15 +29,11 @@ def _append_full_ligand_from_parent(all_coords, names, resnames, resnums, chids,
 
     cg_keys     = set(cg_atom_coords.keys())
     cg_res_keys = sorted({(str(c), int(r)) for c, r in zip(cg_chain, cg_resnum)})
-    print("CG unique (chain,resnum):", cg_res_keys)
-    print("CG atom keys (chain,resnum,name): sample:", list(cg_keys)[:10])
 
     for ch_res in cg_res_keys:
         ch, rn = ch_res
-        print(f"[DEBUG] Selecting ligand atoms in parent PDB: chain {ch}, resnum {rn}")
         sel = pdb.select(f"chain {ch} and resnum {rn}")
         if sel is None:
-            print(f"[DEBUG]   No atoms for chain {ch} resnum {rn} in parent PDB")
             continue
 
         coords_pdb = sel.getCoords()
@@ -60,9 +53,7 @@ def _append_full_ligand_from_parent(all_coords, names, resnames, resnums, chids,
                 match_cg.append(cg_atom_coords[key])
 
         if len(match_pdb) < 3:
-            print(f"[DEBUG]   Only {len(match_pdb)} matching CG atoms; "
-                  f"skipping ligand transform for {ch} {rn}")
-            coords_mapped = coords_pdb  # best we can do
+            coords_mapped = coords_pdb  # too few shared atoms to fit; use as-is
         else:
             X = np.asarray(match_pdb, float).reshape(1, -1, 3)  # mobile: parent PDB
             Y = np.asarray(match_cg, float).reshape(1, -1, 3)  # target: cg_coords frame
@@ -70,10 +61,6 @@ def _append_full_ligand_from_parent(all_coords, names, resnames, resnums, chids,
             R, t = R_all[0], t_all[0]
             coords_mapped = coords_pdb @ R + t
 
-        print(f"[DEBUG]   Parent ligand atoms: {len(coords_pdb)}, "
-              f"CG matches used for fit: {len(match_pdb)}")
-
-        added_count = 0
         for c_map, an, rn_, ch_, el, sg, rn_name in zip(
                 coords_mapped, anames, rnums, chs, elems, segs, rnames):
             key = (str(ch_), int(rn_), str(an))
@@ -87,9 +74,6 @@ def _append_full_ligand_from_parent(all_coords, names, resnames, resnums, chids,
             segnames.append(str(sg).strip())
             elements.append((str(el).strip() or "C"))
             occupancies.append(4.0)
-            added_count += 1
-
-        print(f"[DEBUG]   Added {added_count} new ligand atoms (occ 4.0)")
 
 def build_vdg_atomgroup_from_npz(cg_coords, cg_names, cg_elements, cg_seg, cg_chain, 
     cg_resnum, cg_resname, vdm_bb_coords, vdm_atom_coords, vdm_atom_names, 
@@ -223,7 +207,8 @@ def load_vdg_bucket(vdg_lib_dir, frag_name, subset_size, aa_bucket):
             bb=data["centroid_vdm_bb_coords"].astype(np.float32),
             resnames=data["centroid_scrr_resname"],  # dtype <U4/string
         )
-    except Exception:
+    except Exception as e:
+        print(f"[WARNING] Could not load {npz_path}: {e}")
         bucket = None
 
     return bucket
