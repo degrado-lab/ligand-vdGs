@@ -5,8 +5,9 @@ from itertools import permutations, product
 import numpy as np
 import prody as pr
 from functools import lru_cache
-from clus_helpers import (kabsch, calc_seq_similarity, get_res_iden, found_chain_break,
+from clus_helpers import (calc_seq_similarity, get_res_iden, found_chain_break,
                           get_AA_and_CA_coords, get_bb_coords)
+from utils import kabsch
 
 _RMSD_CACHE_MAXSIZE = 100_000
 _SEQ_CACHE_MAXSIZE  = 50_000
@@ -209,12 +210,18 @@ def get_leader_clusters(
    return clus_assignments, centroids
 
 def _rmsd_pair(X, Y,):
-   '''RMSD between two coordinate arrays (N,3)'''
+   '''RMSD between two coordinate arrays (N,3); NaN rows (missing flanking residues) are skipped.'''
    X = np.asarray(X, dtype=np.float64)
    Y = np.asarray(Y, dtype=np.float64)
    if X.shape != Y.shape:
       raise ValueError(f"RMSD pair got mismatched shapes: {X.shape} vs {Y.shape}")
-   # Use vectorized Kabsch with a single pair (M=1)
+   # Drop positions where either array has NaN (chain breaks / missing residues).
+   # Mirrors calc_seq_similarity, which already drops 'X' flanking positions.
+   valid = ~(np.isnan(X).any(axis=1) | np.isnan(Y).any(axis=1))
+   if not valid.any():
+      return float('inf')
+   X = X[valid]
+   Y = Y[valid]
    _, _, ssd = kabsch(X[None, ...], Y[None, ...], chunk_size=1)
    n_atoms = X.shape[0]
    return float(np.sqrt(ssd[0] / n_atoms))

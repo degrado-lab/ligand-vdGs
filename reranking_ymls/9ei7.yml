@@ -1,9 +1,0 @@
-rmsd_threshold: 0.7
-query_pdbs_dir: '/wynton/home/degradolab/skt/docking/query_structs/9ei7_no_v_preds/'
-solved_struct_path:  '/wynton/home/degradolab/skt/docking/target_structs/9ei7_no_v.pdb' # ground truth
-lig_smiles: 'N[C@@H]1[C@@H](O)[C@H](O[C@@H]2[C@@H]1O[C@H]([C@@H]2O[P](O)(O)=O)N3C=CC(=O)NC3=O)C(O)=O'
-vdg_lib_dir: '/wynton/group/degradolab/skt/docking/databases/frag_vdg_lib'
-outdir: '/wynton/home/degradolab/skt/docking/vdg_matches'
-frags_to_exclude: [] 
-frags_to_include: 'all'
-query_pdbs: 'all'

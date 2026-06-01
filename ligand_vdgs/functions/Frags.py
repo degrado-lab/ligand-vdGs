@@ -7,7 +7,7 @@ from collections import defaultdict
 import prody as pr
 import utils
 
-def get_fragments(bond_radius, mol, min_frag_size=4, max_frag_size=7, quiet=True): 
+def get_fragments(bond_radius, mol, min_frag_size=4, max_frag_size=5, quiet=True): 
     # Decompose the ligand into fragments and store the fragment SMILES. Use SMILES 
     # instead of SMARTS b/c only SMILES (from rdkit) differentiates aliphatic and 
     # aryl (C,c vs. [#6]). Fragment on bond radii `bond_radius` AND the postive 
@@ -65,7 +65,8 @@ def get_fragments(bond_radius, mol, min_frag_size=4, max_frag_size=7, quiet=True
     return grouped_frags
 
 def group_lig_sites_by_overlap(data, key_index=2, threshold=0.5):
-    '''Input: list of tuples (substruct Mol obj, perm_inds, orig_mol_inds) that describe 
+    """
+    Input: list of tuples (substruct Mol obj, perm_inds, orig_mol_inds) that describe 
         instances of a frag in a lig. Determine whether each site has >1 instances, as 
         determined by sharing (overlapping) >=1/2 of the atoms b/n one frag instance and 
         another. For example, if one instance has orig_mol_inds [14, 15, 16, 17] and 
@@ -73,7 +74,8 @@ def group_lig_sites_by_overlap(data, key_index=2, threshold=0.5):
         This avoids overcounting of matches when there are diff permutations of the CG.
     Output: list of groups.
     Method: Two frag instances are related if |A ∩ B| > threshold * max(|A|, |B|).
-    '''
+    """
+    
     sets = [set(item[key_index]) for item in data]
     n = len(data)
     # Union–find
@@ -235,43 +237,62 @@ def is_organic(mol):
     else:
         return True
 
-def get_frags_from_pdbfile(pdbfile, lig_smiles, quiet=False): 
-    if pdbfile.endswith('.pdb') or pdbfile.endswith('.pdb.gz'):
-        query_struct = pr.parsePDB(pdbfile)
-    elif pdbfile.endswith('.cif'):
-        query_struct = pr.parseCIF(pdbfile)
+def get_frags_from_structure(struct_or_path, lig_smiles, quiet=False):
+    """
+    Fragment a ligand from either a prody obj or a path to a pdb/pdb.gz/cif file
+
+    Returns:
+        filtered_frags: dict[sub_smiles -> list of groups (sites)]
+        pdb_mol_assigned_bonds_no_H: RDKit Mol (ligand, no H, single permutation)
+    """
+    
+    if isinstance(struct_or_path, str):
+        if struct_or_path.endswith('.pdb') or struct_or_path.endswith('.pdb.gz'):
+            query_struct = pr.parsePDB(struct_or_path)
+        elif struct_or_path.endswith('.cif'):
+            query_struct = pr.parseCIF(struct_or_path)
+    else:
+        # assume prody obj
+        query_struct = struct_or_path
+
     # Identify ligand and fragment it
-    hetatms = query_struct.hetatm.select('not (ion or resname SEP or resname TPO or resname MSE)')
-    assert len(set(hetatms.getResindices())) == 1
-    # Convert from prody obj to rdkit Mol obj
+    hetatms = query_struct.hetatm.select(
+        'not (ion or resname SEP or resname TPO or resname MSE)')
+    
+    if hetatms is None:
+        raise ValueError("get_frags_from_structure: could not find ligand HETATM atoms.")
+    assert len(set(hetatms.getResnames())) == 1, "Expected exactly one ligand residue."
+
+    # Convert from ProDy object to RDKit Mol via an in-memory PDB block
     buf = io.StringIO()
     pr.writePDBStream(buf, hetatms)
     pdb_block = buf.getvalue()
     pdb_mol = Chem.MolFromPDBBlock(pdb_block, removeHs=True)
-    lig_template = Chem.MolFromSmiles(lig_smiles) 
-    # Assign bond orders (b/c rdkit doesn't calculate this from PDB coords) to detect 
-    # correct valence and aromaticity 
+    lig_template = Chem.MolFromSmiles(lig_smiles)
+
+    # Assign bond orders (valence + aromaticity)
     try:
         pdb_mol_assigned_bonds = AllChem.AssignBondOrdersFromTemplate(lig_template, pdb_mol)
         pdb_mol_assigned_bonds_no_H_perm_inds, pdb_mol_smiles_no_H = manually_remove_Hs(
             pdb_mol_assigned_bonds, return_single_mol_or_perms='single')
         pdb_mol_assigned_bonds_no_H, pdb_mol_perm_inds = pdb_mol_assigned_bonds_no_H_perm_inds
+        # Fragment the H-stripped ligand
         filtered_frags = get_fragments(2, pdb_mol_assigned_bonds_no_H, 4, 5, quiet=quiet)
         return filtered_frags, pdb_mol_assigned_bonds_no_H
     except ValueError as e:
-        print(f"Error processing {pdbfile}: {e}", flush=True)
+        print(f"Error processing {struct_or_path}: {e}", flush=True)
         return {}, None
 
 def check_vdg_job_status(sub_smiles, vdg_lib_dir):
     # Check if the vdg generation job finished without issues
-    vdg_log_file = os.path.join(vdg_lib_dir, sub_smiles, 'logs', f'{sub_smiles}_log')
+    vdg_log_file = os.path.join(vdg_lib_dir, sub_smiles, f'{sub_smiles}_log')
     if not os.path.exists(vdg_log_file):
         return False
     with open(vdg_log_file, 'r') as f:
         log_contents = f.read()
     return 'Job completed.' in log_contents
 
-def summarize_frags(frags_in_lib, frags_to_exclude, frags_to_include):
+def summarize_frags(frags_in_lib, frags_to_exclude, frags_to_include, logfile_fh):
     groups = {
         "Excluded": [],
         "Not in include list": [],
@@ -289,16 +310,11 @@ def summarize_frags(frags_in_lib, frags_to_exclude, frags_to_include):
         else:
             groups["In vdg lib and in include list"].append(sub_smiles)
 
+    # Log summary
     if groups:
-        print("\nFragment summary:", flush=True)
+        print("\n--- Fragment vdG Library Summary ---", file=logfile_fh)
         for category, frags in groups.items():
             if frags:
-                print(f"{category}:", flush=True)
-                print("   ", ", ".join(frags), flush=True)
-        print("\n", flush=True)
-
-def check_in_exclude_list(sub_smiles, frags_to_exclude):
-    for frag in frags_to_exclude:
-        if utils.smiles_equiv(frag, sub_smiles):
-            return True
-    return False
+                print(f"{category}:", file=logfile_fh)
+                print("   ", ", ".join(frags), file=logfile_fh)
+        print("\n", file=logfile_fh)

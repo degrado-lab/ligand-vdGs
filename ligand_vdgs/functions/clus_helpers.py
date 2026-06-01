@@ -132,70 +132,6 @@ def flatten_flanking_seqs(flankingCAs_clus_flankingseqs):
             flat_vdg_flankingseq)
     return flattened_flankingseqs_for_vdgs_in_flankingCA_clus
 
-def kabsch(X, Y, chunk_size=30000):
-    """
-    Rotate and translate X into Y to minimize SSD (Kabsch, 1976).
-    X, Y: arrays of shape [M, N, 3]
-    Returns:
-        R:   [M, 3, 3]
-        t:   [M, 3]
-        ssd: [M]
-    """
-    R_chunks, t_chunks, ssd_chunks = [], [], []
-    M = len(X)
-
-    for start in range(0, M, chunk_size):
-        stop = min(start + chunk_size, M)
-        Xc_in = X[start:stop]
-        Yc_in = Y[start:stop]
-
-        mask = np.logical_or(np.isnan(Xc_in), np.isnan(Yc_in))
-        valid_atom = ~np.any(mask, axis=2)
-        N_atoms = np.sum(valid_atom, axis=1, keepdims=True)
-        zero_rows = (N_atoms == 0).squeeze(-1)
-        safeN = np.where(N_atoms == 0, 1, N_atoms)
-
-        X_nonan = np.where(mask, 0.0, Xc_in).astype(np.float32)
-        Y_nonan = np.where(mask, 0.0, Yc_in).astype(np.float32)
-
-        valid_coords = np.repeat(valid_atom[:, :, None], 3, axis=2)
-        Xbar = (np.sum(X_nonan * valid_coords, axis=1, keepdims=True) /
-                safeN[:, None, :].astype(np.float32))
-        Ybar = (np.sum(Y_nonan * valid_coords, axis=1, keepdims=True) /
-                safeN[:, None, :].astype(np.float32))
-
-        Xc = X_nonan - Xbar
-        Yc = Y_nonan - Ybar
-        Xc[mask] = 0.0
-        Yc[mask] = 0.0
-
-        H = np.matmul(np.transpose(Xc, (0, 2, 1)), Yc)
-        U, S, Vt = np.linalg.svd(H, full_matrices=False)
-        d = np.sign(np.linalg.det(np.matmul(U, Vt))).astype(np.float32)
-
-        D = np.zeros((H.shape[0], 3, 3), dtype=np.float32)
-        D[:, 0, 0] = 1.0
-        D[:, 1, 1] = 1.0
-        D[:, 2, 2] = d
-
-        R = np.matmul(U.astype(np.float32), np.matmul(D, Vt.astype(np.float32)))
-        t = (Ybar - np.matmul(Xbar, R)).reshape(-1, 3)
-
-        XRmY = np.matmul(Xc, R) - Yc
-        ssd = np.sum(XRmY ** 2, axis=(1, 2)).astype(np.float64)
-
-        if np.any(zero_rows):
-            ssd[zero_rows] = np.inf
-
-        R_chunks.append(R)
-        t_chunks.append(t.astype(np.float32))
-        ssd_chunks.append(ssd)
-
-    R = np.concatenate(R_chunks) if R_chunks else np.empty((0, 3, 3), np.float32)
-    t = np.concatenate(t_chunks) if t_chunks else np.empty((0, 3), np.float32)
-    ssd = np.concatenate(ssd_chunks) if ssd_chunks else np.empty((0,), np.float64)
-    return R, t, ssd
-
 def calc_seq_similarity(list1, list2):
     # Percent identity of flanking residue names after dropping positions labeled 'vdm' 
     # or 'X'. Returns identity=0 (max dissimilarity) if all positions drop.
@@ -374,7 +310,7 @@ def get_bb_coords(obj):
 
     return bb_coords
 
-def get_vdg_subsets(input_list, target_size):
+def get_vdg_subsets_target_size(input_list, target_size):
     # Generate combos of residues containing `target_size` elements.
     if len(input_list) < target_size:
         return []  

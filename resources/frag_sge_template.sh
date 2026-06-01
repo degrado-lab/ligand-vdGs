@@ -1,5 +1,5 @@
 # Template for submitting jobs to SGE. This template is used by 
-# ligand_vdgs/generate_vdgs/make_sge_scripts.py 
+# ligand_vdgs/generate_vdgs/make_sge_scripts_for_frags.py 
 
 #!/bin/bash
 

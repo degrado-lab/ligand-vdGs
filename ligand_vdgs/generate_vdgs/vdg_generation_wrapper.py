@@ -1,17 +1,24 @@
 import os
+import sys
 import time
 import subprocess
 import argparse 
 import shutil
 import multiprocessing
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(os.path.join(HERE, "..", "functions"))
+from utils import convert_time_elapsed
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('-s', '--smarts', type=str, required=True, 
                         help="SMARTS pattern.")
-    parser.add_argument('-c', '--cg', type=str, 
-                        help="The common name for the chemical group. Defaults "
-                        "to the SMARTS pattern.")
+    parser.add_argument('-c', '--cg', type=str,
+                        help="Label for the chemical group — used as the output "
+                        "subdirectory name under the vdG library. Can be a "
+                        "descriptive name (e.g. 'carboxylate') or any identifier, "
+                        "but by convention the SMARTS string itself is passed here. "
+                        "Defaults to the SMARTS pattern.")
     parser.add_argument('-p', "--pdb-dir", type=str, required=True,
                         help="Path to your PDB parent database with the same "
                         "directory structure as a mirror of the RCSB PDB; see "
@@ -63,8 +70,7 @@ def main():
         logfile = logfile + "_" + str(time.time())
 
     write_out_commandline_params(logfile, smarts, cg, pdb_dir, probe_dir, out_dir,
-                                 symm_classes, logdir=None,  # not used now
-                                 max_num_to_clus= max_num_to_clus,
+                                 symm_classes, max_num_to_clus=max_num_to_clus,
                                  num_procs=num_procs)
 
     # Set up temporary outdir for fingerprints 
@@ -169,13 +175,7 @@ def main():
 def delete_empty_dirs(_dir):
     for root, dirs, files in os.walk(_dir):
         if not dirs and not files:
-            os.system(f'rmdir "{root}"')
-
-def convert_time_elapsed(seconds):
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = round(seconds % 60, 2)
-    return h, m, s
+            os.rmdir(root)
 
 def set_up_outdir(out_dir):
     # Set up output directory
@@ -200,10 +200,8 @@ def run_gen_fingerprints(job_index, num_procs, fingerprints_cmd):
     fingerprints_cmd = f'{fingerprints_cmd} -j {job_index} -n {num_procs}'
     subprocess.run(fingerprints_cmd, shell=True, check=True)
 
-def write_out_commandline_params(logfile, smarts, cg, pdb_dir, probe_dir, out_dir, 
-                                 symm_classes, logdir, max_num_to_clus, 
-                                 num_procs):
-    # logdir no longer used; logfile lives directly in out_dir
+def write_out_commandline_params(logfile, smarts, cg, pdb_dir, probe_dir, out_dir,
+                                 symm_classes, max_num_to_clus, num_procs):
     with open(logfile, 'w') as _log:
         _log.write(f'SMARTS: {smarts} \n')
         _log.write(f'CG: {cg} \n')

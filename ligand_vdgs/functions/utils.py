@@ -1,12 +1,17 @@
+# utils.py
+
 import os
 import shutil
 from collections import defaultdict
+from itertools import permutations, product
 from rdkit import Chem
+from rdkit.Chem import rdMolAlign as MA
+import numpy as np
 
 def handle_existing_files(out_dir):
     os.makedirs(out_dir, exist_ok=True)
     if len(os.listdir(out_dir)) > 0:
-        raise ValueError(f'The output dir {out_dir} is not empty. Remove files or define a new '
+        raise ValueError(f'[ERROR] The output dir {out_dir} is not empty. Remove files or define a new '
              'output dir name to prevent accidental overwriting.')
 
 def set_up_outdir(outdir, overwrite=False):
@@ -14,7 +19,7 @@ def set_up_outdir(outdir, overwrite=False):
     no stale files.'''
     if os.path.exists(outdir):
         if not os.path.isdir(outdir):
-            raise ValueError(f'The filename you designated as the output directory, {outdir}, '
+            raise ValueError(f'[ERROR] The filename you designated as the output directory, {outdir}, '
                              'already exists and is not a directory.')
         if overwrite:
             print(f'\nWarning: overwriting existing output directory {outdir} because '
@@ -28,7 +33,7 @@ def set_up_outdir(outdir, overwrite=False):
         else:
             # Allow empty dirs; error only if files are present.
             if any(os.scandir(outdir)):
-                raise ValueError(f'The output directory {outdir} is not empty. Remove files or '
+                raise ValueError(f'[ERROR] The output directory {outdir} is not empty. Remove files or '
                                  'set overwrite_existing to True to prevent accidental overwriting.')
     else:
         parent_dir = os.path.dirname(outdir)
@@ -286,3 +291,204 @@ def define_symmetry(smiles):
         normalized.append(mapping[lab])
 
     return " ".join(map(str, normalized))
+
+def kabsch(X, Y, chunk_size=30000):
+    """
+    Fast chunked Kabsch for inputs that should contain NO NaNs.
+
+    Supported usage:
+      X: [N, 3] or [M, N, 3]
+      Y: [M, N, 3]
+
+    Returns:
+      R:   [M, 3, 3]
+      t:   [M, 3]
+      ssd: [M]
+
+    Behavior:
+      - keeps chunking
+      - fails fast on NaNs
+      - specializes the common case X:[N,3], Y:[M,N,3]
+    """
+    X = np.asarray(X, dtype=np.float32)
+    Y = np.asarray(Y, dtype=np.float32)
+
+    if Y.ndim != 3:
+        raise ValueError(f"kabsch: Y must have ndim=3, got Y.ndim={Y.ndim}, Y.shape={Y.shape}")
+
+    if X.ndim not in (2, 3):
+        raise ValueError(f"kabsch: X must have ndim 2 or 3, got X.ndim={X.ndim}")
+
+    if np.isnan(X).any() or np.isnan(Y).any():
+        x_nan = np.argwhere(np.isnan(X))
+        y_nan = np.argwhere(np.isnan(Y))
+        x_msg = "none" if x_nan.size == 0 else f"first X NaN at {tuple(x_nan[0])}"
+        y_msg = "none" if y_nan.size == 0 else f"first Y NaN at {tuple(y_nan[0])}"
+        raise ValueError(
+            "NaNs detected in kabsch input. "
+            f"{x_msg}; {y_msg}; "
+            f"X.shape={X.shape}; Y.shape={Y.shape}"
+        )
+
+    M = Y.shape[0]
+    R_chunks = []
+    t_chunks = []
+    ssd_chunks = []
+
+    # Fast path: one fixed X against many Y rows
+    if X.ndim == 2:
+        # X: [N, 3]
+        Xbar = X.mean(axis=0, keepdims=True)    # [1, 3]
+        Xc = X - Xbar                           # [N, 3]
+        XcT = Xc.T                              # [3, N]
+
+        for start in range(0, M, chunk_size):
+            stop = min(start + chunk_size, M)
+            Y_chunk = Y[start:stop]             # [m, N, 3]
+
+            Ybar = Y_chunk.mean(axis=1, keepdims=True)   # [m, 1, 3]
+            Yc = Y_chunk - Ybar                           # [m, N, 3]
+
+            # H[m] = Xc^T @ Yc[m]
+            H = np.matmul(XcT[None, :, :], Yc)           # [m, 3, 3]
+
+            U, _, Vt = np.linalg.svd(H, full_matrices=False)
+
+            UVt = np.matmul(U, Vt)
+            d = np.sign(np.linalg.det(UVt)).astype(np.float32, copy=False)
+
+            D = np.empty((H.shape[0], 3, 3), dtype=np.float32)
+            D.fill(0.0)
+            D[:, 0, 0] = 1.0
+            D[:, 1, 1] = 1.0
+            D[:, 2, 2] = d
+
+            R = np.matmul(U, np.matmul(D, Vt)).astype(np.float32, copy=False)
+
+            # t[m] = Ybar[m] - Xbar @ R[m]
+            XRbar = np.matmul(Xbar[None, :, :], R)[:, 0, :]   # [m, 3]
+            t = (Ybar[:, 0, :] - XRbar).astype(np.float32, copy=False)
+
+            XR = np.matmul(Xc[None, :, :], R)                 # [m, N, 3]
+            diff = XR - Yc
+            ssd = np.sum(diff * diff, axis=(1, 2)).astype(np.float64, copy=False)
+
+            R_chunks.append(R)
+            t_chunks.append(t)
+            ssd_chunks.append(ssd)
+
+    # Fallback: batched X and batched Y
+    else:
+        for start in range(0, M, chunk_size):
+            stop = min(start + chunk_size, M)
+            X_chunk = X[start:stop]
+            Y_chunk = Y[start:stop]
+
+            Xbar = X_chunk.mean(axis=1, keepdims=True)
+            Ybar = Y_chunk.mean(axis=1, keepdims=True)
+
+            Xc = X_chunk - Xbar
+            Yc = Y_chunk - Ybar
+
+            H = np.matmul(np.transpose(Xc, (0, 2, 1)), Yc)
+
+            U, _, Vt = np.linalg.svd(H, full_matrices=False)
+
+            UVt = np.matmul(U, Vt)
+            d = np.sign(np.linalg.det(UVt)).astype(np.float32, copy=False)
+
+            D = np.empty((H.shape[0], 3, 3), dtype=np.float32)
+            D.fill(0.0)
+            D[:, 0, 0] = 1.0
+            D[:, 1, 1] = 1.0
+            D[:, 2, 2] = d
+
+            R = np.matmul(U, np.matmul(D, Vt)).astype(np.float32, copy=False)
+            t = (Ybar - np.matmul(Xbar, R)).reshape(-1, 3).astype(np.float32, copy=False)
+
+            diff = np.matmul(Xc, R) - Yc
+            ssd = np.sum(diff * diff, axis=(1, 2)).astype(np.float64, copy=False)
+
+            R_chunks.append(R)
+            t_chunks.append(t)
+            ssd_chunks.append(ssd)
+
+    if R_chunks:
+        R = np.concatenate(R_chunks, axis=0)
+        t = np.concatenate(t_chunks, axis=0)
+        ssd = np.concatenate(ssd_chunks, axis=0)
+    else:
+        R = np.empty((0, 3, 3), dtype=np.float32)
+        t = np.empty((0, 3), dtype=np.float32)
+        ssd = np.empty((0,), dtype=np.float64)
+
+    return R, t, ssd
+
+def convert_time_elapsed(seconds):
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = round(seconds % 60, 2)
+    return h, m, s
+
+def best_inplace_symmetry_rmsd(ref_mol, query_mol, max_permutations=1000):
+    """
+    Compute best in-place RMSD between ref_mol and query_mol, enumerating
+    permutations of symmetry-equivalent atoms.
+
+    - Uses identify_mol_symmetry(ref_mol) to get symmetry classes.
+    - Only permutes atoms within symmetry-equivalent groups.
+    - Uses rdMolAlign.CalcRMS (NO re-alignment; structures assumed pre-aligned).
+    """
+    if ref_mol.GetNumAtoms() != query_mol.GetNumAtoms():
+        raise ValueError(f"[ERROR] Atom count mismatch: ref={ref_mol.GetNumAtoms()}, "
+            f"query={query_mol.GetNumAtoms()}")
+
+    # Symmetry groups from WL refinement
+    groups = identify_mol_symmetry(ref_mol)
+    perm_groups = [g for g in groups if len(g) > 1]  # only non-trivial groups
+
+    # No symmetry -> plain in-place RMSD
+    if not perm_groups:
+        return MA.CalcRMS(query_mol, ref_mol)
+
+    # Enumerate permutations per group
+    group_perms = [list(permutations(g)) for g in perm_groups]
+    total = 1
+    for gp in group_perms:
+        total *= len(gp)
+
+    if total > max_permutations:
+        print(f"[WARNING] best_inplace_symmetry_rmsd: symmetry permutations={total} "
+            f"> max_permutations={max_permutations}; this may be slow.", flush=True,)
+
+    N = ref_mol.GetNumAtoms()
+    best = None
+    n_evaluated = 0
+
+    for combo in product(*group_perms):
+        perm = list(range(N))
+        for group_indices, perm_indices in zip(perm_groups, combo):
+            for new_idx, old_idx in zip(group_indices, perm_indices):
+                perm[new_idx] = old_idx
+
+        q_perm = Chem.RenumberAtoms(query_mol, perm)
+        rmsd = MA.CalcRMS(q_perm, ref_mol)
+        n_evaluated += 1
+        if best is None or rmsd < best:
+            best = rmsd
+
+    return best
+
+
+# Underscore is not a valid SMILES character, so _XX_ encodings are unambiguous.
+_SMILES_TO_FILENAME = {'/': '_fs_', '\\': '_bs_'}
+_SMILES_TO_JOB_NAME = {'#': '_tp_'}  # # = triple bond in SMILES; truncates SGE directives
+
+def smiles_to_filename(smiles):
+    '''Encode SMILES into a string safe for use as a filename (encodes / and \\).'''
+    return ''.join(_SMILES_TO_FILENAME.get(c, c) for c in smiles)
+
+def smiles_to_job_name(smiles):
+    '''Encode SMILES into a string safe for SGE job names (encodes # which truncates directives).'''
+    return ''.join(_SMILES_TO_JOB_NAME.get(c, c) for c in smiles)
+

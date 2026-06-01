@@ -1,62 +1,103 @@
+# dock_utils.py
+
 from itertools import combinations, product
 from functools import lru_cache
 import numpy as np
 import os
-import utils
 import re
 
-def get_bsr_combinations(solved_struct, ligname):
-    bindingsite_residues = get_bindingsite_residues(solved_struct,
-        [], ligname, dist_from_lig=4.5, CA_only=False, quiet=False)
+def get_bsr_combinations(solved_struct, ligname, quiet=True):
+    # Enumerate binding-site residue combinations for vdG matching.
+
+    # 1) Find all binding-site residues once
+    bindingsite_residues = get_bindingsite_residues(solved_struct, addl_residues=[],
+        ligname=ligname, dist_from_lig=4.5, CA_only=False, quiet=quiet,)
+
+    # 2) Precompute AA identity + backbone coords per residue
+    #    key: (seg, chain, resnum)
+    #    value: (AA_name, np.array[[N],[CA],[C]] with shape (3, 3))
+    bb_cache = {}
+    for seg, chain, resnum in bindingsite_residues:
+        if seg == "":
+            sele = f"chain {chain} and resnum {resnum}"
+        else:
+            sele = f"segment {seg} and chain {chain} and resnum {resnum}"
+
+        res_obj = solved_struct.select(sele)
+        if res_obj is None:
+            continue
+
+        bb_coords = []
+        for atom_name in ["N", "CA", "C"]:
+            atom = res_obj.select(f"name {atom_name}")
+            if atom is None or atom.numAtoms() == 0:
+                raise ValueError(f"Missing atom {atom_name} in residue "
+                    f"{seg}:{chain}:{resnum}")
+            bb_coords.append(atom.getCoords()[0])
+
+        AA = get_res_AA_identity(res_obj)
+        bb_cache[(seg, chain, resnum)] = (AA, np.asarray(bb_coords, dtype=np.float32),)
+
+    # 3) Enumerate subsets
     bsr_combos = get_vdg_subsets(bindingsite_residues)
+
+    # 4) Build all combinations of AA identities with 'bb' wildcards
     all_bsr_combos = []
     for bsr_combo in bsr_combos:
         bsr_AA_identities = []
         input_bsr_bb_coords = []
-        for bsr in bsr_combo: 
-            bsr_seg, bsr_chain, bsr_resnum = bsr
-            res_obj = select_residue(solved_struct, bsr_seg, bsr_chain, bsr_resnum)
-            res_bb_coords = []
-            for atom_name in ['N', 'CA', 'C']:
-                res_bb_coords.append(utils.get_atom_coords(res_obj, atom_name))
-            input_bsr_bb_coords.append(res_bb_coords)
-            AA = get_res_AA_identity(res_obj)
+
+        for bsr in bsr_combo:
+            if bsr not in bb_cache:
+                # This should be rare; skip broken residues
+                continue
+            AA, bb_coords = bb_cache[bsr]
             bsr_AA_identities.append(AA)
-        bsr_AA_identities_conv_bb = [AA if AA != 'GLY' else 'bb' for AA in bsr_AA_identities]
-        # All of the AAs have potential to provide bb contacts, so sample "bb" vdms
-        options = [(x,) if x == 'bb' else (x, 'bb') for x in bsr_AA_identities_conv_bb]
+            input_bsr_bb_coords.append(bb_coords)
+
+        if not bsr_AA_identities:
+            continue
+
+        # Convert GLY -> bb
+        bsr_AA_identities_conv_bb = [AA if AA != "GLY" else "bb" for AA in bsr_AA_identities]
+
+        # Each AA can be itself or 'bb' (except literal 'bb', which stays 'bb')
+        options = [(x,) if x == "bb" else (x, "bb") for x in bsr_AA_identities_conv_bb]
         combo_variants = list(product(*options))
         for c in combo_variants:
             bsr_aas_coords = (c, bsr_combo, bsr_AA_identities, input_bsr_bb_coords.copy())
             if bsr_aas_coords not in all_bsr_combos:
                 all_bsr_combos.append(bsr_aas_coords)
+
     return all_bsr_combos
 
-def get_bindingsite_residues(prody_obj, addl_residues, ligname, dist_from_lig=8,
-                             CA_only=True, quiet=False):
+def get_bindingsite_residues(prody_obj, addl_residues, ligname, dist_from_lig=8, 
+    CA_only=True, quiet=True):
     res = []
-    # Use CA_only when you're doing blind docking and don't want to use sc info
+    # Use CA_only=True when you're doing blind docking and don't want to use sc info
     # Use CA_only=False when you want to use sc positions to define interactions
-    if CA_only: 
-        _selection = 'name CA'
-    else: 
-        _selection = 'protein'
+    if CA_only:
+        _selection = "name CA"
+    else:
+        _selection = "protein"
     CAs = prody_obj.select(
-        f'{_selection} within {dist_from_lig} of resname {ligname} and not element CA') # exclude calcium
+        f"{_selection} within {dist_from_lig} of resname {ligname} and not element CA"
+        )  # exclude calcium
     for ca in CAs:
         res_tup = (ca.getSegname(), ca.getChid(), ca.getResnum())
         if res_tup not in res:
             res.append(res_tup)
     if addl_residues:
-        res += addl_residues 
+        res += addl_residues
     for r in res:
         if not isinstance(r, tuple) or len(r) != 3:
             print(f"Invalid residue tuple: {r}")
     # Only print the pymol selection once (caller controls this via quiet)
     if not quiet:
-        print('\nBinding site residues for pymol selection:\n')
-        print('select bindingsite, ' + ' or '.join(
-            f'(seg {seg} and chain {chain} and resi {resnum})' for seg, chain, resnum in res) + '\n')
+        print("\nBinding site residues for pymol selection:\n")
+        print("select bindingsite, " + " or ".join(
+            f"(seg {seg} and chain {chain} and resi {resnum})" 
+            for seg, chain, resnum in res) + "\n")
     return res
 
 def get_vdg_subsets(input_list):
@@ -114,9 +155,13 @@ def get_query_cg_coords(sub, sub_smiles):
 
 def name_outdir(pdbfile, outdir, make_pdb_subfolder):
     # Name the outdir for this pdb query.
-    # `make_pdb_subfolder` indicates whether to make a subfolder for each pdb within 
+    # `make_pdb_subfolder` indicates whether to make a subfolder for each pdb within
     # the outdir (e.g. for multiple predictions of the same PDB).
-    pdbname = pdbfile.split('/')[-1].removesuffix('.pdb')
+    pdbname = os.path.basename(pdbfile)
+    for ext in (".pdb.gz", ".pdb", ".cif.gz", ".cif"):
+        if pdbname.endswith(ext):
+            pdbname = pdbname[:-len(ext)]
+            break
     pdb_id = pdbname[:4]
     if make_pdb_subfolder:
         output_dir = os.path.join(outdir, pdb_id, pdbname)

@@ -1,9 +1,0 @@
-rmsd_threshold: 0.7
-query_pdbs_dir: '/wynton/home/degradolab/skt/docking/query_structs/9r8y_with_zn_preds/'
-solved_struct_path:  '/wynton/home/degradolab/skt/docking/target_structs/9r8y_with_zn.pdb' # ground truth
-lig_smiles: 'CCCCNC(=O)c1ccc(SC2CCCCC2)c(c1)[S](N)(=O)=O'
-vdg_lib_dir: '/wynton/group/degradolab/skt/docking/databases/frag_vdg_lib'
-outdir: '/wynton/home/degradolab/skt/docking/vdg_matches'
-frags_to_exclude: [] 
-frags_to_include: 'all'
-query_pdbs: 'all'

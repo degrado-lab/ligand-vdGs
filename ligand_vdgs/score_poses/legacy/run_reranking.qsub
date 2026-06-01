@@ -18,6 +18,11 @@ echo
 
 python /wynton/home/degradolab/skt/docking/ligand-vdGs/ligand_vdgs/score_poses/rerank_poses.py $YMLFILE
 
+wait 
 echo
-echo DONE
-date
+## End-of-job summary, if running as a job
+[[ -n "$JOB_ID" ]] && qstat -j "$JOB_ID"
+
+date # end time
+
+echo "DONE"

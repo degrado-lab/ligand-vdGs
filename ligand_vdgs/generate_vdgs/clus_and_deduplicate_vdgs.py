@@ -35,19 +35,16 @@ Workflow Overview
    Merge AA/CG-permutation duplicates, and retain cluster centroids and a few additional 
    cluster members for manual inspection. Cluster centroids are considered nr vdGs.
    PDBs can be reconstructed later from these output arrays.
-
-5. **Cleanup**
-   Remove temporary streaming directories.
 ''' 
 
 import os
 import sys
 import argparse
 import time
-import shutil
 import numpy as np
 import prody as pr
 import multiprocessing as mp
+import ast
 import json, gzip
 import traceback
 import pickle
@@ -64,9 +61,9 @@ def add_paths():
 add_paths()
 import align_and_cluster as clust
 from clus_helpers import (get_vdg_AA_permutations, combine_cg_and_vdmbb_coords, 
-    flatten_flanking_seqs, flatten_flanking_CAs, get_cg_coords, get_vdg_subsets,
-    select_diverse_pdbIDs, _stream_root, _aa_tmp_dir, _aa_tmp_path, normalize_rmsd,
-    get_cg_atom_metadata,)
+    flatten_flanking_seqs, flatten_flanking_CAs, get_cg_coords, 
+    get_vdg_subsets_target_size, select_diverse_pdbIDs, _aa_tmp_dir, 
+    _aa_tmp_path, normalize_rmsd, get_cg_atom_metadata,)
 from fingerprint_helpers import (_pick_atom_by_com, log_warning, 
     align_coords_sanity_check, _resolve_duplicate_ligand_occupancies,)
 from constants import cg_atoms
@@ -695,7 +692,7 @@ def main():
 
         with open(env_path, "r") as f_env:
             for env_idx, line in enumerate(f_env):
-                environment = eval(line.strip())
+                environment = ast.literal_eval(line.strip())
 
                 # This is the identifier we used previously for vdg_pdbs filenames.
                 pdb_label = "_".join([str(el) for el in environment[0]])
@@ -720,9 +717,10 @@ def main():
                 (cg_names, cg_elements, cg_seg,
                  cg_chain, cg_resnum, cg_resname) = cg_meta
 
-                # Define symmetry class as the user-supplied value if specified; 
-                # otherwise, if symmetry_classes is "None", then set it where each atom 
-                # is its own symm class (asymmetry). 
+                # Set symmetry_classes here (not before the loop) because the default
+                # requires len(cg_coords), which is only known after parsing the first
+                # environment. Once set, it persists for all environments — correct
+                # because the same SMARTS produces the same CG atom count throughout.
                 symmetry_classes = symmetry_classes or list(range(len(cg_coords)))
 
                 # Characterize the vdM residues.
@@ -731,7 +729,7 @@ def main():
 
                 # Determine the vdM combinations, up to size_subset residues.
                 vdm_resinds = list(vdms_dict.keys())
-                vdg_subsets = get_vdg_subsets(vdm_resinds, size_subset)
+                vdg_subsets = get_vdg_subsets_target_size(vdm_resinds, size_subset)
 
                 # Iterate over subsets of residue indices
                 for vdg_subset in vdg_subsets:
@@ -798,21 +796,6 @@ def main():
             with open(logfile, "a") as f: f.write(err_text)
             print(err_text, file=sys.stderr)
             sys.exit(1)  # hard-fail the whole run if any worker fails
-
-    # Remove only this run's temp stream dir so concurrent -n runs don't clobber
-    # each other.
-    try:
-        if os.path.isdir(stream_dir): shutil.rmtree(stream_dir)
-    except Exception as _e:
-        with open(logfile, "a") as f:
-            f.write(f"\t[STREAM WARNING]: Failed to remove {stream_dir}: {_e}\n")
-
-    # Delete parent stream_root only if empty (i.e., last -n job).
-    stream_root = _stream_root(vdglib_dir)  # $TMPDIR or /scratch
-    try:
-        os.rmdir(stream_root)
-    except (FileNotFoundError, OSError):
-        pass  # already deleted or not empty; other -n jobs still running
 
     # Log summary
     s = time.time() - start_time

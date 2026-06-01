@@ -8,27 +8,23 @@
 #$ -l scratch=1G
 #$ -l h_rt=24:00:00
 
-date
-hostname
-
-################################################################################
-
-#!/bin/bash
-# 
 # Description:
-#   This script will submit one SGE job per PDB file to run Probe on. 
-#   The directory containing the .pdb files (PDB database) must contain subdirectories
-#   in RCSB format (see docs/database_generation.txt for more details.).
+#   SGE array job: runs Probe on one PDB file per task.
+#   The PDB database must be in RCSB mirror layout (subdirs by inner 2 chars of PDB code).
 #
 # Usage:
 #   qsub \
-#     -t <number_of_tasks> \         # Number of tasks to run in parallel (i.e. # pdbs)
+#     -t 1-<number_of_pdbs> \        # one task per PDB; SGE_TASK_ID is 1-based
 #     -o <path_to_log_directory> \   # SGE may require this dir to already exist
-#     -e <path_to_log_directory> \   # SGE may require this dir to already exist
-#     <path_to_this_script> \ 
-#     <path_to_probe_output_dir> \   # Directory to output Probe files     
-#     <path_to_SMARTS-vdg_package> \ # Path to the `SMARTS-vdg` package
-#     <path_to_probe_executable>
+#     -e <path_to_log_directory> \
+#     <path_to_this_script> \
+#     <path_to_pdb_dir> \            # $1: PDB database directory
+#     <path_to_probe_output_dir> \   # $2: directory to write Probe output files
+#     <path_to_SMARTS-vdg_package> \ # $3: path to the SMARTS-vdg package
+#     <path_to_probe_executable>     # $4: probe binary
+
+date
+hostname
 
 # Get command line arguments
 pdb_dir=$1

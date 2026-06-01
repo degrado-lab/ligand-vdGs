@@ -1,9 +1,0 @@
-rmsd_threshold: 0.7
-query_pdbs_dir: '/wynton/home/degradolab/skt/docking/query_structs/8yqe_preds/'
-solved_struct_path:  '/wynton/home/degradolab/skt/docking/target_structs/8yqe.pdb' # ground truth
-lig_smiles: 'CC[S](=O)(=O)N1CCC(CC1)NC(=O)c2[nH]ncc2NC(=O)c3c(F)ccc(C4CCOCC4)c3F'
-vdg_lib_dir: '/wynton/group/degradolab/skt/docking/databases/frag_vdg_lib'
-outdir: '/wynton/home/degradolab/skt/docking/vdg_matches'
-frags_to_exclude: [] 
-frags_to_include: 'all'
-query_pdbs: 'all'

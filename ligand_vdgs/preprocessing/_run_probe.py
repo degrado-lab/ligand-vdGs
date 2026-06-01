@@ -8,7 +8,7 @@ def parse_args():
     '''
     argp = argparse.ArgumentParser()
     argp.add_argument('--probe-path', help="Path to probe executable.")
-    argp.add_argument('--input-pdb', help="Path to iput PDB to run Probe on.")
+    argp.add_argument('--input-pdb', help="Path to input PDB to run Probe on.")
     argp.add_argument('--outdir', help="Directory path for outputting probe files.")
     return argp.parse_args()
 
@@ -18,7 +18,12 @@ def main():
     input_pdb = args.input_pdb
     outdir = args.outdir
 
-    pdb_code = input_pdb.split('.pdb')[-2][-4:]
+    basename = os.path.basename(input_pdb)
+    for ext in (".pdb.gz", ".pdb"):
+        if basename.endswith(ext):
+            basename = basename[:-len(ext)]
+            break
+    pdb_code = basename[-4:]
     out_filename = pdb_code + '.probe'
     out_subdir = os.path.join(outdir, pdb_code[1:3])
     out_path = os.path.join(out_subdir, out_filename)
@@ -33,11 +38,11 @@ def main():
     result = subprocess.run(cmd, shell=True)
 
     if os.path.exists(out_path):
-        gzip_cmd = 'gzip {}'.format(out_path)
+        gzip_cmd = ['gzip', out_path]
         print('-'*62)
         print('gzip command:')
-        print(gzip_cmd)
-        os.system(gzip_cmd)
+        print(' '.join(gzip_cmd))
+        subprocess.run(gzip_cmd, check=True)
         print('-'*62)
         print('Job completed.')
     else:
