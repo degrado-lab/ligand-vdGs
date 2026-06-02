@@ -25,17 +25,19 @@ This guide explains how to generate a van der Graph (vdG) database for small mol
 
 ## Prerequisites: Set Up a Parent Database
 
-Before running any pipeline steps, you need a preprocessed PDB database to extract vdGs from. You can use any collection of PDB structures — your own custom set or a mirror of the RCSB PDB. Once you have your source PDBs, complete Steps 1–4 in order before moving on to Steps 5–6.
+Before running any pipeline steps, you need a preprocessed PDB database to extract vdGs from. You can use any collection of PDB structures — your own custom set or a mirror of the RCSB PDB.
 
-- **Step 1: Format the directory layout.** Structures must be organized in RCSB mirror format: each file is named `XXXX.pdb` (4-character code) and placed in a subdirectory named after the inner 2 characters of the code. For example, `1ABC.pdb` → `AB/1ABC.pdb`. Use [`ligand-vdGs/scripts/format_parent_database.py`](../scripts/format_parent_database.py) to reformat an existing directory.
+**Directory layout.** Structures must be organized in RCSB mirror format: each file is named `XXXX.pdb` (4-character code) and placed in a subdirectory named after the inner 2 characters of the code. For example, `1ABC.pdb` → `AB/1ABC.pdb`. Use [`ligand-vdGs/scripts/format_parent_database.py`](../scripts/format_parent_database.py) to reformat an existing directory.
 
-- **Step 2: Prune the database (optional, recommended).** Run [`ligand-vdGs/ligand_vdgs/preprocessing/s01_trim_database.py`](../ligand_vdgs/preprocessing/s01_trim_database.py) to filter by ligand b-factor and extract 10 Å binding-site regions, reducing database size and removing redundant structures. The pipeline works without this step, but skipping it means running on full PDB files (slower, larger, and noisier). If you run it, use the output as `-p` in Step 6 below; otherwise use the formatted database from Step 1.
+Once your source PDBs are in the right layout, complete Steps 1–3 in order before moving on to Steps 4–5.
 
-- **Step 3: Add hydrogens.** The pipeline requires hydrogens to be present in every PDB. Use [Reduce2](https://github.com/cctbx/cctbx_project/tree/master/mmtbx/reduce) (open-source) or Schrödinger's PrepWizard (more accurate, requires a license). To run PrepWizard jobs in parallel on an SGE cluster, see [`ligand-vdGs/ligand_vdgs/preprocessing/s02_run_prepwizard.sh`](../ligand_vdgs/preprocessing/s02_run_prepwizard.sh). Run this on the output of Step 2, or the formatted database from Step 1 if you skipped trimming.
+- **Step 1 (`s01_trim_database.py`) — Prune the database (optional, recommended).** Run [`ligand-vdGs/ligand_vdgs/preprocessing/s01_trim_database.py`](../ligand_vdgs/preprocessing/s01_trim_database.py) to filter by ligand b-factor and extract 10 Å binding-site regions, reducing database size and removing redundant structures. The pipeline works without this step, but skipping it means running on full PDB files (slower, larger, and noisier). If you run it, use the output as `-p` in Step 5 below; otherwise use the formatted database from above.
 
-- **Step 4: Run Probe.** Probe must be installed separately; it is available from the [Richardson lab / MolProbity project](https://github.com/rlabduke/probe). Run [`ligand-vdGs/ligand_vdgs/preprocessing/_run_probe.py`](../ligand_vdgs/preprocessing/_run_probe.py) on each PDB to compute atomic contacts. To submit all PDBs as an SGE array job, use [`ligand-vdGs/ligand_vdgs/preprocessing/s03_run_probe.sh`](../ligand_vdgs/preprocessing/s03_run_probe.sh). The output directory of Probe files is used as `-b` in Step 6 below.
+- **Step 2 (`s02_run_prepwizard.sh`) — Add hydrogens.** The pipeline requires hydrogens to be present in every PDB. Use [Reduce2](https://github.com/cctbx/cctbx_project/tree/master/mmtbx/reduce) (open-source) or Schrödinger's PrepWizard (more accurate, requires a license). To run PrepWizard jobs in parallel on an SGE cluster, see [`ligand-vdGs/ligand_vdgs/preprocessing/s02_run_prepwizard.sh`](../ligand_vdgs/preprocessing/s02_run_prepwizard.sh). Run this on the output of Step 1, or the formatted database above if you skipped trimming.
 
-## Step 5: Build the Fragment Dictionary
+- **Step 3 (`s03_run_probe.sh`) — Run Probe.** Probe must be installed separately; it is available from the [Richardson lab / MolProbity project](https://github.com/rlabduke/probe). Run [`ligand-vdGs/ligand_vdgs/preprocessing/_run_probe.py`](../ligand_vdgs/preprocessing/_run_probe.py) on each PDB to compute atomic contacts. To submit all PDBs as an SGE array job, use [`ligand-vdGs/ligand_vdgs/preprocessing/s03_run_probe.sh`](../ligand_vdgs/preprocessing/s03_run_probe.sh). The output directory of Probe files is used as `-b` in Step 5 below.
+
+## Step 4: Build the Fragment Dictionary
 
 Build a fragment dictionary from your database ligands by running [`ligand_vdgs/generate_vdgs/fragment_database_ligs.py`](../ligand_vdgs/generate_vdgs/fragment_database_ligs.py). This script outputs `database_frags_dict.pkl`, which enumerates all qualifying chemical fragments across your ligand set.
 
@@ -71,9 +73,9 @@ python ligand_vdgs/generate_vdgs/fragment_database_ligs.py \
 
 The output `<output_dir>/database_frags_dict.pkl` is used in the next step.
 
-## Step 6: Generate the vdG Database
+## Step 5: Generate the vdG Database
 
-This step requires `database_frags_dict.pkl` from Step 5, your protonated PDB database from Step 3 (use the trimmed version from Step 2 if you ran it), and the Probe output directory from Step 4.
+This step requires `database_frags_dict.pkl` from Step 4, your protonated PDB database from Step 2 (use the trimmed version from Step 1 if you ran it), and the Probe output directory from Step 3.
 
 A qualifying fragment is one present in at least 80 database ligands and containing at most 5 heavy atoms. The core operation is running [`ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py`](../ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py) once per qualifying fragment SMILES. This calls the `vdG-miner` package to extract and cluster vdGs for that fragment; full usage is in the script header.
 
@@ -92,8 +94,8 @@ python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py \
 |------|-------------|
 | `-s` | Fragment SMILES, interpreted as a SMARTS pattern for substructure matching |
 | `-c` | Chemical group label used as the output subdirectory name under `-o`. By convention, pass the same SMILES as `-s`. Defaults to `-s` if omitted. |
-| `-p` | Path to your protonated PDB database (Step 3). Use the trimmed version from Step 2 if you ran that optional step. |
-| `-b` | Path to the Probe output directory (output of Step 4) |
+| `-p` | Path to your protonated PDB database (Step 2). Use the trimmed version from Step 1 if you ran that optional step. |
+| `-b` | Path to the Probe output directory (output of Step 3) |
 | `-o` | Root output directory for the vdG library |
 | `--num-procs` | Number of parallel processes per job |
 
@@ -119,7 +121,7 @@ done
 
 ### SLURM and other schedulers
 
-First extract the qualifying fragment SMILES to a text file (one SMILES per line) using [`extract_fragment_smiles.py`](../ligand_vdgs/generate_vdgs/extract_fragment_smiles.py). Both flags default to paths under `resources/`, so if you used Option A in Step 5, you can run with no arguments:
+First extract the qualifying fragment SMILES to a text file (one SMILES per line) using [`extract_fragment_smiles.py`](../ligand_vdgs/generate_vdgs/extract_fragment_smiles.py). Both flags default to paths under `resources/`, so if you used Option A in Step 4, you can run with no arguments:
 
 ```bash
 python ligand_vdgs/generate_vdgs/extract_fragment_smiles.py \
