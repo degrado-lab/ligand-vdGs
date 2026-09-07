@@ -2,113 +2,120 @@
 
 import os
 import numpy as np
-import prody as pr
-from itertools import permutations, product, combinations
-from numba import njit
-import hashlib
+from itertools import combinations
 import getpass
+from ligand_vdgs.functions.vdg_struct_utils import FLANK_UNCOMPARABLE
 
-def get_vdg_AA_permutations(reordered_AAs, _vdgs):
+# Field layout of the per-vdG record lists passed to unpack_vdg_records.
+# The producer (clus_and_deduplicate_vdgs._load_bucket) builds records in this
+# order; both sides index through these names so adding a field can't silently
+# shift the positional reads below.
+VDG_FIELDS = ("cg_coords", "bbcoords", "flankseqs", "flankCAs", "pdbpath", "scrr",
+              "cg_names", "cg_elements", "cg_seg", "cg_chain", "cg_resnum",
+              "cg_resname", "slot_flags",
+              "cg_max_b", "cg_min_occ", "vdm_max_b", "vdm_min_occ")
+(F_CG_COORDS, F_BBCOORDS, F_FLANKSEQS, F_FLANKCAS, F_PDBPATH, F_SCRR,
+ F_CG_NAMES, F_CG_ELEMENTS, F_CG_SEG, F_CG_CHAIN, F_CG_RESNUM,
+ F_CG_RESNAME, F_SLOT_FLAGS,
+ F_CG_MAX_B, F_CG_MIN_OCC, F_VDM_MAX_B, F_VDM_MIN_OCC) = range(len(VDG_FIELDS))
+
+def unpack_vdg_records(_vdgs):
+    """Transpose per-vdG records into one list per VDG_FIELDS column.
+
+    Each ``_vdg`` is a list whose field order is ``VDG_FIELDS`` (indexed here
+    through the ``F_*`` constants, not literal positions):
+
+        [cg_coords, bbcoords, flankseqs, flankCAs, pdbpath, scrr,
+         cg_names, cg_elements, cg_seg, cg_chain, cg_resnum, cg_resname,
+         slot_flags, cg_max_b, cg_min_occ, vdm_max_b, vdm_min_occ]
+
+    ``slot_flags`` is the per-vdM-slot provenance code (``SLOT_*`` in
+    vdg_struct_utils), stored in the same slot order as ``scrr``. The four
+    trailing quality fields are returned as one ``out_quality`` tuple per record,
+    so the output has one column fewer than ``VDG_FIELDS`` has fields.
+
+    Interchangeable same-label vdM slots are **not** expanded into duplicate
+    records here. Stage-1 clustering minimises over slot orderings inside its
+    distance instead (``vdg_fp_utils.build_perm_group``), which keeps one
+    physical environment per record -- so a vdG cannot land in two clusters, and
+    no post-hoc union is needed to put the copies back together.
+
+    CG atoms remain in the SMARTS-slot order assigned upstream. Every per-vdG
+    sequence in the returned tuple is a fresh object, so no two output records
+    share a mutable list.
     """
-    Expand vdGs over AA permutations (for duplicated AAs).
+    for i, _vdg in enumerate(_vdgs):
+        if len(_vdg) != len(VDG_FIELDS):
+            raise ValueError(
+                f"vdG record {i} has {len(_vdg)} fields, expected "
+                f"{len(VDG_FIELDS)} ({', '.join(VDG_FIELDS)})")
 
-    Each _vdg is:
-        [cg_coords, bbcoords, flankseqs, flankCAs, pdbpath, scrr, vdm_heavycoords,
-         cg_names, cg_elements, cg_seg, cg_chain, cg_resnum, cg_resname]
-    """
-    permuted_indices = permute_AA_duplicates(reordered_AAs)
-    all_AA_cg_perm_cg_coords = []
-    all_AA_cg_perm_vdm_bbcoords = []
-    all_AA_cg_perm_flankingseqs = []
-    all_AA_cg_perm_flankingCAs = []
-    all_AA_cg_perm_pdbpaths = []
-    all_AA_cg_perm_vdm_scrr = []
-    all_AA_cg_perm_vdm_heavycoords = []
-    all_AA_cg_perm_cg_names = []
-    all_AA_cg_perm_cg_elements = []
-    all_AA_cg_perm_cg_seg = []
-    all_AA_cg_perm_cg_chain = []
-    all_AA_cg_perm_cg_resnum = []
-    all_AA_cg_perm_cg_resname = []
+    total = len(_vdgs)
+    out_coords   = [None] * total
+    out_bb       = [None] * total
+    out_seqs     = [None] * total
+    out_CAs      = [None] * total
+    out_pdbs     = [None] * total
+    out_scrr     = [None] * total
+    out_names    = [None] * total
+    out_elements = [None] * total
+    out_seg      = [None] * total
+    out_chain    = [None] * total
+    out_resnum   = [None] * total
+    out_resname  = [None] * total
+    out_flags    = [None] * total
+    out_quality  = [None] * total
 
-    # Iterate over all AA permutations of each vdg
-    for _vdg in _vdgs:
-        # CG coords and pdbpaths remain unchanged, but vdmbbs, flankingseqs, 
-        # flankingCAs, scrrs, and vdm_heavycoords need to be permuted.
-        for permutation in permuted_indices:
-            all_AA_cg_perm_cg_coords.append(_vdg[0])
-            all_AA_cg_perm_pdbpaths.append(_vdg[4])
+    for idx, _vdg in enumerate(_vdgs):
+        out_coords[idx]   = np.array(_vdg[F_CG_COORDS], dtype=np.float32)
+        out_bb[idx]       = list(_vdg[F_BBCOORDS])
+        out_seqs[idx]     = list(_vdg[F_FLANKSEQS])
+        out_CAs[idx]      = list(_vdg[F_FLANKCAS])
+        out_pdbs[idx]     = _vdg[F_PDBPATH]
+        out_scrr[idx]     = list(_vdg[F_SCRR])
+        out_names[idx]    = list(_vdg[F_CG_NAMES])
+        out_elements[idx] = list(_vdg[F_CG_ELEMENTS])
+        # Scalars: one residue per CG, so a slot ordering cannot change them.
+        out_seg[idx]      = _vdg[F_CG_SEG]
+        out_chain[idx]    = _vdg[F_CG_CHAIN]
+        out_resnum[idx]   = _vdg[F_CG_RESNUM]
+        out_resname[idx]  = _vdg[F_CG_RESNAME]
+        out_flags[idx]    = list(_vdg[F_SLOT_FLAGS])
+        # Measured B-factor/occupancy over the atoms that enter this vdG, kept
+        # per record so a stricter cut can be applied without re-mining.
+        out_quality[idx]  = (float(_vdg[F_CG_MAX_B]), float(_vdg[F_CG_MIN_OCC]),
+                             float(_vdg[F_VDM_MAX_B]), float(_vdg[F_VDM_MIN_OCC]))
 
-            nonpermuted_vdmbb = _vdg[1]
-            nonpermuted_flankingseqs = _vdg[2]
-            nonpermuted_flankingCAs = _vdg[3]
-            nonpermuted_vdm_scrr = _vdg[5]
-            nonpermuted_vdm_heavy = _vdg[6]
+    return (out_coords, out_bb, out_seqs, out_CAs, out_pdbs,
+            out_scrr, out_names, out_elements, out_seg, out_chain,
+            out_resnum, out_resname, out_flags, out_quality)
 
-            vdmbb_permutation = [nonpermuted_vdmbb[ix] for ix in permutation]
-            flankingseqs_permutation = [nonpermuted_flankingseqs[ix] for ix in permutation]
-            flankingCAs_permutation = [nonpermuted_flankingCAs[ix] for ix in permutation]
-            vdm_scrrs_permutation = [nonpermuted_vdm_scrr[ix] for ix in permutation]
-            vdm_heavy_permutation = [nonpermuted_vdm_heavy[ix] for ix in permutation]
-
-            all_AA_cg_perm_vdm_bbcoords.append(vdmbb_permutation)
-            all_AA_cg_perm_flankingseqs.append(flankingseqs_permutation)
-            all_AA_cg_perm_flankingCAs.append(flankingCAs_permutation)
-            all_AA_cg_perm_vdm_scrr.append(vdm_scrrs_permutation)
-            all_AA_cg_perm_vdm_heavycoords.append(vdm_heavy_permutation)
-            all_AA_cg_perm_cg_names.append(_vdg[7])
-            all_AA_cg_perm_cg_elements.append(_vdg[8])
-            all_AA_cg_perm_cg_seg.append(_vdg[9])
-            all_AA_cg_perm_cg_chain.append(_vdg[10])
-            all_AA_cg_perm_cg_resnum.append(_vdg[11])
-            all_AA_cg_perm_cg_resname.append(_vdg[12])
-
-    return (all_AA_cg_perm_cg_coords, all_AA_cg_perm_vdm_bbcoords, 
-        all_AA_cg_perm_flankingseqs, all_AA_cg_perm_flankingCAs, all_AA_cg_perm_pdbpaths,
-        all_AA_cg_perm_vdm_scrr, all_AA_cg_perm_vdm_heavycoords, all_AA_cg_perm_cg_names,
-        all_AA_cg_perm_cg_elements, all_AA_cg_perm_cg_seg, all_AA_cg_perm_cg_chain,
-        all_AA_cg_perm_cg_resnum, all_AA_cg_perm_cg_resname)
-
-def permute_AA_duplicates(seq):
-    # Dictionary to store indices for each element in the sequence
-    seen = {}
-    for i, item in enumerate(seq):
-        if item not in seen:
-            seen[item] = []
-        seen[item].append(i)
-
-    permute_groups = [] # list of all index groups that have duplicates
-    for indices in seen.values():
-        if len(indices) > 1:  # only interested in elements with duplicates
-            permute_groups.append(indices)
-
-    if not permute_groups: # no duplicates, so return the original index list
-        return [list(range(len(seq)))]
-
-    # generate all possible permutations of indices within each group of duplicates
-    permuted_idx_lists = []
-    for perm_combination in product(*[permutations(group) for group in 
-                                      permute_groups]):
-        # start with the list of original indices
-        permuted_idx = list(range(len(seq)))
-
-        # flatten the product of permutations and assign them to the corresponding 
-        # positions
-        for group_idx, perm in zip(permute_groups, perm_combination):
-            for orig_idx, new_idx in zip(group_idx, perm):
-                permuted_idx[orig_idx] = new_idx
-
-        permuted_idx_lists.append(permuted_idx)
-   
-    return permuted_idx_lists
 
 def combine_cg_and_vdmbb_coords(all_cg, all_vdmbb):
-    out = []
-    for _cg, _vdmbb in zip(all_cg, all_vdmbb):
-        flattened_cg = np.asarray(_cg, dtype=np.float32)
-        flattened_vdmbb = np.asarray([atom for res in _vdmbb for atom in res],
-            dtype=np.float32,)
-        out.append(np.vstack([flattened_cg, flattened_vdmbb]))
+    """Stack each vdG's CG coords and flattened vdM backbone into one (n, n_cg+n_bb, 3) array.
+
+    Atom counts are taken from record 0 and every other record must match it; a
+    ragged input is reported here rather than as a numpy broadcast error from the
+    assignment below.
+    """
+    if not all_cg:
+        return []
+    if len(all_vdmbb) != len(all_cg):
+        raise ValueError(
+            f"combine_cg_and_vdmbb_coords: {len(all_cg)} CG records vs "
+            f"{len(all_vdmbb)} vdM-backbone records")
+    n = len(all_cg)
+    n_cg = len(all_cg[0])
+    n_vdms = len(all_vdmbb[0])
+    n_bb = n_vdms * 3  # num_vdms × 3 backbone atoms (N, CA, C)
+    out = np.empty((n, n_cg + n_bb, 3), dtype=np.float32)
+    for i, (_cg, _vdmbb) in enumerate(zip(all_cg, all_vdmbb)):
+        if len(_cg) != n_cg or len(_vdmbb) != n_vdms:
+            raise ValueError(
+                f"combine_cg_and_vdmbb_coords: record {i} has {len(_cg)} CG atoms "
+                f"and {len(_vdmbb)} vdMs, expected {n_cg} and {n_vdms} (from record 0)")
+        out[i, :n_cg] = np.asarray(_cg, dtype=np.float32)
+        out[i, n_cg:] = np.asarray([atom for res in _vdmbb for atom in res], dtype=np.float32)
     return out
 
 def flatten_flanking_CAs(cgvdmbb_clus_flankingCAs):
@@ -132,183 +139,38 @@ def flatten_flanking_seqs(flankingCAs_clus_flankingseqs):
             flat_vdg_flankingseq)
     return flattened_flankingseqs_for_vdgs_in_flankingCA_clus
 
-def calc_seq_similarity(list1, list2):
-    # Percent identity of flanking residue names after dropping positions labeled 'vdm' 
-    # or 'X'. Returns identity=0 (max dissimilarity) if all positions drop.
+def calc_seq_similarity(list1, list2, missing_similarity=0.0):
+    """Return coverage-adjusted percent identity for flanking residues.
+
+    ``missing_similarity`` is a percent-identity prior (0..100) assigned to
+    positions that are uncomparable in either sequence -- FLANK_MISSING (no
+    readable residue) or FLANK_CHAIN_BREAK (past a break, so not a neighbour at
+    all). The two carry the same prior here, since neither supplies a residue to
+    match, but they are distinct symbols so analysis downstream can separate
+    "we could not read it" from "the chain ends here". Central ``'vdm'``
+    positions are excluded from both the observed and expected counts.
+
+    Any other token is compared as a residue name, including
+    NONCANONICAL_AA_LABEL (``'X'``) -- that is a vdM *slot* label and does not
+    appear in flanking sequences, but if it ever does it means a real residue
+    with non-canonical atoms, not absent data.
+    """
+    if not 0.0 <= missing_similarity <= 100.0:
+        raise ValueError("missing_similarity must be between 0 and 100")
     list1 = [i for i in list1 if i != 'vdm']
     list2 = [i for i in list2 if i != 'vdm']
-    assert len(list1) == len(list2)
-    # Exclude residues if at least one of them is an "X"
-    indices_to_exclude = []
-    for ind in range(len(list1)):
-        if list1[ind] == 'X' or list2[ind] == 'X':
-            indices_to_exclude.append(ind)
-    list1 = [item for idx, item in enumerate(list1) if idx not in indices_to_exclude]
-    list2 = [item for idx, item in enumerate(list2) if idx not in indices_to_exclude]
-    matches = sum(1 for a, b in zip(list1, list2) if a == b)
-
-    # Calculate the percentage of matches. If all residues were dropped out, 
-    # it should be treated as max dissimilarity.
-    if len(list1) == 0:
-        match_percentage = 0
-    else:
-        match_percentage = (matches / len(list1)) * 100
-    return match_percentage
-
-def get_res_iden(vdm_obj):
-    seg =     list(set(vdm_obj.getSegnames()))
-    chain =   list(set(vdm_obj.getChids()))
-    resnum =  list(set(vdm_obj.getResnums()))
-    resname = list(set(vdm_obj.getResnames()))
-    assert len(seg) == 1
-    assert len(chain) == 1
-    assert len(resnum) == 1
-    assert len(resname) == 1
-    return seg[0], chain[0], resnum[0], resname[0]
-
-def found_chain_break(flanking_seq_dict, chain_break_ind):
-    # If a chain break is found, overwrite all the subsequent (or preceding) flanking
-    # residues beyond the chain break as AA "X".
-    flank_indices = list(flanking_seq_dict.keys())
-    if chain_break_ind > 0 :
-        inds_to_overwrite = [n for n in flank_indices if n >= chain_break_ind]
-    elif chain_break_ind < 0:
-        inds_to_overwrite = [n for n in flank_indices if n <= chain_break_ind]
-   
-    for overwrite_ind in inds_to_overwrite:
-        flanking_seq_dict[overwrite_ind] = \
-            ['X', np.array([np.nan, np.nan, np.nan])] # ['X', None]
-    return flanking_seq_dict
-
-def _pick_single_ca(ca_sel, prev_ca):
-    # Return a single CA atom object from a ProDy selection, handling altlocs/dups
-    if len(ca_sel) == 1:
-        return ca_sel[0]
-
-    # If we have multiple CAs (altlocs/dups), prefer the one closest to prev_ca.
-    if prev_ca is None:
-        return ca_sel[0]
-
-    best_atom, best_dist = None, float('inf')
-    for atom in ca_sel:
-        d = pr.calcDistance(prev_ca, atom)
-        if d < best_dist:
-            best_atom, best_dist = atom, d
-    return best_atom
-
-def get_AA_and_CA_coords(prody_obj, current_resindex):
-    '''
-    Return (AA, CA_coords) for a residue index.
-    If residue is missing/non-protein, returns AA='X' and CA_coords = [nan, nan, nan].
-    '''
-    # Build selection for this residue index
-    if current_resindex < 0: 
-        sel_str = f'resindex `{current_resindex}`'
-    else:
-        sel_str = f'resindex {current_resindex}'
-
-    curr_resindex_obj = prody_obj.select(sel_str)
-    if curr_resindex_obj is None or curr_resindex_obj.protein is None:
-        return 'X', np.array([np.nan, np.nan, np.nan], dtype=np.float32)
-
-    # Resolve residue name
-    curr_res_AA = list(set(curr_resindex_obj.getResnames()))
-    if len(curr_res_AA) != 1:
-        print(f'[WARNING] get_AA_and_CA_coords: \nResindex {current_resindex} in '
-              f'{prody_obj.getTitle()} contains >1 AA: {curr_res_AA}. Defaulting to AA="X".')
-        return 'X', np.array([np.nan, np.nan, np.nan], dtype=np.float32)
-    AA = curr_res_AA[0]
-
-    # Select CA(s)
-    CA_sel = curr_resindex_obj.select(sel_str + ' and name CA')
-    if CA_sel is None or len(CA_sel) == 0:
-        return 'X', np.array([np.nan, np.nan, np.nan], dtype=np.float32)
-
-    try:
-        ca_atom = _pick_single_ca(CA_sel, prev_ca=None)
-        CA_coords = np.asarray(ca_atom.getCoords(), dtype=np.float32)
-    except Exception:
-        print(f'[WARNING] Could not resolve CA for resindex {current_resindex} in '
-              f'{prody_obj.getTitle()}. Defaulting to AA="X".')
-        return 'X', np.array([np.nan, np.nan, np.nan], dtype=np.float32)
-
-    return AA, CA_coords
-
-def get_cg_atoms(prody_obj, pdbpath):
-    cg = prody_obj.select('occupancy > 2.9')
-    if cg is None or len(cg) == 0:
-        print(f'[WARNING] get_cg_atoms: no atoms with occupancy > 2.9 in {pdbpath}')
-        return None
-    num_atoms = len(cg)
-    coords, names, elements, segs, chains, resnums, resnames = [], [], [], [], [], [], []
-    for ind in range(num_atoms):
-        occ = f'3.{ind}'
-        atom = cg.select(f'occupancy == {occ}')
-        if atom is None or len(atom) != 1:
-            print(f'[WARNING] get_cg_atoms: {0 if atom is None else len(atom)} atoms '
-                  f'are occupancy {occ} in {pdbpath}.')
-            return None
-        a = atom[0]
-
-        #c = np.asarray(a.getCoords(), dtype=float)
-        #if c.ndim == 2:
-        #    # e.g. shape (1, 3)
-        #    c = c[0]
-        #if c.shape != (3,):
-        #    print(f'[WARNING] get_cg_atoms: unexpected coord shape {c.shape} for '
-        #          f'{pdbpath}; skipping CG.')
-        #    return None
-
-        coords.append(a.getCoords())
-        names.append(a.getName())
-        elements.append(a.getElement())
-        segs.append(a.getSegname())
-        chains.append(a.getChid())
-        resnums.append(int(a.getResnum()))
-        resnames.append(a.getResname())
-    return (np.asarray(coords, dtype=np.float32),
-            names, elements, segs, chains, resnums, resnames)
-
-def get_cg_coords(prody_obj, pdbpath):
-    out = get_cg_atoms(prody_obj, pdbpath)
-    if out is None:
-        return None
-    coords, _, _, _, _, _, _ = out
-    return coords
-
-def get_cg_atom_metadata(prody_obj, pdbpath):
-    out = get_cg_atoms(prody_obj, pdbpath)
-    if out is None:
-        return None
-    _, names, elements, segs, chains, resnums, resnames = out
-    return (names, elements, segs, chains, resnums, resnames)
-
-def get_bb_coords(obj):
-    bb_coords = []
-    for atom_name in ['N', 'CA', 'C']:
-        atom_obj = obj.select(f'name {atom_name}')
-        if atom_obj is None or len(atom_obj) == 0:
-            return None # missing backbone atom; give up on this residue
-
-        first_coord = atom_obj.getCoords()[0]
-
-        if len(atom_obj) > 1: # if there are duplicates, compare them to the first one
-            for i, a in enumerate(atom_obj):
-                if i == 0:
-                    continue  # skip the first one (reference)
-                dist = pr.calcDistance(first_coord, a.getCoords())
-                if dist > 0.2:
-                    print(
-                        f"[WARNING] Ambiguous coordinates for {obj.getTitle()} resnum "
-                        f"{set(obj.getResnums())} atom {atom_name} are {dist} apart; "
-                        f"using first occurrence.")
-                    break
-
-        # Scenarios: clean structure w/ 1 atom, duplicate atoms < 0.2A apart are 
-        # likely benign, and duplicate atoms > 0.2A possibly harmful, so log warning. 
-        bb_coords.append(np.asarray(first_coord, dtype=np.float32))
-
-    return bb_coords
+    if len(list1) != len(list2):
+        raise ValueError(
+            f"Sequence similarity got mismatched lengths: {len(list1)} vs {len(list2)}")
+    expected = len(list1)
+    if expected == 0:
+        return float(missing_similarity)
+    pairs = [(a, b) for a, b in zip(list1, list2)
+             if a not in FLANK_UNCOMPARABLE and b not in FLANK_UNCOMPARABLE]
+    matches = sum(1 for a, b in pairs if a == b)
+    missing = expected - len(pairs)
+    effective_matches = matches + missing * (missing_similarity / 100.0)
+    return (effective_matches / expected) * 100.0
 
 def get_vdg_subsets_target_size(input_list, target_size):
     # Generate combos of residues containing `target_size` elements.
@@ -316,114 +178,97 @@ def get_vdg_subsets_target_size(input_list, target_size):
         return []  
     return list(combinations(input_list, target_size)) 
 
-def select_diverse_pdbIDs(strings, k): # k = max num to select
-   # Greedy max–min Hamming selection over equal-length strings (PDB IDs)
-   # to promote dataset diversity. Assumes PDB IDs are 4 characters long.
-   ascii_array = strings_to_ascii_array(strings)
+def select_diverse_pdbIDs(strings, k): # k = max num of distinct PDB IDs to select
+   # Greedy max–min Hamming selection over distinct PDB IDs to promote dataset diversity.
+   # `strings` may repeat a PDB ID (multiple vdGs from one structure); dedupe first so
+   # the k selected indices correspond to k distinct IDs, not k list entries.
+   unique_strings = list(dict.fromkeys(strings))
+   k = min(k, len(unique_strings))
+   ascii_array = strings_to_ascii_array(unique_strings)
    selected_indices = select_diverse_subset_greedy(ascii_array, k)
-   return [strings[i] for i in selected_indices]
+   return [unique_strings[i] for i in selected_indices]
 
 def strings_to_ascii_array(strings):
-   return np.array([[ord(c) for c in s] for s in strings], dtype=np.uint8)
+   if not strings:
+      return np.empty((0, 0), dtype=np.int32)
+   max_len = max(len(s) for s in strings)
+   return np.array([[ord(c) for c in s.ljust(max_len, '\x00')] for s in strings], dtype=np.int32)
 
-@njit
-def hamming(s1, s2):
-   dist = 0
-   for i in range(len(s1)):
-      if s1[i] != s2[i]:
-         dist += 1
-   return dist
-
-@njit
-def update_min_dists(data, selected_idx, selected_mask, min_dists):
-   n = data.shape[0]
-   for i in range(n):
-      if selected_mask[i] == 0:
-         dist = hamming(data[selected_idx], data[i])
-         if dist < min_dists[i]:
-            min_dists[i] = dist
+def update_min_dists(data, selected_idx, min_dists):
+   # Vectorized over rows. Already-selected rows are updated too (cheaper than
+   # masking) and are harmless: select_diverse_subset_greedy masks them out of the
+   # argmax, so their min_dists entry is never read.
+   dist = (data != data[selected_idx]).sum(axis=1).astype(min_dists.dtype)
+   np.minimum(min_dists, dist, out=min_dists)
 
 def select_diverse_subset_greedy(data, k):
    n = data.shape[0]
+   if n == 0:
+      raise ValueError("data is empty")
+   if k <= 0:
+      raise ValueError(f"k must be positive, got {k}")
+   if k > n:
+      raise ValueError(f"k={k} exceeds data size n={n}")
    selected = [0]  # start with first point
    selected_mask = np.zeros(n, dtype=np.uint8)
    selected_mask[0] = 1
-   min_dists = np.full(n, 255, dtype=np.uint8)
+   # Sentinel: max possible Hamming distance (data.shape[1]) + 1, avoids wraparound
+   sentinel = data.shape[1] + 1
+   min_dists = np.full(n, sentinel, dtype=np.int32)
 
-   # Initial distance pass
-   for i in range(1, n):
-      min_dists[i] = hamming(data[0], data[i])
+   # Initial distance pass: vectorized hamming from data[0] to all others.
+   min_dists[1:] = (data[1:] != data[0]).sum(axis=1).astype(np.int32)
 
    for _ in range(1, min(n, k)):
-      # Select max of min distances
-      max_idx = -1
-      max_val = -1
-      for i in range(n):
-         if selected_mask[i] == 0 and min_dists[i] > max_val:
-            max_val = min_dists[i]
-            max_idx = i
+      # Select unselected point with largest min-distance to any selected point.
+      # Mask selected entries to a value smaller than any reachable distance.
+      masked = np.where(selected_mask, np.int32(-1), min_dists.astype(np.int32))
+      max_idx = int(np.argmax(masked))
+
+      if masked[max_idx] < 0:  # all points are selected
+         break
 
       selected.append(max_idx)
       selected_mask[max_idx] = 1
 
-      # Parallel update of min distances
-      update_min_dists(data, max_idx, selected_mask, min_dists)
+      # Update min distances to all unselected points from newly selected point
+      update_min_dists(data, max_idx, min_dists)
 
    return selected
 
-def _stream_root(vdglib_dir):
-    # Root for AA composition streaming buckets.
+def _stream_root(vdglib_dir, create=False):
+    # Root for AA composition streaming buckets. Pure path computation unless
+    # create=True: callers that only need the path (e.g. to clean it up) must not
+    # have to make the directory as a side effect of asking for it.
     # Tries $TMPDIR, /scratch, /tmp, and vdglib_dir as fallback.
+    # Includes SGE job ID for isolation of concurrent runs by the same user.
     user = os.environ.get("USER") or getpass.getuser() or "unknown"
     vdglib_tag = os.path.basename(os.path.abspath(vdglib_dir.rstrip(os.sep)))
+    job_id = os.environ.get("JOB_ID", "")
+    if job_id:
+        # SGE job runs: use job_id (and optionally task_id) for per-invocation isolation
+        task_id = os.environ.get("SGE_TASK_ID", "")
+        job_suffix = f"{job_id}_{task_id}" if task_id else job_id
+    else:
+        # Local runs: use PID as fallback
+        job_suffix = str(os.getpid())
+
     tmpdir_env = os.environ.get("TMPDIR")
     if tmpdir_env:
-        root = os.path.join(tmpdir_env, f"vdg_stream_{vdglib_tag}")
+        root = os.path.join(tmpdir_env, user, f"vdg_stream_{vdglib_tag}_{job_suffix}")
     elif os.path.isdir("/scratch"):
-        root = os.path.join("/scratch", user, f"vdg_stream_{vdglib_tag}")
+        root = os.path.join("/scratch", user, f"vdg_stream_{vdglib_tag}_{job_suffix}")
     elif os.path.isdir("/tmp"):
-        root = os.path.join("/tmp", user, f"vdg_stream_{vdglib_tag}")
+        root = os.path.join("/tmp", user, f"vdg_stream_{vdglib_tag}_{job_suffix}")
     else:
-        root = os.path.join(vdglib_dir, "stream_tmp")
-    os.makedirs(root, exist_ok=True)
+        root = os.path.join(vdglib_dir, user, f"stream_tmp_{job_suffix}")
+    if create:
+        os.makedirs(root, exist_ok=True)
     return root
 
-def _aa_tmp_dir(vdglib_dir, size_subset):
+def _aa_tmp_dir(vdglib_dir, size_subset, create=False):
     # Write per-AA-bucket records to disk to free memory
-    return os.path.join(_stream_root(vdglib_dir), str(size_subset))
-
-def _aa_tmp_path(vdglib_dir, size_subset, aa_key):
-    # AA bucket file name is based on AA key plus a short SHA1 suffix
-    h = hashlib.sha1(aa_key.encode()).hexdigest()[:16]
-    fname = f"{aa_key[:80]}__{h}.jsonl.gz"
-    return os.path.join(_aa_tmp_dir(vdglib_dir, size_subset), fname)
-
-def normalize_rmsd(num_atoms, atoms):
-    ''' Return a size-normalized RMSD threshold (Å) for the given atom set
-    ('cgvdmbb' or 'flankbb'). The threshold scales linearly with the number
-    of atoms between 8 and 15:
-        flankbb: 0.5 Å → 1.5 Å
-        cgvdmbb: 0.5 Å → 1.0 Å
-    Below 8 atoms, use the minimum; above 15, use the maximum.
-    '''
-
-    if atoms == 'flankbb':
-        max_threshold = 1.5
-        min_threshold = 0.5
-    elif atoms == 'cgvdmbb':
-        max_threshold = 1.0
-        min_threshold = 0.5
-    else:
-        raise ValueError(f"Unknown atom set for normalize_rmsd: {atoms}")
-
-    min_atoms = 8
-    max_atoms = 15
-
-    if num_atoms < min_atoms:
-        return min_threshold
-    if num_atoms > max_atoms:
-        return max_threshold
-
-    scaling_factor = (num_atoms - min_atoms) / (max_atoms - min_atoms)
-    threshold = min_threshold + scaling_factor * (max_threshold - min_threshold)
-    return threshold
+    d = os.path.join(_stream_root(vdglib_dir, create=create), str(size_subset))
+    if create:
+        os.makedirs(d, exist_ok=True)
+    return d

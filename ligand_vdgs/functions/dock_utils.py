@@ -3,10 +3,30 @@
 from itertools import combinations, product
 from functools import lru_cache
 import numpy as np
-import os
-import re
 
-def get_bsr_combinations(solved_struct, ligname, quiet=True):
+from ligand_vdgs.functions import vdg_struct_utils as struct_utils
+from ligand_vdgs.functions.vdg_struct_utils import get_res_AA_identity
+from ligand_vdgs.functions.utils import mol_from_fragment
+
+# Largest vdG subset size the library is built for; caps BSR combo enumeration.
+#
+#   - AA-slot symmetry is minimized over *inside* the clustering distance
+#     (vdg_fp_utils.build_perm_group), so a repeated-label bucket costs prod(k!)
+#     permutations per pair-distance -- 2x at sizes 1-2, but 6x for a bb_bb_bb
+#     bucket at size 3, on top of an already O(N^2) clustering.
+#   - The CG_VDM_CONTACT_CUTOFF guard in clus_and_deduplicate_vdgs checks each
+#     vdM slot but discards the *whole* environment when any one fails, so a
+#     non-contacting slot takes its genuinely-contacting partners with it. At
+#     size 2 that costs 0.133% of vdGs (measured over 1,501 size-2 nr vdGs),
+#     which is why the simple version was kept. The loss grows with subset size:
+#     more slots means more chances that at least one fails, and more good slots
+#     discarded each time it does. Above 2, drop only the offending slot -- which
+#     means re-deriving the subset's aa_bucket and de-duplicating the remainder
+#     against the smaller-subset vdGs that generation already emits.
+# Raising this means fixing both, not editing this line.
+MAX_SUBSET_SIZE = 2
+
+def get_bsr_combinations(solved_struct, ligname, quiet=True, pdbfile=""):
     # Enumerate binding-site residue combinations for vdG matching.
 
     # 1) Find all binding-site residues once
@@ -27,21 +47,37 @@ def get_bsr_combinations(solved_struct, ligname, quiet=True):
         if res_obj is None:
             continue
 
-        bb_coords = []
-        for atom_name in ["N", "CA", "C"]:
-            atom = res_obj.select(f"name {atom_name}")
-            if atom is None or atom.numAtoms() == 0:
-                raise ValueError(f"Missing atom {atom_name} in residue "
-                    f"{seg}:{chain}:{resnum}")
-            bb_coords.append(atom.getCoords()[0])
+        # (seg, chain, resnum) is not unique when insertion codes are in use: the
+        # selection pulls every icode variant at once, and get_bb_coords would take
+        # N from one residue and CA from another. Skip rather than merge.
+        if len(set(res_obj.getIcodes())) > 1:
+            print(
+                f"[WARNING] ({pdbfile}) Residue {seg}:{chain}:{resnum} has multiple "
+                f"insertion codes; skipping (insertion codes are not part of the BSR key).",
+                flush=True,)
+            continue
+
+        # Same backbone policy as the library side (best altloc, finite and
+        # non-collinear N/CA/C); returns None if any of that fails.
+        bb_coords = struct_utils.get_bb_coords(res_obj)
+        if bb_coords is None:
+            print(
+                f"[WARNING] ({pdbfile}) Residue {seg}:{chain}:{resnum} has no usable "
+                f"N/CA/C backbone; skipping residue.", flush=True,)
+            continue
 
         AA = get_res_AA_identity(res_obj)
-        bb_cache[(seg, chain, resnum)] = (AA, np.asarray(bb_coords, dtype=np.float32),)
+        if AA is None:
+            continue
+        bb_arr = np.asarray(bb_coords, dtype=np.float32)
+        bb_arr.setflags(write=False)  # shared by every combo variant below
+        bb_cache[(seg, chain, resnum)] = (AA, bb_arr)
 
     # 3) Enumerate subsets
     bsr_combos = get_vdg_subsets(bindingsite_residues)
 
-    # 4) Build all combinations of AA identities with 'bb' wildcards
+    # 4) Build all combinations of sidechain / backbone labels
+    seen_bsr_keys = set()  # (c, bsr_combo): both are tuples of hashable primitives
     all_bsr_combos = []
     for bsr_combo in bsr_combos:
         bsr_AA_identities = []
@@ -49,49 +85,62 @@ def get_bsr_combinations(solved_struct, ligname, quiet=True):
 
         for bsr in bsr_combo:
             if bsr not in bb_cache:
-                # This should be rare; skip broken residues
+                print(
+                    f"[WARNING] BSR residue {bsr} not found in backbone cache; skipping.",
+                    flush=True,)
                 continue
             AA, bb_coords = bb_cache[bsr]
             bsr_AA_identities.append(AA)
             input_bsr_bb_coords.append(bb_coords)
 
-        if not bsr_AA_identities:
-            continue
+        if len(bsr_AA_identities) != len(bsr_combo):
+            continue  # one or more residues missing backbone atoms; skip whole combo
 
-        # Convert GLY -> bb
-        bsr_AA_identities_conv_bb = [AA if AA != "GLY" else "bb" for AA in bsr_AA_identities]
+        # Each residue is tried both as its own sidechain identity and as the
+        # single backbone label; whether a backbone geometry is physically
+        # hostable is decided on the read path, not here (see
+        # hit_finder_core.backbone_slots_can_host).
+        options = [struct_utils.query_slot_labels(AA) for AA in bsr_AA_identities]
 
-        # Each AA can be itself or 'bb' (except literal 'bb', which stays 'bb')
-        options = [(x,) if x == "bb" else (x, "bb") for x in bsr_AA_identities_conv_bb]
         combo_variants = list(product(*options))
         for c in combo_variants:
-            bsr_aas_coords = (c, bsr_combo, bsr_AA_identities, input_bsr_bb_coords.copy())
-            if bsr_aas_coords not in all_bsr_combos:
+            key = (c, bsr_combo)
+            if key not in seen_bsr_keys:
+                seen_bsr_keys.add(key)
+                # Coord arrays are the read-only ones from bb_cache, shared
+                # across variants; consumers copy on conversion.
+                bsr_aas_coords = (c, bsr_combo, bsr_AA_identities, tuple(input_bsr_bb_coords))
                 all_bsr_combos.append(bsr_aas_coords)
 
     return all_bsr_combos
 
-def get_bindingsite_residues(prody_obj, addl_residues, ligname, dist_from_lig=8, 
+def get_bindingsite_residues(prody_obj, addl_residues, ligname, dist_from_lig=None,
     CA_only=True, quiet=True):
     res = []
-    # Use CA_only=True when you're doing blind docking and don't want to use sc info
-    # Use CA_only=False when you want to use sc positions to define interactions
+    # Use CA_only=True when you're doing blind docking and want only C-alpha positions.
+    # Use CA_only=False to select all protein atoms (not just CA) near the ligand.
+    if dist_from_lig is None:
+        dist_from_lig = 8 if CA_only else 4.5
     if CA_only:
         _selection = "name CA"
     else:
         _selection = "protein"
-    CAs = prody_obj.select(
-        f"{_selection} within {dist_from_lig} of resname {ligname} and not element CA"
-        )  # exclude calcium
-    for ca in CAs:
-        res_tup = (ca.getSegname(), ca.getChid(), ca.getResnum())
-        if res_tup not in res:
+    atoms = prody_obj.select(
+        f"({_selection} and not element Ca CA and not resname CA) "
+        f"within {dist_from_lig} of resname {ligname}")  
+          # exclude calcium (name CA can match Ca2+ ions, not just alpha carbons);
+          # element casing ("Ca" vs "CA") isn't consistent across PDB writers
+    seen = set()  # membership set alongside the list, which keeps atom order
+    for atom in atoms:
+        res_tup = (atom.getSegname(), atom.getChid(), atom.getResnum())
+        if res_tup not in seen:
+            seen.add(res_tup)
             res.append(res_tup)
     if addl_residues:
         res += addl_residues
     for r in res:
         if not isinstance(r, tuple) or len(r) != 3:
-            print(f"Invalid residue tuple: {r}")
+            print(f"[WARNING] Invalid residue tuple: {r}")
     # Only print the pymol selection once (caller controls this via quiet)
     if not quiet:
         print("\nBinding site residues for pymol selection:\n")
@@ -103,116 +152,52 @@ def get_bindingsite_residues(prody_obj, addl_residues, ligname, dist_from_lig=8,
 def get_vdg_subsets(input_list):
     # Initialize an empty list to store all subsets
     all_subsets = []
-    # Loop through subset sizes 1& 2, generate combos, then add to list
-    for r in range(1, 3):
+    for r in range(1, MAX_SUBSET_SIZE + 1):
         subsets = combinations(input_list, r)
         all_subsets.extend(subsets)
     return all_subsets
 
-def select_residue(prody_obj, seg, chain, resnum):
-    if seg == '':
-        sele = f'chain {chain} and resnum {resnum}'
-    else:
-        sele = f'segment {seg} and chain {chain} and resnum {resnum}'
-    res_obj = prody_obj.select(sele)
-    return res_obj
+@lru_cache(maxsize=1024)
+def cg_element_symbols(cg_smarts):
+    """Per-atom element symbols for a CG pattern, in the pattern's own atom order.
 
+    Read off the parsed mol rather than tokenized out of the string. The CG
+    pattern is a SMARTS (that is what generation parsed it as), and
+    utils.extract_elements is a SMILES tokenizer by its own docstring: it yields
+    nothing at all for '[#6][#7]', and three symbols for the two atoms of
+    'C[N,O]'. RDKit gets both right.
 
-def get_res_AA_identity(res_obj):
-    assert len(set(res_obj.getResnames())) == 1
-    AA = res_obj.getResnames()[0]
-    return AA
+    ``None`` marks an atom whose element the pattern does not pin down -- an OR
+    or negation query, which RDKit reports as atomic number 0. Callers must treat
+    those slots as matching any element; only the query fragment itself knows
+    what is really there.
 
-def extract_elements(smiles: str):
-    # Return a list of elements in the order they appear in the SMILES string.
-    # Match:
-    # - Two-letter uppercase elements (Cl, Br, Si, Na, Li)
-    # - Single uppercase element (C, N, O, S, etc.)
-    # - Single lowercase aromatic atom (c, n, o, s, p)
-    pattern = r"(Cl|Br|Si|Na|Li|[A-Z]|[cnosp])"
-    return re.findall(pattern, smiles)
+    Depends only on the CG definition, so it is cached rather than recomputed per
+    permutation.
+    """
+    mol = mol_from_fragment(cg_smarts)
+    if mol is None:
+        raise ValueError(f"Could not parse CG pattern as SMARTS: {cg_smarts!r}")
+    return tuple(a.GetSymbol() if a.GetAtomicNum() else None for a in mol.GetAtoms())
 
-def get_query_cg_coords(sub, sub_smiles):
+def get_query_cg_coords(sub, cg_smarts):
     coords_list = []
-    Mol_elements_list = []
-    # Get atom names, etc.
+    mol_elements = []
     conf = sub.GetConformer()  # Get the 3D conformer to get coords
     for atom in sub.GetAtoms():
         pos = conf.GetAtomPosition(atom.GetIdx())  # returns an RDKit Point3D object
-        xyz = (pos.x, pos.y, pos.z)
-        coords_list.append(xyz)
-        Mol_elements_list.append(atom.GetSymbol())
-    
-    # Check that the atom orders are actually correct by checking the element names
-    smiles_elements = extract_elements(sub_smiles)
-    smiles_elements = [e.capitalize() for e in smiles_elements] # capital to match Mol elements
-    if smiles_elements != Mol_elements_list:
-        # Raise error
-        raise ValueError(f"Element order mismatch between SMILES and RDKit Mol:\n"
-                         f"SMILES elements: {smiles_elements}\n"
-                         f"Mol elements: {Mol_elements_list}")
+        coords_list.append((pos.x, pos.y, pos.z))
+        mol_elements.append(atom.GetSymbol())
+
+    # The guard stays per-Mol: atom order is established separately for every
+    # permutation (by Frags, or by reorder_sub_to_target_smiles picking matches[0]),
+    # so validating one representative and trusting the rest would not be equivalent.
+    cg_elements = cg_element_symbols(cg_smarts)
+    if len(mol_elements) != len(cg_elements) or any(
+            expected is not None and expected != got
+            for expected, got in zip(cg_elements, mol_elements)):
+        raise ValueError(f"Element order mismatch between CG pattern and RDKit Mol:\n"
+                         f"CG pattern elements: {list(cg_elements)} "
+                         f"(None = element not pinned by the pattern)\n"
+                         f"Mol elements: {mol_elements}")
     return coords_list
-
-def name_outdir(pdbfile, outdir, make_pdb_subfolder):
-    # Name the outdir for this pdb query.
-    # `make_pdb_subfolder` indicates whether to make a subfolder for each pdb within
-    # the outdir (e.g. for multiple predictions of the same PDB).
-    pdbname = os.path.basename(pdbfile)
-    for ext in (".pdb.gz", ".pdb", ".cif.gz", ".cif"):
-        if pdbname.endswith(ext):
-            pdbname = pdbname[:-len(ext)]
-            break
-    pdb_id = pdbname[:4]
-    if make_pdb_subfolder:
-        output_dir = os.path.join(outdir, pdb_id, pdbname)
-    else:
-        output_dir = os.path.join(outdir, pdbname)
-    return output_dir
-
-@lru_cache(maxsize=8192)
-def _map_aa_identities_to_vdg_resinds_cached(vdg_AAs_tuple, target_list_tuple, wildcard='bb'):
-    vdg_AAs = list(vdg_AAs_tuple)
-    target_list = list(target_list_tuple)
-    AA_indices = {}
-
-    # Handle regular AAs (non-wildcards, i.e. not `bb`)
-    for AA in set(target_list):
-        if AA != wildcard:
-            AA_indices[AA] = [i for i, x in enumerate(vdg_AAs) if x == AA]
-    
-    # For wildcard, it can match any AA in the vdg (exclude lig)
-    AA_codes = ['ALA', 'ARG', 'ASN', 'ASP', 'CYS', 'GLU', 'GLN', 'GLY',
-                'HIS', 'ILE', 'LEU', 'LYS', 'MET', 'PHE', 'PRO', 'SER',
-                'THR', 'TRP', 'TYR', 'VAL']
-    if wildcard in target_list:
-        AA_indices[wildcard] = [i for i, x in enumerate(vdg_AAs) if x in AA_codes]
-    
-    # Generate all permutations of indices
-    result = []
-    def backtrack(current_indices, target_position):
-        # If we've matched all target elements, add the current permutation to result
-        if target_position == len(target_list):
-            result.append(current_indices.copy())
-            return
-
-        # Get the next element to match
-        current_element = target_list[target_position]
-        
-        # Iterate over each possible index for this element
-        for idx in AA_indices.get(current_element, []):
-            # Make sure we don't use the same index twice
-            if idx not in current_indices:
-                current_indices.append(idx)
-                backtrack(current_indices, target_position + 1)
-                current_indices.pop()  # Backtrack
-    backtrack([], 0)
-    return result
-
-def map_aa_identities_to_vdg_resinds(vdg_AAs, target_list, wildcard='bb'):
-    '''
-    Given a list of amino acids in the prody obj (`vdg_AAs`) and a list of AAs to 
-    select for (`target_list`), find all permutations of indices (i.e., resindices) in the 
-    vdg (`vdg_AAs`) that match the target list elements in order. The amino acid `bb` 
-    is treated as a wildcard.
-    '''
-    return _map_aa_identities_to_vdg_resinds_cached(tuple(vdg_AAs), tuple(target_list), wildcard)

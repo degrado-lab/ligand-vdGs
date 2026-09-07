@@ -23,9 +23,11 @@ def main():
         if basename.endswith(ext):
             basename = basename[:-len(ext)]
             break
-    pdb_code = basename[-4:]
-    out_filename = pdb_code + '.probe'
-    out_subdir = os.path.join(outdir, pdb_code[1:3])
+    # Keep the full stem (`1abc` or `1abc_1`) and lowercase the middle-two
+    # subdir: this is the layout the miner reads back (vdg.py builds
+    # probe_dir/<stem[1:3].lower()>/<stem>.probe.gz).
+    out_filename = basename + '.probe'
+    out_subdir = os.path.join(outdir, basename[1:3].lower())
     out_path = os.path.join(out_subdir, out_filename)
     if not os.path.exists(out_subdir):
         os.makedirs(out_subdir)

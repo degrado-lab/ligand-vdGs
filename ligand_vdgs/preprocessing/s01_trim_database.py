@@ -8,11 +8,9 @@ Reduces size of the 50G consolidated_BioLiP2_split/ database by
   (there's some logic about taking a guess at whether the pdbs are within the same
   series or not - double check that and describe here.)
 
-Usage: 
+Usage:
 cd $YOUR_LIGAND-VDGS_DIR
-pip install -e . # for debugging and developing
-pip install .    # for general usage
-python -m ligand_vdgs.preprocessing.trim_database
+python ligand_vdgs/preprocessing/s01_trim_database.py
 
 NOTE: the reason this script takes forever for BioLiP2 is because there are a lot of 
 "ligands" that are like ALAA, ALAB, ALA1, ALA2, etc. and are not actually
@@ -22,13 +20,13 @@ enough chain columns that they run into each other. TODO: filter out those PDBs.
 
 import os
 import traceback
-import numpy as np
-import pickle as pkl
 import json
+import numpy as np
 import prody as pr
 
 from ligand_vdgs.functions.interactions import add_pdb_to_nr_db_dict
 from ligand_vdgs.functions.utils import set_up_outdir
+from ligand_vdgs.preprocessing._prep_filters import drop_prepwizard_hazard_residues
 
 origin_dir = '/home/sophia/DockDesign/databases/consolidated_BioLiP2_split'
 target_dir = '/home/sophia/DockDesign/databases/consolidated_BioLiP2_trimmed'
@@ -36,14 +34,21 @@ lig_avg_bfactor_cutoff = 40 # default is 40
 output_database_dict_name = '20240809_database_dict.json'
 overwrite_pdbs = False # If set to true NEED TO ADD code for checking whether a pdbfile already exists (TODO)
 skip_to_output_pdbs = True
-radius = 10
+# Sphere radius around each ligand, in A. Measured over 124 deposited entries
+# (contact shell = 4.5 A): 10 A retains 93.2% of a contact vdM's +/-2 flanking
+# residues, 83.5% of the ligand's second shell and 8.2% of its third; 16 A
+# completes the second shell, and 20 A is the first radius that also reaches
+# the third (99.5%). 20 A costs ~3.0x the atoms of 10 A. Third-shell context is
+# what a protonation program needs to place a buried His/Asp correctly, so the
+# radius is set for that rather than for the flank walk.
+radius = 20
 
 pdbs_already_done = 'log_processed_pdbs.txt'
 previous_checkpoint_dict = 'checkpoint.pkl'
 
 
 def main():
-                
+
     checkpoint_name = output_database_dict_name + '.checkpoint'
 
     # Iterate through pdb files
@@ -55,7 +60,7 @@ def main():
     #                                                lig res: 
     #                                                      list of interacting residues 
     #                                                      (segment, chain, rensum, resname)
-    # See get_lig_interacting_chains() for more details. 
+    # See interactions.add_pdb_to_nr_db_dict() for more details.
     database_dict = {} 
 
     #if restart: # the name restart could be confusng bc now it should be reload
@@ -84,13 +89,13 @@ def main():
 
                     # Add the ligand(s) and interacting residues to the ligand dict
                     # if nonredundant. 
+                    # Redundancy here is a quick and dirty check (computationally
+                    # cheap); it is refined later in the vdG creation process.
                     database_dict = add_pdb_to_nr_db_dict(
-                        database_dict, pdbpath, lig_bfactor_cutoff=lig_avg_bfactor_cutoff,
-                        unrefined=True) # unrefined is a quick and dirty way to check
-                                        # for redundancy (computationally cheaper. Option
-                                        # to refine later in the vdg creation process.)
+                        database_dict, pdbpath,
+                        lig_bfactor_cutoff=lig_avg_bfactor_cutoff)
                 except Exception as e:
-                    print('PDB FAILED: ', pdbfile)
+                    print(f'[ERROR] PDB failed: {pdbfile}')
                     print(e)
                     traceback.print_exc()
 
@@ -99,16 +104,13 @@ def main():
                     print(f"Dumping on pdbfile_ix: {pdbfile_ix}", flush=True)
                     json.dump(database_dict, open(checkpoint_name, "w"))
 
-            #if pkl_dumped: # TODO: get rid
-            #    break
-
     
         print("Starting final JSON dump", flush=True)
         json.dump(database_dict, open(output_database_dict_name, "w"))
         print("Done with final JSON dump", flush=True)
 
     # Now that the ligand instances have been deduplicated, print out only the binding sites
-    # (10A around the lig)
+    # (*radius* A around the lig)
     
     AAs = ['ALA', 'CYS', 'ASP', 'GLU', 'PHE', 'GLY', 'HIS', 'ILE', 'LYS', 'LEU', 
             'MET', 'ASN', 'PRO', 'GLN', 'ARG', 'SER', 'THR', 'VAL', 'TRP', 'TYR']
@@ -124,13 +126,10 @@ def main():
         if len(ligresn) == 4 and ligresn[:3] in AAs:
             continue
         for lig_res in lig_interactions.keys():
-            lig_res_ = lig_res.split(' ')
-            pdbname = lig_res_[0]
-            seg_ch_res = lig_res_[1:4]
-            if pdbname not in bindingsite_dict.keys():
-                bindingsite_dict[pdbname] = [seg_ch_res]
-            else:
-                bindingsite_dict[pdbname].append(seg_ch_res)
+            # Keys are ' '-joined 'pdbfile seg chain resnum resname' (see interactions.py);
+            # seg and chain may be empty strings.
+            pdbname, _seg, _ch, _resnum, _resname = lig_res.split(' ')
+            bindingsite_dict.setdefault(pdbname, []).append((_seg, _ch, int(_resnum)))
 
     # Then, select *radius* around the lig residues, and write out the pdb.
     for pdb_name, list_ligs in bindingsite_dict.items():
@@ -144,24 +143,30 @@ def main():
 
         # Load pdb
         original_pdbpath = os.path.join(origin_dir, original_pdb_subdir, pdb_name)
-        parsed = pr.parsePDB(original_pdbpath)
-        # Select all ligand residues
-        all_ligs_sel = ''
-        for lig_residue in list_ligs:
-            _seg, _ch, _resnum = lig_residue 
-            if _seg == '':
-                lig_sel = f'(chain {_ch} and resnum {_resnum})'
-            else:
-                lig_sel = f'(segment {_seg} chain {_ch} and resnum {_resnum})'
-            if all_ligs_sel == '':
-                all_ligs_sel = lig_sel
-            else:
-                all_ligs_sel += f' or {lig_sel}'
         try:
+            parsed = pr.parsePDB(original_pdbpath)
+            if parsed is None:
+                print(f'[ERROR] Could not parse {original_pdbpath}')
+                continue
+
+            # Select all ligand residues. Match on the seg/chain/resnum arrays rather than
+            # building a selection string: a blank segname or chid, or a negative resnum,
+            # can't be round-tripped through ProDy's selection syntax.
+            segnames, chids, resnums = parsed.getSegnames(), parsed.getChids(), parsed.getResnums()
+            lig_mask = np.zeros(len(parsed), dtype=bool)
+            for _seg, _ch, _resnum in list_ligs:
+                lig_mask |= (segnames == _seg) & (chids == _ch) & (resnums == _resnum)
+            if not lig_mask.any():
+                print(f'[ERROR] No ligand atoms found in {original_pdbpath} for {list_ligs}')
+                continue
+            ligs = parsed[np.flatnonzero(lig_mask)]
+
             # Select sphere around all ligand residues (entire residues)
-            sele_around_lig_str = f'within {radius} of ({all_ligs_sel})'
-            resinds_around_lig = set(parsed.select(sele_around_lig_str).getResindices())
-            resindices_around_lig = ' '.join([str(i) for i in resinds_around_lig])
+            around = parsed.select(f'within {radius} of ligobj', ligobj=ligs)
+            # Drop residues that would provoke prepwizard in s02 (see _prep_filters).
+            keep_resindices = drop_prepwizard_hazard_residues(
+                parsed, set(around.getResindices()))
+            resindices_around_lig = ' '.join(str(i) for i in keep_resindices)
             around_lig = parsed.select(f'resindex {resindices_around_lig}')
 
             # Write out PDB
@@ -171,7 +176,7 @@ def main():
             print(output_path)
         except Exception as e:
             print('--------------------------------------')
-            print('FAILED TO OUTPUT', output_path)
+            print(f'[ERROR] Failed to output {output_path}')
             print(e)
             traceback.print_exc()
             print('--------------------------------------')
@@ -179,7 +184,7 @@ def main():
     num_output_pdbs = 0
     for pdb_output_subdir in os.listdir(target_dir):
         for pdb_file in os.listdir(os.path.join(target_dir, pdb_output_subdir)):
-            if pdb_file.endswith('.pdb'):
+            if pdb_file.endswith('.pdb') or pdb_file.endswith('.pdb.gz'):
                 num_output_pdbs += 1
     print('Number of deduplicated PDBs processed:', len(bindingsite_dict.keys()))
     print('Number of PDBs successfully output:', num_output_pdbs)
@@ -189,77 +194,6 @@ def main():
 
 
     print('Script successfully completed.')
-
-    
-
-
-def convert_nested_dict_keys_and_values(d):
-    """Recursively converts the keys (tuples to underscore-separated strings)
-    and values (tuples to hyphen-separated strings) of a nested dictionary in place."""
-    
-    for outer_key in list(d.keys()):  # Iterate over the outer dictionary's keys
-        nested_dict = d[outer_key]  # Get the nested dictionary
-        
-        # Create a new dictionary to hold the updated keys and values
-        updated_nested_dict = {}
-        
-        for inner_key, inner_value in nested_dict.items():
-            # Convert the inner key tuple to an underscore-separated string
-            new_inner_key = f"{inner_key[0]} {' '.join([str(i) for i in inner_key[1]])}"
-            # Convert the inner value tuple to a hyphen-separated string
-            new_inner_value = []
-            for n in inner_value:
-                n_sublist = []
-                for sub_n in n:
-                    if type(sub_n)==np.int64:
-                        sub_n = int(sub_n) # json does not recognize numpy int
-                    else:
-                        sub_n = str(sub_n) # json does not recognize numpy str either
-                    
-                    
-                    n_sublist.append(sub_n)
-                new_inner_value.append(n_sublist)
-
-            # Add the converted key-value pair to the updated dictionary
-            updated_nested_dict[new_inner_key] = new_inner_value
-        
-        # Update the outer dictionary with the updated nested dictionary
-        d[outer_key] = updated_nested_dict
-
-
-
-
-
-
-
-
-
-
-
-
-'''
-    Select each ligand and determine what chains it interacts with. 
-    
-    Downstream use: 
-        -- If it only interacts with 1 chain, then take that monomer and make it
-           a separate pdb to isolate it from irrelevant chains to reduce the database size.
-        -- If it interacts with >1 chain, then need to keep those interacting chains. 
-    
-    Store the ligs (seg/chain/resnum) and interacting residues in a dict to further
-    reduce the database size by making a guess at whether monomers within a pdb are redundant
-    by looking up the lig and vdm resnums and seeing if they're the same across the different 
-    monomers (intra-pdb redundancy). You can additionally make a guess about whether 2 pdbs are
-    redundant by seeing if their acc. codes are similar (i.e. in the same series), and their ligs 
-    and vdms are on the same chains/resnums (inter-pdb redundancy).
-    
-    
-    '''
-
-
-
-
-
-        
 
 
 if __name__ == "__main__":

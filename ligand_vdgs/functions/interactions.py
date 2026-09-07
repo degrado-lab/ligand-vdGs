@@ -1,101 +1,103 @@
 import numpy as np
 import prody as pr
-from smart_vdms.functions.redundancy import check_networks, check_pdbnames
+from ligand_vdgs.functions.redundancy import check_networks, check_pdbnames
 
 
-def get_nr_res_interactions_with_ligs_in_pdb(ligand, complex, unrefined, dist_cutoff=4.8, 
+def get_nr_res_interactions_with_ligs_in_pdb(ligand, atoms, dist_cutoff=4.8,
                                              lig_bfactor_cutoff=40):
     '''
-    Identifies the ligands and the protein residues interacting with those ligands in a single PDB.
-    Unrefined redundancy refers to a crude/quick and dirty way of measuring redundancy. 
-    Later on in the vdg creation process, there will be an opportunity to refine redundancy checks.
-    This quick/dirty approximation is to reduce the size of the database in the first place (for prepwizard, probe, etc.) 
-    
+    Identifies the ligands and the *protein* residues interacting with those ligands in a
+    single PDB. Unrefined redundancy refers to a crude/quick and dirty way of measuring
+    redundancy. Later on in the vdg creation process, there will be an opportunity to refine
+    redundancy checks. This quick/dirty approximation is to reduce the size of the database in
+    the first place (for prepwizard, probe, etc.)
+
     dist_cutoff refers to distance between ligand heavy atom and protein heavy atom.
 
+    Ligands with no protein residue within dist_cutoff are dropped: they have no vdG to
+    contribute.
     '''
-    
-    ligand_networks = {} # key = (ligand segment, lig chain, lig resnum, lig resname)
-                         # value = ligand "networks", where each "network" is a list of 
-                         # interacting residues (comprising vdg). Each interacting res is represented
-                         # by its (segment, chain, resnum, resname)
+
+    ligand_networks = {} # key = 'lig segment, lig chain, lig resnum, lig resname'
+                         # value = ligand "networks", where each "network" is a list of
+                         # interacting residues (comprising vdg). Each interacting res is
+                         # represented by its (segment, chain, resnum, resname)
 
     ligand_resinds = set(ligand.getResindices())
-    all_lig_residues = [] # each element is (lig segment, lig chain, lig resnum)
-    # First, collect all lig res seg, chain, and resnums to avoid cases where, for example, in a single 
-    # PDB, the first resind of ligand CAH is chain B, so we put chain B in the nr dict and deem chain A's 
-    # CAH redundant, but the first resind of HEM is chain A, so we put HEM's chain A in the nr dict and 
-    # deem HEM's chain B irrelevant; in this case, we would be writing out both chains A + B, but in 
-    # actuality, they're equivalent (see 9c/4c9n.pdb). Happens fairly often.
+    lig_residues = [] # each element is (lig segment, lig chain, lig resnum, lig resindex)
+    # Collect and sort all lig residues before processing any of them, so that which copy of a
+    # ligand is kept doesn't depend on the order resindices happen to appear in. Otherwise, in a
+    # single PDB, the first resind of ligand CAH might be chain B, so we put chain B in the nr
+    # dict and deem chain A's CAH redundant, while the first resind of HEM is chain A, so we put
+    # HEM's chain A in the nr dict and deem HEM's chain B irrelevant; we'd write out both chains
+    # A + B even though they're equivalent (see 9c/4c9n.pdb). Happens fairly often.
 
-    for lig_resind in sorted(ligand_resinds): # but don't store the lig resind b/c it will get re-indexes
-                                      # in the trimmed pdb
-        lig_obj = complex.select(f'resindex {lig_resind}')
+    for lig_resind in sorted(ligand_resinds):
+        lig_obj = atoms.select(f'resindex {lig_resind}')
+        if lig_obj is None:
+            continue
+        # `atoms` is already hydrogen-stripped by the caller, so lig_obj is heavy atoms only.
         # Remove instances where the lig is a single heavy atom (like O)
-        if len(lig_obj.select('not element H D')) == 1:
+        if len(lig_obj) == 1:
             continue
         # Remove instances where the average b-factor of the ligand is > the lig_bfactor_cutoff.
-        lig_avg_b = np.mean(lig_obj.select('not element H D').getBetas())
+        lig_avg_b = np.mean(lig_obj.getBetas())
         if lig_avg_b > lig_bfactor_cutoff:
             continue
 
         firstligatom = lig_obj[0]
-        _ligseg_, _ligch_, _ligresnum_ = firstligatom.getSegname(), firstligatom.getChid(), firstligatom.getResnum()
-        all_lig_residues.append(' '.join([_ligseg_, _ligch_, str(_ligresnum_)]))
+        lig_residues.append((firstligatom.getSegname(), firstligatom.getChid(),
+                             int(firstligatom.getResnum()), lig_resind))
 
-    sorted_lig_residues = sorted(set(all_lig_residues))
-    for a in sorted_lig_residues:
-        ligseg_, ligch_, ligresnum_ = a.split(' ') # empty whitespace for when seg is ''
-        ligresnum_ = int(ligresnum_)
-        if ligresnum_ < 0: # need grave accent to escape negative sign
-            ligresnum_ = f"`{ligresnum_}`"
-        if ligseg_ == '': 
-            lig_pr_obj = complex.select(f'chain {ligch_} and resnum {ligresnum_}')
-        else:
-            lig_pr_obj = complex.select(f'segment {ligseg_} and chain {ligch_} and resnum {ligresnum_}')
-        candidate_lig_seg, candidate_lig_chain, candidate_lig_resnum, candidate_lig_resname = \
-            lig_pr_obj.getSegnames()[0], lig_pr_obj.getChids()[0], lig_pr_obj.getResnums()[0], \
-            lig_pr_obj.getResnames()[0]
-        candidate_lig_id = ' '.join([candidate_lig_seg, candidate_lig_chain, str(candidate_lig_resnum), 
-                            candidate_lig_resname])
-        
-        # Determine which segments, chains, and residues each lig interacts with
+    for lig_seg, lig_chain, lig_resnum, lig_resind in sorted(lig_residues):
+        # Select by resindex rather than by seg/chain/resnum: a blank segname or chid, or a
+        # negative resnum, can't be round-tripped through a selection string.
+        lig_pr_obj = atoms.select(f'resindex {lig_resind}')
+        lig_resname = lig_pr_obj.getResnames()[0]
+        candidate_lig_id = ' '.join([lig_seg, lig_chain, str(lig_resnum), lig_resname])
+
+        # Determine which segments, chains, and residues each lig interacts with.
+        # 'protein' is the complement of the ligand selection in add_pdb_to_nr_db_dict
+        # ('not (water or ion or protein)'), so ligand and neighbours stay disjoint by
+        # construction (exwithin is belt-and-braces). Note this also excludes nucleic acids
+        # and any residue ProDy's 'protein' flag doesn't recognize.
         candidate_interacting_residues = []
-        neighbs = complex.select(f'within {dist_cutoff} of ligobj', ligobj=lig_pr_obj)
+        neighbs = atoms.select(f'protein and exwithin {dist_cutoff} of ligobj',
+                               ligobj=lig_pr_obj)
+        if neighbs is None: # no protein contacts -> nothing to mine; drop the ligand
+            continue
         for neighb in neighbs:
-            seg, chain, resnum, resname = neighb.getSegname(), neighb.getChid(), neighb.getResnum(), \
-                neighb.getResname()
+            seg, chain, resnum, resname = neighb.getSegname(), neighb.getChid(), \
+                neighb.getResnum(), neighb.getResname()
             vdm_id = [str(seg), str(chain), int(resnum), str(resname)] # numpy int and str not recognized by json
             if vdm_id not in candidate_interacting_residues:
                 candidate_interacting_residues.append(vdm_id)
 
-        # Does the vdg/network (a ligand and its vdms) have the same resnums and resnames as others
-        # within this same PDB? If yes, then redundant.  
-
-        if len(ligand_networks.keys()) == 0:
+        # Does the vdg/network (a ligand and its vdms) have the same resnums and resnames as
+        # others within this same PDB? If yes, then redundant.
+        is_redundant = False
+        for already_deduplicated_ligs, already_deduplicated_network in ligand_networks.items():
+            # Keys are ' '-joined 'seg chain resnum resname'; split to compare
+            # fields (indexing the string would compare single characters). Split
+            # from the right, and only twice: a blank segname or chid contributes
+            # an empty field, and a segname may even contain a space, but resnum
+            # and resname never do.
+            _, dedup_resnum, dedup_resname = already_deduplicated_ligs.rsplit(' ', 2)
+            # Check if lig resnums and resname match
+            if lig_resnum == int(dedup_resnum) and lig_resname == dedup_resname:
+                # If yes, check if vdm resnums and resnames match. Tolerate 2 "missing" residues
+                # because this is checking within the same PDB (intra-pdb)
+                is_redundant = check_networks(candidate_interacting_residues,
+                                              already_deduplicated_network, tol=2)
+                if is_redundant:
+                    break
+        if not is_redundant:
             ligand_networks[candidate_lig_id] = candidate_interacting_residues
-        else: 
-            candidate_network = {}
-            is_redundant = False
-            for already_deduplicated_ligs, already_deduplicated_network in ligand_networks.items():
-                # Check if lig resnums and resname match
-                if (candidate_lig_resnum == already_deduplicated_ligs[2] and 
-                    candidate_lig_resname == already_deduplicated_ligs[3]):
-                    # If yes, check if vdm resnums and resnames match. Tolerate 2 "missing" residues
-                    # because this is checking within the same PDB (intra-pdb)
-                    is_redundant = check_networks(candidate_interacting_residues, 
-                                                  already_deduplicated_network, tol=2)
-                    if is_redundant:
-                        break
-            if not is_redundant:
-                candidate_network[candidate_lig_id] = candidate_interacting_residues
-            # Update the dict after iteration
-            ligand_networks.update(candidate_network)
 
     return ligand_networks
 
 
-def add_pdb_to_nr_db_dict(database_dict, pdbpath, unrefined, lig_bfactor_cutoff):
+def add_pdb_to_nr_db_dict(database_dict, pdbpath, lig_bfactor_cutoff):
     '''
     Select each ligand and determine what chains it interacts with. 
     
@@ -113,46 +115,37 @@ def add_pdb_to_nr_db_dict(database_dict, pdbpath, unrefined, lig_bfactor_cutoff)
     '''
 
     pdbfile = pdbpath.split('/')[-1]
-    if not pdbfile.endswith('pdb'):
+    if not (pdbfile.endswith('.pdb') or pdbfile.endswith('.pdb.gz')):
         print('NOT A PDB:', pdbpath)
         return database_dict
     
     # Identify ligand(s)
-    complex = pr.parsePDB(pdbpath).select('not element H D')
-    ligands = complex.select('not (water or ion or protein)') # prody "hetero" selection not suitable
+    atoms = pr.parsePDB(pdbpath)
+    if atoms is None:
+        print('[ERROR] ProDy could not parse:', pdbpath)
+        return database_dict
+    atoms = atoms.select('not element H D')
+    ligands = atoms.select('not (water or ion or protein)') # prody "hetero" selection not suitable
     if ligands is None: # could be None if the "ligand" is actually a noncanonical AA
         return database_dict
     
-    pdb_dict = get_nr_res_interactions_with_ligs_in_pdb(ligands, complex, unrefined, 
-                                                        lig_bfactor_cutoff=lig_bfactor_cutoff)
+    pdb_dict = get_nr_res_interactions_with_ligs_in_pdb(
+        ligands, atoms, lig_bfactor_cutoff=lig_bfactor_cutoff)
     # Add every vdg instance (lig + its interacting residues) to database_dict if not redundant
     for candidate_lig_res_id, candidate_network in pdb_dict.items():
         lig_resname = candidate_lig_res_id.split(' ')[-1]
-        # Is this vdg (ligand + its interacting residues) redundant to something already in the database dict?
+        # Is this vdg (ligand + its interacting residues) redundant to something already in the
+        # database dict?
         vdg_is_redundant = False
-        
-        if len(database_dict) == 0:
-            database_dict[lig_resname] = {}
-            database_dict[lig_resname][' '.join([pdbfile, candidate_lig_res_id])] = candidate_network
-        else:
-            if lig_resname not in database_dict.keys():
-                database_dict[lig_resname] = {}
-                database_dict[lig_resname][' '.join([pdbfile, candidate_lig_res_id])] = candidate_network
-            else: # Need to check against existing networks, which is quite deep in the nested structure
-                for deduplicated_lig_res, deduplicated_lig_network in database_dict[lig_resname].items():
-                    network_is_redundant = check_networks(candidate_network, deduplicated_lig_network)
-                    if network_is_redundant:
-                        # Are the PDBs part of the same series?
-                        same_pdb_series = check_pdbnames(pdbfile, deduplicated_lig_res[0])
-                        if same_pdb_series:
-                            vdg_is_redundant = True
-                            break
+        existing_ligs = database_dict.setdefault(lig_resname, {})
+        for deduplicated_lig_res, deduplicated_lig_network in existing_ligs.items():
+            if check_networks(candidate_network, deduplicated_lig_network):
+                # Are the PDBs part of the same series?
+                if check_pdbnames(pdbfile, deduplicated_lig_res.split(' ')[0]):
+                    vdg_is_redundant = True
+                    break
 
         if not vdg_is_redundant:
-            database_dict[lig_resname][' '.join([pdbfile, candidate_lig_res_id])] = candidate_network
+            existing_ligs[' '.join([pdbfile, candidate_lig_res_id])] = candidate_network
 
     return database_dict
-
-
-
-

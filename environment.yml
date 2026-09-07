@@ -1,4 +1,4 @@
-name: vdg_env
+name: lig_vdgs
 channels:
   - conda-forge
   - defaults
@@ -80,6 +80,7 @@ dependencies:
       - propcache==0.3.2
       - psutil==7.0.0
       - pyparsing==3.1.1
+      - pytest==9.1.1
       - python-dateutil==2.9.0.post0
       - pytz==2025.2
       - pyyaml==6.0.2
@@ -87,6 +88,8 @@ dependencies:
       - requests==2.32.5
       - scikit-learn==1.6.1
       - scipy==1.13.1
+      - seaborn==0.13.2
+      - umap-learn==0.5.12
       - six==1.17.0
       - sympy==1.14.0
       - threadpoolctl==3.6.0
@@ -99,3 +102,6 @@ dependencies:
       - tzdata==2025.2
       - urllib3==2.5.0
       - yarl==1.20.1
+      # Editable install of this repo, so `ligand_vdgs.*` imports resolve
+      # without sys.path manipulation. Resolves relative to this file's dir.
+      - -e .

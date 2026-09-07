@@ -1,156 +1,613 @@
 # align_and_cluster.py
 
-import os
-from itertools import permutations, product
 import numpy as np
-import prody as pr
+from collections import OrderedDict, namedtuple
 from functools import lru_cache
-from clus_helpers import (calc_seq_similarity, get_res_iden, found_chain_break,
-                          get_AA_and_CA_coords, get_bb_coords)
-from utils import kabsch
+from ligand_vdgs.functions.clus_helpers import calc_seq_similarity
+from ligand_vdgs.functions import vdg_struct_utils as struct_utils
+from ligand_vdgs.functions.vdg_struct_utils import (get_res_iden, found_chain_break,
+    get_AA_and_CA_coords, get_bb_coords, build_flank_lookup_index)
+from ligand_vdgs.functions.utils import kabsch_ssd
+from ligand_vdgs.functions.vdg_fp_utils import (
+    INTERNAL_DISTANCE_EPS, build_perm_group, fp_tolerances,
+    full_row_permutations, internal_distance_lower_bounds,
+    precompute_bucket_fingerprints, precompute_internal_distance_descriptors)
 
-_RMSD_CACHE_MAXSIZE = 100_000
-_SEQ_CACHE_MAXSIZE  = 50_000
+_SEQ_CACHE_MAXSIZE  = 100_000   # sequence similarity (Stage 2 sub-clusters only)
+
+# Stage-2 centre selection is O(m^2) in Python-level pair distances, so both the
+# cluster size at which it stops being exact and how often it is refreshed have
+# to be bounded; see _exact_medoid and get_leader_clusters' leader pass.
+_EXACT_MEDOID_MAX = 1_000       # above this, the medoid is picked from a subsample
+_MEDOID_SUBSAMPLE = 512
+
+# Sized so a cluster clustered exactly (m <= _EXACT_MEDOID_MAX) has all m(m-1)/2
+# of its pairs resident at once. Below that the repeated medoid refreshes of one
+# growing cluster evict each other's pairs and every refresh recomputes a fresh
+# Kabsch per pair, which turns the leader pass from quadratic-with-reuse into
+# cubic. The bound still matters -- an unbounded dict is an OOM on a big bucket --
+# so it is tied to the exact-path cap rather than raised freely.
+_RMSD_CACHE_MAXSIZE = _EXACT_MEDOID_MAX * (_EXACT_MEDOID_MAX - 1) // 2
+
+# pose_minimax_prototype: candidate cap, and the pair budget per Kabsch block.
+_MINIMAX_CANDIDATE_CAP = 4_096
+_MINIMAX_BLOCK_PAIRS   = 200_000
 
 EPS = 1e-9   # strict-improvement epsilon for reassignment; tune to 1e-8 if needed
 
+_CacheInfo = namedtuple('_CacheInfo', 'hits misses evictions maxsize currsize')
+
+
+
+class _BoundedRmsdCache:
+   """Bounded LRU for pair RMSDs, with the membership test ``lru_cache`` lacks.
+
+   Batching only pays if it computes *just* the misses, which means asking what
+   is already known -- ``functools.lru_cache`` exposes no such query. The bound
+   is kept because it is load-bearing: a bucket of n vdGs has n(n-1)/2 pairs
+   (367k for one guanidine bucket alone, far more for a large high-symmetry
+   fragment), so an unbounded dict is an out-of-memory waiting to happen.
+
+   Keys are ``(i, j, p)``: an ordered index pair plus the slot ordering applied
+   to the lower-indexed record. The stored value is the flank RMSD only, so the
+   metric is not part of the key. Indices are relative to the *current* call's
+   datasets and collide across calls, so the ``cache_clear`` on every
+   ``get_leader_clusters`` entry is what keeps this correct.
+   """
+
+   __slots__ = ("_d", "_maxsize", "hits", "misses", "evictions")
+
+   def __init__(self, maxsize):
+      self._d = OrderedDict()
+      self._maxsize = maxsize
+      self.hits = self.misses = self.evictions = 0
+
+   def __contains__(self, key):
+      return key in self._d
+
+   def get(self, key):
+      d = self._d
+      if key in d:
+         d.move_to_end(key)
+         self.hits += 1
+         return d[key]
+      self.misses += 1
+      return None
+
+   def put(self, key, value):
+      d = self._d
+      if key in d:
+         d.move_to_end(key)
+      d[key] = value
+      if len(d) > self._maxsize:
+         d.popitem(last=False)
+         # Nonzero means pairs are being recomputed; the bound needs revisiting.
+         self.evictions += 1
+
+   def cache_clear(self):
+      self._d.clear()
+      self.hits = self.misses = self.evictions = 0
+
+   def cache_info(self):
+      return _CacheInfo(self.hits, self.misses, self.evictions,
+                        self._maxsize, len(self._d))
+
+
+# Rows (pairs x group elements) per batched Kabsch call. Kabsch is ~99% of
+# Stage-1 time, and calling it per candidate pair costs ~12x what batching does,
+# so the graph builder defers survivors and flushes them in blocks. The cap is on
+# rows rather than pairs because a 24-automorphism CG at subset size 2 expands
+# each pair 48-fold, and the temporaries have to stay bounded regardless.
+_GRAPH_BATCH_ROWS = 500_000
+
+
+def _batched_min_rmsd(data, ia, ib, full_perms, n_total,
+                      batch_rows=_GRAPH_BATCH_ROWS):
+   """Symmetry-minimised RMSD for pairs (ia[k], ib[k]), in batched Kabsch calls.
+
+   One `kabsch_ssd` call per block of pairs x group elements, rather than one
+   per pair: identical values, and the difference between a Stage-1 bucket
+   taking seconds and taking minutes.
+   """
+   n_perm = len(full_perms)
+   out = np.empty(ia.size, dtype=np.float64)
+   per_block = max(1, batch_rows // n_perm)
+   for start in range(0, ia.size, per_block):
+      stop = min(start + per_block, ia.size)
+      m = stop - start
+      A = data[ia[start:stop]]
+      B = data[ib[start:stop]]
+      X = np.empty((m * n_perm, n_total, 3), dtype=np.float32)
+      for k, perm in enumerate(full_perms):
+         X[k * m:(k + 1) * m] = A[:, perm]
+      Y = np.empty_like(X)
+      for k in range(n_perm):
+         Y[k * m:(k + 1) * m] = B
+      ssd = kabsch_ssd(X, Y).reshape(n_perm, m).min(axis=0)
+      out[start:stop] = np.sqrt(ssd / n_total)
+   return out
+
+
+def _stage1_neighbor_graph(data, threshold, n_cg, perm_group, counters=None):
+   """Exact symmetry-aware within-cutoff neighbour lists and their distances.
+
+   Runs the admissible cascade -- CA/CG-COM fingerprints, the six-atom backbone
+   fit at subset size 2, then the internal-distance bound -- before the exact
+   fit. Every stage is minimised over the same `perm_group` the exact RMSD uses;
+   screening a subset of the group would make the bounds inadmissible, because
+   the true distance is itself a minimum over all of it.
+   """
+   n, n_total = len(data), data.shape[1]
+   n_res = (n_total - n_cg) // 3
+   full_perms = full_row_permutations(perm_group, n_cg)
+
+   # Distinct backbone relabelings in the group, for the two stages that see
+   # backbone atoms but not CG atoms.
+   bb_perms = []
+   for _cg_perm, bb_perm in perm_group:
+      if not any(np.array_equal(bb_perm, seen) for seen in bb_perms):
+         bb_perms.append(bb_perm)
+   res_orders = [tuple(bb[::3] // 3) for bb in bb_perms]
+
+   fp = precompute_bucket_fingerprints(data, n_cg)
+   fp_tol = fp_tolerances(threshold, n_total, n_cg, n_res) if fp else None
+   desc = precompute_internal_distance_descriptors(data, n_cg)
+   if fp:
+      fp_ca = (np.stack([fp['fp0'], fp['fp1']], axis=1) if n_res == 2
+               else fp['fp0'][:, None])
+      fp_ca_ca = fp.get('fp2')
+
+   bb_arr = data[:, n_cg:]
+   adj = [[] for _ in range(n)]
+   adj_d = [[] for _ in range(n)]
+   pend_i, pend_j, pend_rows = [], [], 0
+   n_perm = len(full_perms)
+   stats = {'fp': 0, 'bb_lb': 0, 'internal_lb': 0, 'exact': 0, 'edges': 0}
+
+   def _flush():
+      nonlocal pend_rows
+      if not pend_i:
+         return
+      qi = np.concatenate(pend_i)
+      qj = np.concatenate(pend_j)
+      rmsd = _batched_min_rmsd(data, qi, qj, full_perms, n_total)
+      keep = rmsd <= threshold
+      for a, b, d in zip(qi[keep].tolist(), qj[keep].tolist(),
+                         rmsd[keep].tolist()):
+         adj[a].append(b)
+         adj_d[a].append(d)
+         adj[b].append(a)
+         adj_d[b].append(d)
+      stats['edges'] += int(keep.sum())
+      pend_i.clear()
+      pend_j.clear()
+      pend_rows = 0
+
+   for i in range(n - 1):
+      cand = np.arange(i + 1, n, dtype=np.intp)
+      if fp:
+         # A slot relabeling swaps which residue each CA fingerprint belongs to,
+         # so a pair survives if ANY residue order is within tolerance.
+         mask = np.zeros(cand.size, dtype=bool)
+         for order in res_orders:
+            sub = np.ones(cand.size, dtype=bool)
+            for k, src in enumerate(order):
+               sub &= np.abs(fp_ca[i, src] - fp_ca[cand, k]) <= fp_tol[k]
+            mask |= sub
+         if fp_ca_ca is not None:   # CA-CA distance is slot-order invariant
+            mask &= np.abs(fp_ca_ca[i] - fp_ca_ca[cand]) <= fp_tol[2]
+         cand = cand[mask]
+      stats['fp'] += cand.size
+
+      if cand.size and n_res == 2:
+         # A single N/CA/C triplet is nearly rigid and does not prune; six atoms
+         # across two residues do.
+         lb = None
+         for bb_perm in bb_perms:
+            ssd = kabsch_ssd(bb_arr[i][bb_perm], bb_arr[cand])
+            cur = np.sqrt(ssd / n_total)
+            lb = cur if lb is None else np.minimum(lb, cur)
+         cand = cand[lb <= threshold + INTERNAL_DISTANCE_EPS]
+      stats['bb_lb'] += cand.size
+
+      if cand.size and desc:
+         lb = internal_distance_lower_bounds(i, cand, desc, n_total, perm_group)
+         cand = cand[lb <= threshold + INTERNAL_DISTANCE_EPS]
+      stats['internal_lb'] += cand.size
+
+      if cand.size:
+         pend_i.append(np.full(cand.size, i, dtype=np.intp))
+         pend_j.append(cand)
+         pend_rows += cand.size * n_perm
+         if pend_rows >= _GRAPH_BATCH_ROWS:
+            _flush()
+   _flush()
+   stats['exact'] = stats['internal_lb']
+   if counters is not None:
+      counters.update(stats)
+   return adj, adj_d
+
+
+def get_butina_clusters(cgvdmbb_data, threshold, n_cg_atoms,
+                        cg_symm_perms=None, aa_bucket_parts=(),
+                        counters=None):
+   """Sphere-exclusion clustering of Stage-1 pose geometry.
+
+   Butina (1999) sphere exclusion -- the same rule as the GROMOS/Daura
+   conformational clustering algorithm: build the exact within-cutoff neighbour
+   graph, then repeatedly take the unassigned vdG with the most neighbours as a
+   representative and assign it together with its still-unassigned neighbours.
+
+   Two properties follow, and both are why this replaced the moving-medoid
+   leader pass. Every discarded vdG is within `threshold` of the representative
+   that stands in for it, so the stored radius means something; and the result
+   does not depend on input order, so two fragments' cluster counts are
+   comparable.
+
+   Note the guarantee is on the *radius*, not the diameter: two members of one
+   cluster may be up to 2*threshold apart.
+
+   Returns ``(clus_assignments, representatives, radii)``, all keyed by 1-based
+   cluster number, with `radii` giving each cluster's exact pose radius. Only
+   the partition is consumed downstream: Stage 2 re-partitions each cluster and
+   the stored row and radius come from `pose_minimax_prototype` on the resulting
+   subgroup. `representatives`/`radii` are kept because they are free -- both
+   fall out of the loop below -- and are what the sphere-exclusion guarantee
+   above is asserted against in tests/test_butina_clustering.py.
+
+   Every Stage-1 atom is mandatory, so non-finite input raises here rather than
+   being screened out: the fingerprint prefilter compares with ``<=``, which is
+   False against NaN, so such a record would be pruned from every candidate list
+   and emerge as a *singleton cluster* -- a plausible-looking result that is
+   written to the library and only fails much later, inside `kabsch_ssd` at hit
+   finding. Generation already filters these upstream
+   (`clus_and_deduplicate_vdgs._has_complete_stage1_coords`); this makes the
+   invariant local to the algorithm that depends on it.
+   """
+   data = np.asarray(cgvdmbb_data, dtype=np.float32)
+   n = len(data)
+   if data.size and not np.isfinite(data).all():
+      bad = np.flatnonzero(~np.isfinite(data).all(axis=(1, 2)))
+      raise ValueError(
+         f"get_butina_clusters received non-finite Stage-1 coordinates in "
+         f"{bad.size} of {n} records (first at index {int(bad[0])}); every "
+         "Stage-1 atom is mandatory")
+   if n == 0:
+      return {}, {}, {}
+   if n == 1:
+      return {1: [0]}, {1: 0}, {1: 0.0}
+
+   perm_group = build_perm_group(cg_symm_perms, n_cg_atoms, aa_bucket_parts)
+   adj, adj_d = _stage1_neighbor_graph(
+      data, threshold, n_cg_atoms, perm_group, counters=counters)
+
+   degree = np.fromiter((len(a) for a in adj), dtype=np.int64, count=n)
+   # Stable sort on descending degree: ties go to the lower index, so the
+   # partition is reproducible for a given bucket.
+   order = np.argsort(-degree, kind='stable')
+   assigned = np.full(n, -1, dtype=np.int64)
+   reps, members, radii = [], [], []
+   for seed in order.tolist():
+      if assigned[seed] >= 0:
+         continue
+      cnum = len(reps)
+      assigned[seed] = cnum
+      mem, radius = [seed], 0.0
+      for nbr, dist in zip(adj[seed], adj_d[seed]):
+         if assigned[nbr] < 0:
+            assigned[nbr] = cnum
+            mem.append(nbr)
+            if dist > radius:
+               radius = dist
+      reps.append(seed)
+      members.append(mem)
+      radii.append(radius)
+
+   clus_assignments = {c + 1: mem for c, mem in enumerate(members)}
+   representatives = {c + 1: r for c, r in enumerate(reps)}
+   cluster_radii = {c + 1: r for c, r in enumerate(radii)}
+   return clus_assignments, representatives, cluster_radii
+
+
+def pose_minimax_prototype(cgvdmbb_data, member_indices, n_cg_atoms,
+                        perm_group=None):
+   """Minimax prototype of a group under pose RMSD, plus its exact pose radius.
+
+   The published minimax prototype (Bien & Tibshirani 2011): the member
+   minimising its greatest distance to the rest. Not a medoid -- a medoid
+   minimises the *mean*, which does not bound the maximum, so storing one would
+   discard the radius guarantee (measured 0.78 A against a 0.50 A cutoff).
+
+   Returns the member minimising its greatest symmetry-aware RMSD to the rest,
+   which is the choice that makes the stored radius as small as the group
+   allows. Stage 2 partitions a pose cluster by flanking context, and a
+   subgroup's members are only guaranteed to be within the cutoff of the
+   *Stage-1* seed -- so once the stored row is a subgroup's own member, the
+   radius has to be recomputed on pose geometry rather than assumed.
+   """
+   members = list(member_indices)
+   if not members:
+      raise ValueError('pose_minimax_prototype needs at least one member')
+   if len(members) == 1:
+      return members[0], 0.0
+   data = np.asarray(cgvdmbb_data, dtype=np.float32)
+   n_total = data.shape[1]
+   if perm_group is None:
+      perm_group = ((np.arange(n_cg_atoms, dtype=np.intp),
+                     np.arange(n_total - n_cg_atoms, dtype=np.intp)),)
+   full_perms = full_row_permutations(perm_group, n_cg_atoms)
+   m = len(members)
+   idx = np.asarray(members, dtype=np.intp)
+
+   # Candidates are subsampled past the cap, but each candidate's greatest
+   # distance is still measured against *every* member, so the returned radius is
+   # exact for whichever row is returned. Only the optimality of the choice
+   # weakens: the true minimax member may sit outside the sample, in which case
+   # the stored radius is honest but larger than it had to be. Deterministic
+   # stride rather than RNG, so a rebuilt library reproduces the same rows.
+   if m > _MINIMAX_CANDIDATE_CAP:
+      cand_pos = np.linspace(0, m - 1, _MINIMAX_CANDIDATE_CAP).astype(np.intp)
+      cand_pos = np.unique(cand_pos)
+   else:
+      cand_pos = np.arange(m, dtype=np.intp)
+
+   # Accumulated in row blocks. Materializing the m x m matrix is ~10 GB at
+   # m=20k, past the per-job memory ceiling with several workers on a node, and
+   # only the per-row maximum is ever read from it.
+   worst = np.empty(cand_pos.size, dtype=np.float64)
+   rows_per_block = max(1, _MINIMAX_BLOCK_PAIRS // m)
+   for start in range(0, cand_pos.size, rows_per_block):
+      stop = min(start + rows_per_block, cand_pos.size)
+      rows = cand_pos[start:stop]
+      ia = np.repeat(idx[rows], m)
+      ib = np.tile(idx, rows.size)
+      d = _batched_min_rmsd(data, ia, ib, full_perms, n_total).reshape(rows.size, m)
+      # The self-pair is a zero on this row and cannot be the maximum, so it
+      # needs no masking.
+      worst[start:stop] = d.max(axis=1)
+   best = int(np.argmin(worst))
+   return members[int(cand_pos[best])], float(worst[best])
+
+
 def get_leader_clusters(
-   data_to_clus, threshold, AA_subset, size_subset, vdglib_dir,
+   data_to_clus, threshold,
    seq_weight=0.5,
+   missing_seq_similarity=0.0,             # fraction used as prior for unknown flanks
    refresh_medoid_every=64,                  # periodic refresh for big clusters
    small_refresh_max=16,                     # robust for small clusters
    final_exact_medoid_pass=True,             # polish small clusters cheaply
-   final_reassign_once=True                  # one refinement pass
+   final_reassign_once=True,                 # one refinement pass
+   slot_orders=None,                         # interchangeable vdM slot orderings
 ):
+   """Partition one pose cluster by flanking context. Returns the partition only.
+
+   Distance is ``flanking-sequence dissimilarity * seq_weight + flanking-CA
+   RMSD``, over whichever of the two datasets is supplied.
+
+   The medoids this computes internally are cluster *centres* -- they decide
+   which subgroup each vdG joins -- but they are not returned, because they are
+   not what gets stored. The stored row for each subgroup is its
+   ``pose_minimax_prototype``: a flank-metric medoid says nothing about pose, and
+   the radius recorded next to the row is a pose radius.
+
+   ``slot_orders`` are the vdM slot orderings that permute only same-label slots
+   (``vdg_fp_utils.slot_orders`` on the bucket's label list). The distance is
+   minimised over them, because Stage 1 already treats two vdGs as the same pose
+   if they match under ANY of those orderings: comparing slot 1's flank to slot
+   1's flank positionally would then pit the flanks of a swapped pair against
+   each other crosswise, inflate the distance, and split one interaction mode
+   into two subgroups -- each carrying about half the real cluster_size and
+   cluster_num_parents. Over-splitting only, so no stored geometry is wrong, but
+   the support counts downstream analysis reads would be. Mixed-label buckets
+   (ARG_bb) admit only the identity and cost nothing extra.
+
+   Stage-1 pose geometry does **not** come through here. It is sphere-exclusion
+   clustering in :func:`get_butina_clusters`, which needs the whole within-cutoff
+   neighbour graph rather than a single pass over current representatives, and
+   which -- unlike this pass -- guarantees every member lies within the cutoff of
+   the representative that is kept.
+
+   **One call at a time per process.** The datasets and caches are attributes on
+   this function object and are keyed by index into *this* call's datasets, so
+   they are cleared on entry to every call -- not once per bucket, since a bucket
+   makes one call per Stage-1 cluster. The pipeline parallelizes over processes,
+   where that state is private.
+   """
    metrics, datasets = [], []
    for data, metric in data_to_clus:
       metrics.append(metric); datasets.append(data)
    metric_to_data = {m: d for m, d in zip(metrics, datasets)}
+   unknown = set(metrics) - {'flankseq', 'flankbb'}
+   if unknown:
+      raise ValueError(f'get_leader_clusters handles flankseq/flankbb only, got {sorted(unknown)}')
+
+   if not datasets:
+      return {}
    n = len(datasets[0])
    for d in datasets: assert len(d) == n
 
+   if n == 0:
+      return {}
    if n == 1:
-      return {1: [0]}, {1: 0}
-
-   # Implement persistent LRU memoization to reuse distances across leader pass, 
-   # exact-medoid, and reassignment without per-call sizing or cache resets.
-
-   # Initialize once per process; keep references on the function object
-   if not hasattr(get_leader_clusters, "_seqsim_cached"):
-      # small global registries mapping dataset ids -> actual arrays
-      get_leader_clusters._SEQ_DATASETS  = {}
-      get_leader_clusters._RMSD_DATASETS = {}
-
-      # cache sequence similarity (0..100). key: (id(seq_dataset), i, j)
-      @lru_cache(maxsize=_SEQ_CACHE_MAXSIZE)
-      def _seqsim_cached(ds_id, i, j):
-          seq = get_leader_clusters._SEQ_DATASETS[ds_id]
-          return calc_seq_similarity(seq[i], seq[j]) # returns percent identity
-
-      # cache RMSD by metric and dataset identity
-      @lru_cache(maxsize=_RMSD_CACHE_MAXSIZE)
-      def _rmsd_cached(metric_name, ds_id, i, j):
-          a, b = _ord_pair(i, j)
-          data = get_leader_clusters._RMSD_DATASETS[(metric_name, ds_id)]
-          X = data[a]; Y = data[b]
-          return _rmsd_pair(X, Y)
-
-      # stash them on the function so they persist across calls
-      get_leader_clusters._seqsim_cached = _seqsim_cached
-      get_leader_clusters._rmsd_cached   = _rmsd_cached
- 
-   # aliases
-   _seqsim_cached = get_leader_clusters._seqsim_cached
-   _rmsd_cached   = get_leader_clusters._rmsd_cached
-   _SEQ_DATASETS  = get_leader_clusters._SEQ_DATASETS
-   _RMSD_DATASETS = get_leader_clusters._RMSD_DATASETS
-
-   # register the current datasets by identity for caching 
-   dsid_seq     = id(metric_to_data['flankseq']) if 'flankseq' in metric_to_data else None
-   dsid_flankbb = id(metric_to_data['flankbb'])  if 'flankbb'  in metric_to_data else None
-   dsid_cgvdmbb = id(metric_to_data['cgvdmbb'])  if 'cgvdmbb'  in metric_to_data else None
-
-   if dsid_seq is not None and dsid_seq not in _SEQ_DATASETS:
-      _SEQ_DATASETS[dsid_seq] = metric_to_data['flankseq']
-   if dsid_flankbb is not None and ('flankbb', dsid_flankbb) not in _RMSD_DATASETS:
-      _RMSD_DATASETS[('flankbb', dsid_flankbb)] = metric_to_data['flankbb']
-   if dsid_cgvdmbb is not None and ('cgvdmbb', dsid_cgvdmbb) not in _RMSD_DATASETS:
-      _RMSD_DATASETS[('cgvdmbb', dsid_cgvdmbb)] = metric_to_data['cgvdmbb']
+      return {1: [0]}
 
    def _ord_pair(i, j):
       # Order indices so (i, j) and (j, i) share the same cache entry.
       return (i, j) if i <= j else (j, i)
 
-   # ---- distance = seq_dissim * seq_weight + RMSD(flankbb?) + RMSD(cgvdmbb?)
-   def _dist_idx_idx(i, j, early_stop=True, cap=None):
-      # cap: if provided, we early-exit once total > min(cap, threshold)
-      cutoff = threshold if cap is None else min(cap, threshold)
-      total = 0.0
-      a, b = _ord_pair(i, j)
+   # Persistent memoization across leader pass, exact-medoid, reassignment
+   if not hasattr(get_leader_clusters, "_seqsim_cached"):
+      get_leader_clusters._SEQ_DATA      = None
+      get_leader_clusters._FLANKBB_DATA  = None
 
-      if dsid_seq is not None:
-         # pull seq sim from persistent cache instead of recomputing
-         sim = _seqsim_cached(dsid_seq, a, b)  # 0..100
+      @lru_cache(maxsize=_SEQ_CACHE_MAXSIZE)
+      def _seqsim_cached(i, j, missing_similarity, p):
+          # p indexes the slot ordering applied to the LOWER-indexed record.
+          # Applying the group to one side is enough: it is closed under
+          # inverse, so min_g d(g.i, j) == min_g d(i, g.j).
+          seq = get_leader_clusters._SEQ_DATA_PERMS[p]
+          return calc_seq_similarity(
+             seq[i], get_leader_clusters._SEQ_DATA[j],
+             missing_similarity=missing_similarity * 100.0)
+
+      _rmsd_store = _BoundedRmsdCache(_RMSD_CACHE_MAXSIZE)
+
+      def _rmsd_cached(a, b, p):
+          # Callers pass an already-ordered pair, so (i, j) and (j, i) hit the
+          # same entry.
+          key = (a, b, p)
+          hit = _rmsd_store.get(key)
+          if hit is not None:
+             return hit
+          val = _rmsd_pair(get_leader_clusters._FLANKBB_DATA_PERMS[p][a],
+                           get_leader_clusters._FLANKBB_DATA[b])
+          _rmsd_store.put(key, val)
+          return val
+      _rmsd_cached.cache_clear = _rmsd_store.cache_clear
+      _rmsd_cached.cache_info = _rmsd_store.cache_info
+      _rmsd_cached.store = _rmsd_store
+      get_leader_clusters._seqsim_cached = _seqsim_cached
+      get_leader_clusters._rmsd_cached   = _rmsd_cached
+
+   # Indices are call-local, so clear on entry to every call.
+   get_leader_clusters._seqsim_cached.cache_clear()
+   get_leader_clusters._rmsd_cached.cache_clear()
+
+   get_leader_clusters._SEQ_DATA = metric_to_data.get('flankseq')
+   get_leader_clusters._FLANKBB_DATA = metric_to_data.get('flankbb')
+
+   has_seq = get_leader_clusters._SEQ_DATA is not None
+   has_flankbb = get_leader_clusters._FLANKBB_DATA is not None
+
+   # Both datasets are flattened in slot order with one contiguous, equal-length
+   # block per slot, so permuting slots is a block reorder. Materialized once per
+   # bucket rather than reordered per pair: a pair distance is evaluated many
+   # times across the leader, medoid and reassignment passes.
+   orders = tuple(slot_orders) if slot_orders else ((0,),)
+   if len(orders) > 1:
+      n_slots = len(orders[0])
+      def _permuted(dataset):
+         out = [dataset]
+         for order in orders[1:]:
+            per_slot = len(dataset[0]) // n_slots if len(dataset[0]) else 0
+            out.append([[rec[s * per_slot + k] for s in order
+                         for k in range(per_slot)] for rec in dataset])
+         return out
+      get_leader_clusters._SEQ_DATA_PERMS = (
+         _permuted(get_leader_clusters._SEQ_DATA) if has_seq else None)
+      get_leader_clusters._FLANKBB_DATA_PERMS = (
+         _permuted(get_leader_clusters._FLANKBB_DATA) if has_flankbb else None)
+   else:
+      get_leader_clusters._SEQ_DATA_PERMS = [get_leader_clusters._SEQ_DATA]
+      get_leader_clusters._FLANKBB_DATA_PERMS = [get_leader_clusters._FLANKBB_DATA]
+   n_orders = len(orders)
+
+   _seqsim_cached = get_leader_clusters._seqsim_cached
+   _rmsd_cached   = get_leader_clusters._rmsd_cached
+
+   if has_seq and not 0.0 <= missing_seq_similarity <= 1.0:
+      raise ValueError("missing_seq_similarity must be between 0 and 1")
+
+   def _dist_one(a, b, p, early_stop, cutoff):
+      total = 0.0
+      if has_seq:
+         sim = _seqsim_cached(a, b, float(missing_seq_similarity), p)  # 0..100
          total += ((100.0 - sim) / 100.0) * seq_weight
          if early_stop and total > cutoff:
             return total
-
-      if dsid_flankbb is not None:
-         # cached RMSD for 'flankbb'
-         total += _rmsd_cached('flankbb', dsid_flankbb, a, b)
-         if early_stop and total > cutoff:
-            return total
-
-      if dsid_cgvdmbb is not None:
-         # cached RMSD for 'cgvdmbb'
-         total += _rmsd_cached('cgvdmbb', dsid_cgvdmbb, a, b)
-
+      if has_flankbb:
+         total += _rmsd_cached(a, b, p)
       return total
 
-   # ---- exact medoid (O(m^2), but m is small for small clusters) ----
-   def _exact_medoid(members):
-      if len(members) <= 2:
-          return members[0]
-      best, best_sum = members[0], float('inf')
-      for c in members:
-         s = 0.0
-         for o in members:
-            if o == c: continue
-            # same distance, hits persistent caches
-            s += _dist_idx_idx(c, o, early_stop=False)  # <- full distance
-            if s >= best_sum:  # early break on the SUM, not on threshold
-               break
-         if s < best_sum:
-             best_sum, best = s, c
+   def _dist_idx_idx(i, j, early_stop=True, cap=None):
+      cutoff = threshold if cap is None else min(cap, threshold)
+      a, b = _ord_pair(i, j)
+      best = _dist_one(a, b, 0, early_stop, cutoff)
+      # Identity first, then the rest against the running best: a same-label
+      # bucket costs |orders| distance evaluations, a mixed one exactly the
+      # original count.
+      for p in range(1, n_orders):
+         if best <= 0.0:
+            break
+         best = min(best, _dist_one(a, b, p, early_stop, min(cutoff, best)))
       return best
 
-   # ---- Leader pass ----
-   reps = [0]            # representative indices
-   members = [[0]]       # cluster memberships (lists of indices)
+   def _exact_medoid(members):
+      # Full pairwise: no early-exit, warms cache for the reassignment step
+      m = len(members)
+      if m <= 2:
+         # m == 2: the two members have identical row sums, so there is no medoid
+         # to find; the first is the deterministic tie-break.
+         return members[0]
+      if m > _EXACT_MEDOID_MAX:
+         return _sampled_medoid(members)
+      row_sums = np.zeros(m, dtype=np.float64)
+      for ii in range(m):
+         for jj in range(ii + 1, m):
+            d = _dist_idx_idx(members[ii], members[jj], early_stop=False)
+            row_sums[ii] += d
+            row_sums[jj] += d
+      return members[int(np.argmin(row_sums))]
 
+   def _sampled_medoid(members):
+      """Medoid of a deterministic subsample, for clusters too large to do exactly.
+
+      This picks a cluster *centre*, which decides only which subgroup a vdG
+      joins during the leader pass -- it is never stored. The row that gets
+      written is ``pose_minimax_prototype``'s, chosen on pose geometry and
+      re-measured there, so an approximate centre costs assignment quality at the
+      margin and nothing in the recorded data.
+
+      Exact is O(m^2) *Python-level* pair distances (measured: n=200 9 s, n=400
+      36 s, n=800 158 s), which is cubic overall once the leader pass refreshes a
+      growing cluster, and does not finish for the largest bb_bb/ARG buckets.
+      """
+      m = len(members)
+      pos = np.unique(np.linspace(0, m - 1, _MEDOID_SUBSAMPLE).astype(np.intp))
+      sample = [members[int(p)] for p in pos]
+      k = len(sample)
+      row_sums = np.zeros(k, dtype=np.float64)
+      for ii in range(k):
+         for jj in range(ii + 1, k):
+            d = _dist_idx_idx(sample[ii], sample[jj], early_stop=False)
+            row_sums[ii] += d
+            row_sums[jj] += d
+      return sample[int(np.argmin(row_sums))]
+
+   def _should_refresh(size_now):
+      """Whether a cluster that just grew to `size_now` should re-pick its centre.
+
+      Every append while small, then a fixed stride, then powers of two. The
+      stride alone is O(m / refresh_medoid_every) refreshes of a cluster growing
+      to m, each itself quadratic -- cubic overall, and the reason a large
+      bb_bb/ARG bucket did not finish. Geometric spacing past the exact-path cap
+      makes it O(log m) refreshes, and a centre that is re-picked on every
+      doubling is no staler in relative terms than one re-picked every 64.
+      """
+      if size_now <= small_refresh_max:
+         return True
+      if not refresh_medoid_every:   # caller disabled periodic refresh entirely
+         return False
+      if size_now <= _EXACT_MEDOID_MAX:
+         return size_now % refresh_medoid_every == 0
+      return size_now & (size_now - 1) == 0
+
+   # ---- Leader pass ----
+   reps = [0]
+   members = [[0]]
    for i in range(1, n):
       best_j, best_d = -1, float('inf')
       for j, r in enumerate(reps):
-         # Use persistent caches for distance calls
          d = _dist_idx_idx(i, r, early_stop=True, cap=best_d)
          if d < best_d:
             best_d, best_j = d, j
 
       if best_d <= threshold and best_j >= 0:
-         # assign to existing cluster
          members[best_j].append(i)
-
-         # small-cluster refresh
          size_now = len(members[best_j])
-         # robust for tiny clusters
-         if size_now <= small_refresh_max:
+         if _should_refresh(size_now):
             reps[best_j] = _exact_medoid(members[best_j])
-         # periodic refresh for big clusters
-         elif refresh_medoid_every and (size_now % refresh_medoid_every == 0):
-            reps[best_j] = _exact_medoid(members[best_j])
-
       else:
-         # start new cluster
          reps.append(i)
          members.append([i])
 
@@ -160,178 +617,191 @@ def get_leader_clusters(
          reps[j] = _exact_medoid(members[j])
 
       if final_reassign_once:
-         # map each item -> its current cluster
-         item2clus = {}
-         for j, mem in enumerate(members):
-            for idx in mem:
-               item2clus[idx] = j
-
-         # single reassignment step: move only if STRICTLY closer to another medoid and within threshold
+         item2clus = {idx: j for j, mem in enumerate(members) for idx in mem}
          moved_any = False
          for i in range(n):
             cur_j = item2clus[i]
-            # Distances to medoids hit persistent caches
-            d_cur = _dist_idx_idx(i, reps[cur_j], early_stop=True, cap=threshold)
+            d_cur = _dist_idx_idx(i, reps[cur_j], early_stop=False)
             best_j, best_d = cur_j, d_cur
 
-            # If nothing can beat ~0, skip quickly
             if best_d <= EPS:
                continue
 
             for j, r in enumerate(reps):
                if j == cur_j:
                   continue
-               strict_cap = min(best_d - EPS, threshold)  # if best_d==d_cur initially, this is d_cur-EPS
+               strict_cap = min(best_d - EPS, threshold)
                if strict_cap <= 0.0:
-                  continue  # can't possibly beat current
+                  continue
                d = _dist_idx_idx(i, r, early_stop=True, cap=strict_cap)
                if d < best_d:
                   best_d, best_j = d, j
 
             # Reassign only if strictly closer and within threshold
             if best_j != cur_j and best_d <= threshold and best_d + EPS < d_cur:
-               # move i
-               members[cur_j].remove(i)
-               members[best_j].append(i)
-               item2clus[i] = best_j
+               item2clus[i] = best_j   # defer list mutation; update dict only
                moved_any = True
 
-         # drop any empties and recompute medoids once more
+         # rebuild members from item2clus in one pass, then recompute medoids
          if moved_any:
+            new_members_lists = [[] for _ in reps]
+            for i, j in item2clus.items():
+               new_members_lists[j].append(i)
             new_reps, new_members = [], []
-            for j, mem in enumerate(members):
-               if len(mem) == 0: continue
+            for j, mem in enumerate(new_members_lists):
+               if not mem:
+                  continue
                new_members.append(mem)
                new_reps.append(_exact_medoid(mem))
             members, reps = new_members, new_reps
 
-   clus_assignments = {cnum+1: mem for cnum, mem in enumerate(members)}
-   centroids        = {cnum+1: reps[cnum] for cnum in range(len(reps))}
-   return clus_assignments, centroids
+   return {cnum + 1: mem for cnum, mem in enumerate(members)}
 
-def _rmsd_pair(X, Y,):
-   '''RMSD between two coordinate arrays (N,3); NaN rows (missing flanking residues) are skipped.'''
-   X = np.asarray(X, dtype=np.float64)
-   Y = np.asarray(Y, dtype=np.float64)
+def _rmsd_pair(X, Y):
+   """Stage-2 RMSD over coordinate rows that are finite in both structures.
+
+   Stage 1 has no counterpart: its atoms are all mandatory, and records missing
+   any of them are dropped upstream by
+   `clus_and_deduplicate_vdgs._has_complete_stage1_coords`.
+   """
+   X = np.asarray(X, dtype=np.float32)
+   Y = np.asarray(Y, dtype=np.float32)
    if X.shape != Y.shape:
       raise ValueError(f"RMSD pair got mismatched shapes: {X.shape} vs {Y.shape}")
-   # Drop positions where either array has NaN (chain breaks / missing residues).
-   # Mirrors calc_seq_similarity, which already drops 'X' flanking positions.
-   valid = ~(np.isnan(X).any(axis=1) | np.isnan(Y).any(axis=1))
+   if X.ndim != 2 or X.shape[1] != 3:
+      raise ValueError(f"RMSD pair expected shape (N, 3), got {X.shape}")
+   valid = np.isfinite(X).all(axis=1) & np.isfinite(Y).all(axis=1)
    if not valid.any():
       return float('inf')
    X = X[valid]
    Y = Y[valid]
-   _, _, ssd = kabsch(X[None, ...], Y[None, ...], chunk_size=1)
-   n_atoms = X.shape[0]
-   return float(np.sqrt(ssd[0] / n_atoms))
+   ssd = kabsch_ssd(X[None, ...], Y[None, ...], chunk_size=1)
+   return float(np.sqrt(ssd[0] / len(X)))
+
+def _permuted_rmsd_pair(X, Y, cg_index_perms, n_cg):
+   """Min RMSD over explicit, graph-validated CG automorphisms via Kabsch.
+
+   Test-facing: production Stage-1 code takes the batched path
+   (`_batched_min_rmsd`), and this is the readable single-pair reference the
+   automorphism and slot-symmetry tests check that path's semantics against.
+   """
+   X = np.asarray(X, dtype=np.float32)
+   Y = np.asarray(Y, dtype=np.float32)
+   if X.shape != Y.shape:
+      raise ValueError(f"Permuted RMSD got mismatched shapes: {X.shape} vs {Y.shape}")
+   bb_X = X[n_cg:]
+   n_atoms = len(X)
+   P = len(cg_index_perms)
+   X_perms = np.empty((P, n_atoms, 3), dtype=np.float32)
+   for k, perm_idx in enumerate(cg_index_perms):
+      X_perms[k, :n_cg] = X[np.asarray(perm_idx, dtype=np.intp)]
+      X_perms[k, n_cg:] = bb_X
+   # kabsch_ssd fast path: fixed Y [n_atoms, 3] vs P permuted X [P, n_atoms, 3]
+   ssds = kabsch_ssd(Y, X_perms)
+   return float(np.sqrt(ssds.min() / n_atoms))
+
+
+def _mark_flanking_chain_breaks(flanking_seq_dict, num_flanking):
+   """Mark discontinuous flanks on each side of the vdM independently.
+
+   The walk ends for two different reasons and they are recorded separately.
+   A flank with no usable CA keeps its own FLANK_MISSING label -- the residue is
+   unreadable, which is not a statement about the chain -- and only the positions
+   *past* it become FLANK_CHAIN_BREAK, since continuity can no longer be checked
+   through it. A CA-CA step over 4.5 A is a real break, so that position and
+   everything beyond it becomes FLANK_CHAIN_BREAK.
+
+   Mutates and returns the caller's flanking_seq_dict.
+   """
+   central_CA = np.asarray(flanking_seq_dict[0][1], dtype=np.float32)
+   for direction in (1, -1):
+      prev_CA = central_CA
+      for flank_num in range(1, num_flanking + 1):
+         ind = direction * flank_num
+         curr_CA = np.asarray(flanking_seq_dict[ind][1], dtype=np.float32)
+         if not np.isfinite(curr_CA).all():
+            found_chain_break(flanking_seq_dict, ind + direction)
+            break
+         # prev_CA is finite by construction: it seeds from the vdM's own CA,
+         # which get_bb_coords guarantees, and every later value already passed
+         # the finiteness check above.
+         if np.linalg.norm(curr_CA - prev_CA) > 4.5:
+            found_chain_break(flanking_seq_dict, ind)
+            break
+         prev_CA = curr_CA
+   return flanking_seq_dict
+
 
 def get_vdm_res_features(prody_obj, pdbpath, num_flanking):
    # Identify the vdM residues (occ == 2). To be safe, select > 1.5 and < 2.5.
    vdm_residues = prody_obj.select('(occupancy) > 1.5 and (occupancy < 2.5)')
+   if vdm_residues is None or len(vdm_residues) == 0:
+      return {}
    vdm_resinds = set(vdm_residues.getResindices())
-   # Record features of the vdm residues (bb coords, flanking residues, pdb paths, etc.)
+   # Built once for the whole environment: the flank walk below asks for
+   # 2*num_flanking residues per vdM, and each miss-free lookup here saves three
+   # ProDy selections (~1 ms). Ambiguous residues are absent from it, so those
+   # still take the selection path.
+   flank_index = build_flank_lookup_index(prody_obj)
    vdms_dict = {}
    for vdm_resind in vdm_resinds:
       vdm_obj = vdm_residues.select(f'resindex {vdm_resind}')
-      # BB coords
       bb_coords = get_bb_coords(vdm_obj)
-      if bb_coords is None:  # missing N, CA, and/or C
+      if bb_coords is None:
          continue
 
-      # Add heavy atoms for this vdM residue
-      vdm_heavy_sel = vdm_obj.select('not element H D')
-      if vdm_heavy_sel is None or len(vdm_heavy_sel) == 0:
-         continue
-      vdm_heavy_coords = vdm_heavy_sel.getCoords().astype(np.float32)
-      vdm_heavy_names = vdm_heavy_sel.getNames()
-      vdm_heavy_elems = vdm_heavy_sel.getElements()
-
-      # Store heavy-atom metadata as a dict so it can be serialized cleanly
-      vdm_heavy = {
-         "coords": vdm_heavy_coords,
-         "names": vdm_heavy_names,
-         "elements": vdm_heavy_elems,}
-
-      # Sequence of (contiguous) flanking residues
-      flanking_seq_dict = {}  # key = relative flank num (-1, +1, etc.),
-                              # value = list(AA identity, CA coords)
-      # Walk up and down the flanking residues and check that they are actually
-      # neighboring the vdM, and not jumped through a chain break. If there's a
-      # chain break, report the AA as "X".
-      # > First, store the CA coords.
+      # Walk flanking residues fwd/bwd, checking for chain breaks; positions past
+      # a break are marked FLANK_CHAIN_BREAK, unreadable ones FLANK_MISSING.
+      flanking_seq_dict = {}
       for flank_num in range(1, num_flanking + 1):
-         negative_flank_num = -1 * flank_num
-         positive_flank_num = flank_num
-         # Adding the flank_num (neg. or pos.) gives you the residue index
-         for f in [negative_flank_num, positive_flank_num]:
-            # Get the AA identity and CA coords of the "current" resindex
-            current_resindex = vdm_resind + f
-            AA, CA_coords = get_AA_and_CA_coords(prody_obj, current_resindex)
+         for f in [-flank_num, flank_num]:
+            AA, CA_coords = get_AA_and_CA_coords(
+               prody_obj, vdm_resind + f, flank_index=flank_index)
             flanking_seq_dict[f] = [AA, CA_coords]
-      # Get the CA coords of the central vdM as well
-      flanking_seq_dict[0] = ['vdm', bb_coords[1]]  # label as 'vdm' for easy exclusion
-                                                   # when calculating seq. similarity
-      # > Then, go through the dict for chain breaks. Start in the fwd direction, and
-      #   then progress backward.
-      fwd_rel_inds = range(1, num_flanking + 1)
-      back_rel_inds = [-1 * i for i in fwd_rel_inds]
-      central_vdm_CA = flanking_seq_dict[0][1]
-      for list_indices in [fwd_rel_inds, back_rel_inds]:
-         for ind in list_indices:
-            # Get distance between current flanking res (relative to central vdm)
-            # and res prior to it.
-            if ind == 1 or ind == -1:
-               prev_CA = central_vdm_CA
-            curr_CA = flanking_seq_dict[ind][1]
-            if np.any(np.isnan(curr_CA)):  # curr_CA is None:
-               # If chain break, overwrite the residues preceding (if N-term) or
-               # succeeding (if C-term) the chain break as AA "X".
-               flanking_seq_dict = found_chain_break(flanking_seq_dict, ind)
-               break
-            dist = pr.calcDistance(np.array(prev_CA), np.array(curr_CA))
-            # If the dist is > 4.5A, then it's a chain break.
-            if dist > 4.5:
-               flanking_seq_dict = found_chain_break(flanking_seq_dict, ind)
-               break
-            # Otherwise, continue walking.
-            prev_CA = curr_CA
-      # Get this vdm resind's PDB identifier (seg, chain, resnum)
+      flanking_seq_dict[0] = ['vdm', bb_coords[1]]
+      flanking_seq_dict = _mark_flanking_chain_breaks(
+         flanking_seq_dict, num_flanking)
       vdm_seg_chain_resnum_resname = get_res_iden(vdm_obj)
-      # Store all into dict
-      vdm_descript = [
-          vdm_seg_chain_resnum_resname,
-          bb_coords,
-          flanking_seq_dict,
-          vdm_heavy,]
+      if vdm_seg_chain_resnum_resname is None:
+          continue
+      vdm_descript = [vdm_seg_chain_resnum_resname, bb_coords, flanking_seq_dict]
       vdm_AA = vdm_seg_chain_resnum_resname[-1]
-      assert vdm_resind not in list(vdms_dict.keys())
+      if vdm_resind in vdms_dict:
+          raise ValueError(f"Duplicate vdM resindex {vdm_resind} encountered in vdG assembly.")
       vdms_dict[vdm_resind] = [vdm_AA, vdm_descript]
    return vdms_dict
 
-def reorder_vdg_subset(vdg_subset, vdms_dict, cg_obj, prody_obj):
-   ''' Return per-vdG features reordered by alphabetical AA name, after assigning each 
-   vdM as 'bb' (backbone contact) or its sidechain AA. 
-   '''
+def _coords_or_empty(sel):
+   """Heavy-atom coords of a ProDy selection, or an empty (0, 3) array if None."""
+   if sel is None or len(sel) == 0:
+      return np.zeros((0, 3), dtype=np.float32)
+   return np.asarray(sel.getCoords(), dtype=np.float32).reshape(-1, 3)
+
+def _min_dist_to_cg(cg_coords, other_coords):
+   """Min distance from any CG atom to any atom in `other_coords`. Both heavy-only."""
+   diff = cg_coords[:, None, :] - other_coords[None, :, :]
+   return float(np.sqrt(np.min(np.sum(diff * diff, axis=2))))
+
+def reorder_vdg_subset(vdg_subset, vdms_dict, cg_coords, prody_obj):
+   # Reorder by alphabetical AA name; label each vdM slot by the moiety that
+   # contacts the CG -- its resname, the backbone label BB_LABEL, or 'X' when
+   # non-canonical atoms are what touch the CG. Also emits a
+   # per-slot flag (SLOT_* in vdg_struct_utils) carrying what the label does not.
+   cg_coords = np.asarray(cg_coords, dtype=np.float32)
    aas_of_vdms_in_order = []
    bb_coords_of_vdms_in_order = []
    flankingseqs_of_vdms_in_order = []
    flanking_CA_coords_of_vdms_in_order = []
    seg_ch_res_of_vdms_in_order = []
-   vdm_heavycoords_of_vdms_in_order = []
+   slot_flags_of_vdms_in_order = []
 
    for _vdmresind in vdg_subset:
       vdmAA, vdm_features = vdms_dict[_vdmresind]
-      vdm_seg_chain_resnum_resname, bb_coords, flanking_seq_dict, vdm_heavy_coords = vdm_features
+      vdm_seg_chain_resnum_resname, bb_coords, flanking_seq_dict = vdm_features
       seg_ch_res_of_vdms_in_order.append(vdm_seg_chain_resnum_resname)
       bb_coords_of_vdms_in_order.append(bb_coords)
-      vdm_heavycoords_of_vdms_in_order.append(vdm_heavy_coords)
 
-      flankingseqs = []
-      flankingCAs = []
       sorted_flank_indices = sorted(list(flanking_seq_dict.keys()))
-      # Check if it's a backbone-only contact. If it is, instead of recording vdmAA, 
-      # record "bb" as the vdm resname.
       _vdg_seg, _vdg_ch, _vdg_resnum, _vdg_resname = vdm_seg_chain_resnum_resname
 
       if _vdg_resnum < 0:
@@ -344,334 +814,111 @@ def reorder_vdg_subset(vdg_subset, vdms_dict, cg_obj, prody_obj):
       else:
          vdm_sel = f'chain {_vdg_ch} and {res_sel}'
       vdm_res_obj = prody_obj.select(f'{vdm_sel} and not element H D')
-      vdm_sc = vdm_res_obj.select(f'{vdm_sel} and sidechain') 
-      
-      if vdm_sc is None:  # then Gly
-         aas_of_vdms_in_order.append('bb') # assign gly as 'bb'
-      elif len(vdm_sc) == 0: # also Gly
-         aas_of_vdms_in_order.append('bb')
-      else: # not Gly, so check if it has a sc contact
-         has_sidechain_contact = False
-         # Determine whether the vdm is a bb or sc contact. H is excluded in cg_obj b/c 
-         # a CG H within 4.5A of a sc atom is not necessarily a sc contact and will 
-         # give poor results.
-         for cg_atom in cg_obj:
-            # sc condition
-            dists_cg_atom_to_sc = pr.calcDistance(cg_atom, vdm_sc)
-            if np.any(dists_cg_atom_to_sc <= 4.4):
-               has_sidechain_contact = True 
-               break 
+      if vdm_res_obj is None:
+         raise ValueError(f'reorder_vdg_subset: no atoms found for "{vdm_sel}"')
+      # (seg, chain, resnum) is not unique when insertion codes are in use: the
+      # selection pulls every icode variant at once, and this would build one slot
+      # out of two residues' atoms. Skip rather than merge -- same policy as
+      # dock_utils.get_bsr_combinations on the query side. A lone icode is fine;
+      # only a collision is not. The raise is the skip: the caller logs it and
+      # moves to the next vdG subset.
+      _icodes = vdm_res_obj.getIcodes()   # None when the source set no icodes at all
+      if _icodes is not None and len(set(_icodes)) > 1:
+         raise ValueError(
+            f'reorder_vdg_subset: residue {_vdg_seg}:{_vdg_ch}:{_vdg_resnum} has '
+            'multiple insertion codes (insertion codes are not part of the vdM key)')
 
-         if has_sidechain_contact:
-            aas_of_vdms_in_order.append(vdmAA)
-         else: 
-            # Even if it doesn't have a close sc contact, it may have a weaker sc 
-            # contact, so don't rule it out completely. See whether the closest AA atom 
-            # is bb or sc.
-            vdm_bb = vdm_res_obj.select(f'{vdm_sel} and backbone') 
-            min_dist_to_sc = None
-            min_dist_to_bb = None
-            for cg_atom in cg_obj:
-               # get closest dist to AA sc
-               dist_to_sc = pr.calcDistance(cg_atom, vdm_sc)
-               if min_dist_to_sc is None:
-                  min_dist_to_sc = min(dist_to_sc)
-               else:
-                  min_dist_to_sc = min(min_dist_to_sc, min(dist_to_sc))
-               # get closest dist to AA bb
-               dist_to_bb = pr.calcDistance(cg_atom, vdm_bb)
-               if min_dist_to_bb is None:
-                  min_dist_to_bb = min(dist_to_bb)
-               else:
-                  min_dist_to_bb = min(min_dist_to_bb, min(dist_to_bb))
-            
-            # Is bb closer to lig by at least 0.3A compared to sc? If yes, then bb.
-            if ((min_dist_to_bb < min_dist_to_sc) and 
-                (min_dist_to_sc - min_dist_to_bb > 0.3)):
-               aas_of_vdms_in_order.append('bb')
-            else: # then sc
-               aas_of_vdms_in_order.append(vdmAA)
+      # Split by atom name, not by ProDy's flags: the motivating case is a residue
+      # that wears a canonical resname while carrying atoms that resname does not
+      # have (a GFP chromophore deposited as GLY, an oxidized CYS, an alkylated
+      # LYS), and ProDy would hand those extras back as an ordinary sidechain.
+      res_bb, res_sc, res_extra = struct_utils.split_residue_heavy_atoms(
+         vdm_res_obj, _vdg_resname)
+      if res_bb is None:
+         # Resname outside the 20, so there is no reference atom set. Fall back to
+         # ProDy's own split and treat nothing as non-canonical. Not reachable from
+         # the current pipeline (vdG-miner keeps only the 20, and prep renames the
+         # rest), kept so a future database change degrades instead of crashing.
+         res_sc = _coords_or_empty(vdm_res_obj.select(f'{vdm_sel} and sidechain'))
+         res_bb = _coords_or_empty(vdm_res_obj.select(f'{vdm_sel} and backbone'))
+         res_extra = np.zeros((0, 3), dtype=np.float32)
 
-      # Decompress the flanking AA and CA info
-      for flank_ind in sorted_flank_indices:
-         flank_resname, flank_ca = flanking_seq_dict[flank_ind]
-         flankingseqs.append(flank_resname)
-         flankingCAs.append(flank_ca)
+      # Which moiety of the *canonical* residue is nearest the CG. Computed for
+      # every slot including 'X', where it describes the real residue underneath
+      # the modification -- something the label cannot say.
+      if len(res_sc) == 0:
+         reason = struct_utils.SLOT_NO_SC
+      else:
+         min_dist_to_sc = _min_dist_to_cg(cg_coords, res_sc)
+         if min_dist_to_sc <= 4.5:
+            reason = struct_utils.SLOT_SC
+         elif len(res_bb) == 0:
+            print(f'[WARNING] reorder_vdg_subset: no backbone atoms for "{vdm_sel}"; '
+                  'treating as SC contact', flush=True)
+            reason = struct_utils.SLOT_SC
+         else:
+            # Is bb closer to the lig by at least 0.3 A than sc? If yes, then bb.
+            min_dist_to_bb = _min_dist_to_cg(cg_coords, res_bb)
+            reason = (struct_utils.SLOT_BB_CLOSER
+                      if min_dist_to_sc - min_dist_to_bb > 0.3
+                      else struct_utils.SLOT_SC)
+
+      is_modified = len(res_extra) > 0
+      if is_modified and _min_dist_to_cg(cg_coords, res_extra) <= 4.5:
+         # The atoms doing the contacting are not part of the residue this slot is
+         # named for, so neither the resname nor a backbone label describes it.
+         # Label it 'X' rather than dropping it: the geometry is real and worth
+         # keeping, it just must not be counted as an observation of the residue
+         # whose name it wears.
+         label = struct_utils.NONCANONICAL_AA_LABEL
+      elif reason == struct_utils.SLOT_SC:
+         label = vdmAA
+      else:
+         label = struct_utils.bb_label_for(_vdg_resname)
+
+      aas_of_vdms_in_order.append(label)
+      slot_flags_of_vdms_in_order.append(
+         reason | (struct_utils.SLOT_MODIFIED if is_modified else 0))
+
+      # Decompress flanking info
+      flankingseqs = [flanking_seq_dict[i][0] for i in sorted_flank_indices]
+      flankingCAs = [flanking_seq_dict[i][1] for i in sorted_flank_indices]
       flankingseqs_of_vdms_in_order.append(flankingseqs)
       flanking_CA_coords_of_vdms_in_order.append(flankingCAs)
-   
+
    assert len(aas_of_vdms_in_order) == len(bb_coords_of_vdms_in_order)
-   # Then, re-order based on alphabetical order
-   super_list = [aas_of_vdms_in_order,
-                 bb_coords_of_vdms_in_order, 
-                 flankingseqs_of_vdms_in_order,
-                 flanking_CA_coords_of_vdms_in_order, 
-                 seg_ch_res_of_vdms_in_order,
-                 vdm_heavycoords_of_vdms_in_order]
+   assert len(slot_flags_of_vdms_in_order) == len(aas_of_vdms_in_order)
+   # Re-order by alphabetical AA name. slot_flags goes last so the sort key
+   # (entries 0 and 1) is unaffected.
+   super_list = [aas_of_vdms_in_order, bb_coords_of_vdms_in_order,
+                 flankingseqs_of_vdms_in_order, flanking_CA_coords_of_vdms_in_order,
+                 seg_ch_res_of_vdms_in_order, slot_flags_of_vdms_in_order]
    return sort_vdGs_by_AA(super_list)
 
 def sort_vdGs_by_AA(super_list):
-   # Check if all sublists have equal length
    assert all(len(sublist) == len(super_list[0]) for sublist in super_list)
-   # Combine the sublists into a list of tuples, where each tuple corresponds to the 
-   # elements at the same index
    combined = list(zip(*super_list))
-   # Sort the combined list based on the first element (from the first sublist)
-   sorted_combined = sorted(combined, key=lambda x: x[0])
-   # Unzip the sorted combined list back into sublists
-   sorted_sublists = list(zip(*sorted_combined))
-   return [list(sublist) for sublist in sorted_sublists]
+   def _sort_key(entry):
+      # Primary key: AA name; secondary: CA coords for deterministic duplicate-AA ordering
+      ca = np.asarray(entry[1][1], dtype=np.float32).reshape(-1)
+      if ca.size != 3 or not np.isfinite(ca).all():
+         # A vdM CA is mandatory (get_bb_coords rejects the residue otherwise), so
+         # this means the caller built the entry itself and the tie-break is gone.
+         raise ValueError(f'sort_vdGs_by_AA: vdM {entry[0]} has no usable CA coords '
+                          'for the duplicate-AA tie-break')
+      return (entry[0], float(ca[0]), float(ca[1]), float(ca[2]))
+   sorted_combined = sorted(combined, key=_sort_key)
+   return [list(sublist) for sublist in zip(*sorted_combined)]
 
-def permute_on_indices(symmetry_classes, coords_to_permute):
-   # Given a list of indices to permute on (symmetry_classes), permute a list or 
-   # array of coordinates.
-   assert len(symmetry_classes) == len(coords_to_permute)
-   # Group coordinates by their indices
-   grouped_coords = {}
-   for idx, coord in zip(symmetry_classes, coords_to_permute):
-      if idx not in grouped_coords:
-         grouped_coords[idx] = []
-      grouped_coords[idx].append(coord)
+def clear_caches():
+   """Clear Stage-2's memoized distance caches and dataset registries.
 
-   # Generate all permutations of coordinates within each group
-   grouped_permutations = {}
-   for key in grouped_coords:
-      grouped_permutations[key] = list(permutations(grouped_coords[key]))
-
-   # Generate all combinations of permutations (one for each group)
-   result = []
-   for perm_combination in product(*grouped_permutations.values()):
-      # Rebuild the permuted list from the permuted groups
-      permuted_list = []
-      # For each original index, we need to pick the corresponding permuted item
-      perm_idx = {key: 0 for key in grouped_permutations}  # Keep track of which 
-                                           # element in each permutation we're at
-      for idx in symmetry_classes:
-         # Find the group corresponding to the current index (grouped_permutations)
-         group_perm = perm_combination[list(
-            grouped_permutations.keys()).index(idx)]
-         permuted_list.append(group_perm[perm_idx[idx]])
-         perm_idx[idx] += 1  # Move to the next item in this group's permutation
-      
-      result.append(np.array(permuted_list))
-
-   return result
-
-def get_vdg_AA_and_cg_perms(all_AA_perm_cg_coords, all_AA_perm_vdm_bbcoords,
-    all_AA_perm_flankingseqs, all_AA_perm_flankingCAs, all_AA_perm_pdbpaths, 
-    all_AA_perm_vdm_scrr, all_AA_perm_vdm_heavycoords, all_AA_perm_cg_names, 
-    all_AA_perm_cg_elements, all_AA_perm_cg_seg, all_AA_perm_cg_chain,
-    all_AA_perm_cg_resnum, all_AA_perm_cg_resname, symmetry_classes,):
-    """
-    Expand over CG symmetry permutations, carrying vdM features and CG atom metadata.
-    Inputs are parallel lists, length = #vdGs-after-AA-perm.
-    """
-
-    if symmetry_classes is None:
-        return (all_AA_perm_cg_coords, all_AA_perm_vdm_bbcoords,
-            all_AA_perm_flankingseqs, all_AA_perm_flankingCAs,
-            all_AA_perm_pdbpaths, all_AA_perm_vdm_scrr,
-            all_AA_perm_vdm_heavycoords,
-            all_AA_perm_cg_names, all_AA_perm_cg_elements,
-            all_AA_perm_cg_seg, all_AA_perm_cg_chain,
-            all_AA_perm_cg_resnum, all_AA_perm_cg_resname,)
-
-    # Recompile vdGs with permuted symmetric CG indices
-    all_AA_cg_perm_cg_coords = []
-    all_AA_cg_perm_vdm_bbcoords = []
-    all_AA_cg_perm_flankingseqs = []
-    all_AA_cg_perm_flankingCAs = []
-    all_AA_cg_perm_pdbpaths = []
-    all_AA_cg_perm_vdm_scrr_cg_perm = []
-    all_AA_cg_perm_vdm_heavycoords = []
-
-    all_AA_cg_perm_cg_names = []
-    all_AA_cg_perm_cg_elements = []
-    all_AA_cg_perm_cg_seg = []
-    all_AA_cg_perm_cg_chain = []
-    all_AA_cg_perm_cg_resnum = []
-    all_AA_cg_perm_cg_resname = []
-
-    for (cgcoords, vdmcoords, seq, CAs, pdbpath, scrr, vdm_heavycoords,
-         cg_names, cg_elements, cg_seg, cg_chain, cg_resnum, cg_resname) in zip(
-        all_AA_perm_cg_coords, all_AA_perm_vdm_bbcoords, all_AA_perm_flankingseqs, 
-        all_AA_perm_flankingCAs, all_AA_perm_pdbpaths, all_AA_perm_vdm_scrr,
-        all_AA_perm_vdm_heavycoords, all_AA_perm_cg_names, all_AA_perm_cg_elements,
-        all_AA_perm_cg_seg, all_AA_perm_cg_chain, all_AA_perm_cg_resnum, 
-        all_AA_perm_cg_resname,):
-        perms = permute_on_indices(symmetry_classes, cgcoords)
-
-        for perm_ind, perm in enumerate(perms):
-            all_AA_cg_perm_cg_coords.append(perm)
-            all_AA_cg_perm_vdm_bbcoords.append(vdmcoords)
-            all_AA_cg_perm_flankingseqs.append(seq)
-            all_AA_cg_perm_flankingCAs.append(CAs)
-            all_AA_cg_perm_pdbpaths.append(pdbpath)
-
-            vdm_scrr_perm = [scrr, f"cg_perm_{perm_ind + 1}"]
-            all_AA_cg_perm_vdm_scrr_cg_perm.append(vdm_scrr_perm)
-
-            all_AA_cg_perm_vdm_heavycoords.append(vdm_heavycoords)
-
-            # CG metadata duplicated across symmetry-equivalent perms
-            all_AA_cg_perm_cg_names.append(cg_names)
-            all_AA_cg_perm_cg_elements.append(cg_elements)
-            all_AA_cg_perm_cg_seg.append(cg_seg)
-            all_AA_cg_perm_cg_chain.append(cg_chain)
-            all_AA_cg_perm_cg_resnum.append(cg_resnum)
-            all_AA_cg_perm_cg_resname.append(cg_resname)
-
-    return (
-        all_AA_cg_perm_cg_coords, all_AA_cg_perm_vdm_bbcoords, 
-        all_AA_cg_perm_flankingseqs, all_AA_cg_perm_flankingCAs, all_AA_cg_perm_pdbpaths, 
-        all_AA_cg_perm_vdm_scrr_cg_perm, all_AA_cg_perm_vdm_heavycoords,
-        all_AA_cg_perm_cg_names, all_AA_cg_perm_cg_elements, all_AA_cg_perm_cg_seg, 
-        all_AA_cg_perm_cg_chain, all_AA_cg_perm_cg_resnum, all_AA_cg_perm_cg_resname,)
-
-def reassign_cgvdmbb_clusters(cgvdmbb_clus_assignments,
-    all_pdbpaths, all_scrr_cg_perm):
-   """
-   Merge equivalent clusters with degenerate vdGs (diff AA perms and CG perms of the same 
-   PDB) and reassign cluster numbers by size. Must merge before deleting duplicates b/c 
-   need the duplicate names to determine which clusters are equivalent. 
-
-   Returns: 
-       {new_cluster_number: [indices_into_all_*_arrays, ...]}
-   where indices correspond to the entries in all_* arrays
-   (e.g., all_AA_cg_perm_cg_coords, all_AA_cg_perm_pdbpaths, etc.)
-   for mapping between clusters.
-   """
-
-   # Dict architecture containing _all_ vdGs with sorted scrrs:
-   #   temp_clus_assignments[(clusnum,)] = [
-   #       (pdb_base, sorted_scrrs, clus_mem_index, pdbpath), ...]
-   temp_clus_assignments = {}
-
-   for cgvdmbb_clusnum, member_indices in cgvdmbb_clus_assignments.items():
-      clus_label = f'clus_{cgvdmbb_clusnum}'
-      clus_tup = (clus_label,)
-
-      if clus_tup not in temp_clus_assignments:
-         temp_clus_assignments[clus_tup] = []
-
-      for ix in member_indices:
-         pdbpath = all_pdbpaths[ix]
-         pdbname = os.path.basename(pdbpath)
-
-         if pdbname.endswith('.pdb.gz'):
-            pdb_base = pdbname[:-len('.pdb.gz')]
-         elif pdbname.endswith('.pdb'):
-            pdb_base = pdbname[:-len('.pdb')]
-         else:
-            pdb_base = pdbname
-
-         scrrs, cg_perm = all_scrr_cg_perm[ix]
-         # scrrs is a list of [seg, chain, resnum, resname]
-         grouped_scrrs = [
-            [str(seg), str(chain), str(resnum), str(resname)]
-            for (seg, chain, resnum, resname) in scrrs]
-         sorted_scrrs = sorted(grouped_scrrs)
-
-         # index for this specific pdb of specific AA perm and cg perm for mapping it 
-         # back to the original "all_AA_cg_perm"...etc... lists. 
-         clus_mem_index = str(ix) 
-
-         vdg = (pdb_base, sorted_scrrs, clus_mem_index, pdbpath)
-
-         # Remove duplicates
-         existing_pairs = [v[:2] for v in temp_clus_assignments[clus_tup]]
-         if vdg[:2] not in existing_pairs:
-            temp_clus_assignments[clus_tup].append(vdg)
-
-   # Merge_equivalent_clusters -> delete_redun_vdgs -> reassign_temp_clusters
-   temp_clus_assignments = merge_equivalent_clusters(temp_clus_assignments)
-   pruned_clusters = delete_redun_vdgs(temp_clus_assignments)
-   reassigned = reassign_temp_clusters(pruned_clusters)
-
-   # Convert from vdg tuples back to index lists. Reassign clusters.
-   renumbered_clusters = {}
-   for new_cgvdmbb_clusnum, vdgs in reassigned.items():
-      renumbered_clusters[new_cgvdmbb_clusnum] = [int(v[2]) for v in vdgs]
-
-   return renumbered_clusters 
-
-def determine_redundant_temp_vdg(already_seen_temp_vdgs, 
-                                 candidate_pdbbase, candidate_scrr):
-   # Return True if the candidate vdg has already been seen.
-   for a in already_seen_temp_vdgs:
-      seen_pdbbase = a[0]
-      seen_scrr = a[1]
-      if candidate_pdbbase == seen_pdbbase and candidate_scrr == seen_scrr:
-         return True
-   return False
-
-def determine_cluster_redundancy(clusnumA_vdgs, clusnumB_vdgs): 
-   # Return yes if the vdg in clus A is in clus B
-   for vdgA in clusnumA_vdgs:
-      vdgA_pdbbase, vdgA_sorted_scrrs, vdgA_ix, vdgA_pdbpath = vdgA
-      for vdgB in clusnumB_vdgs:
-         vdgB_pdbbase, vdgB_sorted_scrrs, vdgB_ix, vdgB_pdbpath = vdgB
-         if vdgA_pdbbase == vdgB_pdbbase and vdgA_sorted_scrrs == vdgB_sorted_scrrs:
-            return True
-   return False
-
-def merge_equivalent_clusters(temp_clus_assignments):
-   # After gathering all the pdb and sorted scrrs, find the degenerate vdGs and merge them.
-   already_seen_temp_clustup_A = []
-   clusnumbers = list(temp_clus_assignments.keys())
-   for clustupA in clusnumbers:
-      if clustupA not in temp_clus_assignments.keys(): # b/c dict dynamically changing
-         continue
-      clusnumA_vdgs = temp_clus_assignments[clustupA]
-      already_seen_temp_clustup_A.append(clustupA)
-      for clustupB in clusnumbers:
-         if clustupA == clustupB:
-            continue
-         if clustupB not in temp_clus_assignments.keys(): # b/c dict dynamically changing
-            continue
-         if clustupB in already_seen_temp_clustup_A:
-            continue # ensures that only the upper triangle is calculated 
-         clusnumB_vdgs = temp_clus_assignments[clustupB]
-         # Are any of clusnumA vdgs in clusnumB?
-         if determine_cluster_redundancy(clusnumA_vdgs, clusnumB_vdgs): 
-            # If so, merge the clusters
-            temp_clus_assignments[clustupA] += temp_clus_assignments[clustupB]
-            del temp_clus_assignments[clustupB]
-   return temp_clus_assignments
-
-def delete_redun_vdgs(temp_clus_assignments):
-   # Next, delete the redundant vdgs within the merged clusters
-   already_seen_temp_vdgs = []
-   pruned_clusters = {}
-   for clusnum, vdgs in temp_clus_assignments.items():
-      for _ind, vdg in enumerate(vdgs):
-         pdbbase, scrr, clusmem_ix, pdbpath = vdg
-         if determine_redundant_temp_vdg(already_seen_temp_vdgs, pdbbase, scrr):
-            continue
-         else:
-            already_seen_temp_vdgs.append(vdg)
-            # add to pruned_clusters
-            if clusnum not in pruned_clusters.keys():
-               pruned_clusters[clusnum] = []
-            pruned_clusters[clusnum].append(vdg)
-   return pruned_clusters
-
-def reassign_temp_clusters(pruned_clusters):
-   '''
-   Reassign cluster numbers, sorting cluster numbers based on size.
-   '''
-   clus_tuples = list(pruned_clusters.keys())
-   original_clus_labels = {}
-   for tup in clus_tuples:
-      cgvdmbb_clus = tup
-      assert cgvdmbb_clus not in original_clus_labels.keys()
-      original_clus_labels[cgvdmbb_clus] = pruned_clusters[tup]
-   
-   # Re-order/renumber cgvdmbb clus nums based on # of vdgs
-   reassigned_cgvdmbb_clusters = {}
-   sorted_cgvdmbb_clusters = sorted(original_clus_labels.values(), 
-                                    key=lambda x: len(x), reverse=True)
-   for new_cgvdmbb_clus_num, vdgs in enumerate(sorted_cgvdmbb_clusters, start=1):
-      reassigned_cgvdmbb_clusters[new_cgvdmbb_clus_num] = vdgs
-
-   return reassigned_cgvdmbb_clusters
+   Call between buckets so one bucket's index-keyed cache cannot be read by the
+   next. Stage 1 holds no module-level state -- get_butina_clusters is
+   self-contained -- so there is nothing to clear on its side."""
+   if not hasattr(get_leader_clusters, '_rmsd_cached'):
+      return
+   get_leader_clusters._rmsd_cached.cache_clear()
+   get_leader_clusters._seqsim_cached.cache_clear()
+   get_leader_clusters._SEQ_DATA = None
+   get_leader_clusters._FLANKBB_DATA = None

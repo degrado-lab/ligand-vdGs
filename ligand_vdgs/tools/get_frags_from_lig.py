@@ -3,12 +3,9 @@ For a list of ligands, determine if a vdg library for each of their fragments ex
 and identify fragments that don't currently have a vdg library.
 '''
 
-import sys
 import os
-from rdkit import Chem, RDLogger
-sys.path.append(os.path.join(os.path.dirname(__file__), 'ligand_vdgs', 'functions'))
-import Frags 
-import utils
+from rdkit import Chem
+from ligand_vdgs.functions import Frags, utils
 
 # ------- Example settings --------------------------------
 list_smiles = ['CNCc1ccc(cc1)c2[nH]c3cc(F)cc4C(=O)NCCc2c34', 
@@ -28,10 +25,25 @@ frags_to_query['need'] = []
 for smiles in list_smiles:
     # Convert SMILES to RDKit molecule and remove H's
     orig_mol = Chem.MolFromSmiles(smiles, sanitize=False)
-    
-    results = Frags.manually_remove_Hs(orig_mol, 'single') # rdkit's remove 
+    if orig_mol is None:
+        print(f'[WARNING] could not parse SMILES: {smiles}')
+        continue
+    # Perceive aromaticity before fragmenting: unsanitized, a Kekule-written ring
+    # keys as [C;r6]=[C;r6](...) instead of cc(...), which silently matches nothing
+    # in the library. fragment_database_ligs sanitizes at the same point.
+    try:
+        Chem.SanitizeMol(orig_mol)
+    except Exception as e:
+        print(f'[WARNING] sanitization failed ({e}): {smiles}')
+        continue
+
+    results = Frags.manually_remove_Hs(orig_mol, 'single') # rdkit's remove
                                             # H method isn't good enough.
-    
+    if results is None:
+        # H-removal/canonicalization failed (see the warning it printed); skip
+        # this ligand rather than aborting the whole scan.
+        print(f'[WARNING] could not process SMILES: {smiles}')
+        continue
     mol_info, _ = results
     mol, _ = mol_info
     
@@ -46,24 +58,13 @@ for smiles in list_smiles:
         found_match = False
         for fraglib in fraglibs:
             for frag_smiles in os.listdir(fraglib):
-                if utils.smiles_equiv(frag_smiles, sub_smiles, check_atom_order=False):
-                    # Has the job finished yet? Check the log file in 
-                    # fraglib/frag_smiles/logs/<frag_smiles>_log to find the line 
-                    # "Job completed."
-                    logfile = os.path.join(fraglib, frag_smiles, 'logs', 
-                        f'{frag_smiles}_log')
-                    if os.path.exists(logfile):
-                        with open(logfile, 'r') as f:
-                            loglines = f.readlines()
-                        if any('Job completed.' in line for line in loglines):
-                            frags_to_query['already_have'].append((sub_smiles, fraglib))
-                        else:
-                            frags_to_query['started_but_not_completed'].append(
-                                (sub_smiles, fraglib))
+                if utils.smiles_equiv(frag_smiles, sub_smiles):
+                    if Frags.check_vdg_job_status(frag_smiles, fraglib):
+                        frags_to_query['already_have'].append((sub_smiles, fraglib))
                     else:
                         frags_to_query['started_but_not_completed'].append(
                             (sub_smiles, fraglib))
-                    
+
                     found_match = True
         if not found_match:
             frags_to_query['need'].append(sub_smiles)

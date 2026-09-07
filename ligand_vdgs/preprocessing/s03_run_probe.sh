@@ -40,7 +40,7 @@ pdb_file=${pdb_files[$((SGE_TASK_ID - 1))]} # SGE_TASK_ID is 1-based
 
 # Run Probe
 echo "Processing $pdb_file" 
-python _run_probe.py \
+python "$(dirname "$0")/_run_probe.py" \
   --input-pdb $pdb_file \
   --outdir $output_probe_dir \
   --probe-path $probe_path

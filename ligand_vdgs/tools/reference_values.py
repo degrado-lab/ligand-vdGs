@@ -1,5 +1,3 @@
-import numpy as np
-
 AA_size = {'ALA': 5,
            'ARG': 11,
            'ASN': 8,
@@ -20,6 +18,17 @@ AA_size = {'ALA': 5,
            'TRP': 14,
            'TYR': 12,
            'VAL': 7}
+
+# Heavy atoms in the peptide backbone (N, CA, C, O). Every residue presents these,
+# so they are the "size" of a backbone-mediated contact category.
+BB_HEAVY_ATOMS = 4
+
+# Sidechain-only heavy-atom counts. A bucket labelled with a resname means that
+# residue's *sidechain* is what contacts the CG, so the surface competing for the
+# contact is the sidechain, not the whole residue. GLY drops out (0 sidechain
+# heavy atoms) -- which is exactly why no GLY sidechain bucket is ever generated.
+AA_sidechain_size = {aa: n - BB_HEAVY_ATOMS
+                     for aa, n in AA_size.items() if n > BB_HEAVY_ATOMS}
 
 AA_background_freq = \
           {'ALA': 0.08733094390532901,
@@ -42,24 +51,3 @@ AA_background_freq = \
            'TRP': 0.013705138015159568,
            'TYR': 0.03489372480131626,
            'VAL': 0.07244700673477375}
-
-def avg_aa_size_unweighted():
-    '''Unweighted mean heavy-atom count across the 20 canonical AAs.'''
-    return np.mean(list(AA_size.values()))
-
-def avg_aa_size_bg_weighted():
-    '''Background-frequency-weighted mean heavy-atom count.
-    Use as the normalization denominator so that size-adjusted enrichment = 0
-    when an AA's count is fully explained by its background frequency and size.'''
-    return sum(AA_background_freq[aa] * AA_size[aa] for aa in AA_size)
-
-def avg_aa_pair_size_unweighted():
-    '''Unweighted mean combined heavy-atom count across all 210 unique AA pairs.
-    Equals 2 × avg_aa_size_unweighted() by linearity of expectation.'''
-    return 2 * avg_aa_size_unweighted()
-
-def avg_aa_pair_size_bg_weighted():
-    '''Expected combined heavy-atom count for a pair of AAs drawn independently
-    from the background frequency distribution.
-    = E[size(aa1) + size(aa2)] = 2 * avg_aa_size_bg_weighted() by linearity.'''
-    return 2 * avg_aa_size_bg_weighted()

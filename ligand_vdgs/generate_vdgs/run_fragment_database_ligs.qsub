@@ -1,0 +1,39 @@
+#!/bin/bash
+#$ -S /bin/bash
+#$ -cwd
+#$ -N frag_db_ligs
+#$ -l h_rt=0:29:00
+#$ -l mem_free=2G
+#$ -l scratch=2G
+#$ -pe smp 8
+#$ -o logs/frag_db_ligs.sge.log
+#$ -j y
+
+source ~/.bashrc
+conda activate lig_vdgs
+
+# -cwd + relative paths: submit from the repo root, or --ccd/--outdir below
+# resolve against the wrong directory.
+#
+# mem_free is PER SLOT under
+# -pe smp, so this asks for 16G total; each worker holds one ligand plus its
+# fragments and peaks well under 1G, and only the parent holds frag_dict (~2 MB
+# pickled). A bigger PE request just lengthens the queue wait.
+#
+# --nproc does not affect the output: results are merged in input order, which
+# is what fixes which of two degenerate keys becomes the recorded one.
+python ligand_vdgs/generate_vdgs/fragment_database_ligs.py \
+    --ccd resources/Components-smiles-cactvs.smi \
+    --outdir resources \
+    --logfile logs/fragment_database_ligs.log \
+    --nproc 8
+STATUS=$?
+
+[[ -n "$JOB_ID" ]] && qstat -j "$JOB_ID"
+
+if [ "$STATUS" -eq 0 ]; then
+    echo "DONE"
+else
+    echo "FAILED (exit $STATUS)" >&2
+fi
+exit "$STATUS"

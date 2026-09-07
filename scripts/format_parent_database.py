@@ -9,13 +9,11 @@ For example, a PDB file named
 
 Please note that your PDB files should be named with a 4-character identifier (XXXX.pdb).
 
-Usage: 
+Usage:
     >> cd $YOUR_LIGAND-VDGS_DIR
-    >> pip install -e . # for debugging and developing
-    >> pip install .    # for users
     >> python scripts/format_parent_database.py \
-        --pdb-input-dir <input_dir> \
-        --pdb-output-dir <output_dir>
+        --input_dir <input_dir> \
+        --output_dir <output_dir>
 '''
 
 import os
@@ -46,24 +44,27 @@ def main():
     else:
         os.makedirs(pdb_output_dir)
 
-    # Move the pdbs
-    for pdb in os.listdir(pdb_input_dir):
-        print(pdb)
-        # Ensure that the PDB has exactly 4 characters
+    pdbs = os.listdir(pdb_input_dir)
+
+    # Validate all file names up front so a bad name aborts before any file is touched
+    for pdb in pdbs:
         pdbcode = pdb.removesuffix('.pdb')
         if len(pdbcode) != 4:
             raise ValueError('PDB file names are expected to have 4 characters ("XXXX.pdb"). '
                              'Invalid file: {}'.format(os.path.join(pdb_input_dir, pdb)))
 
+    # Copy the pdbs (source database is left intact)
+    for pdb in pdbs:
+        print(pdb)
         # Determine its subdir, based on the inner 2 characters in the pdb name
-        subdir_code = pdb[1:3]
+        subdir_code = pdb[1:3].lower()   # readers lowercase the middle two
         subdir_path = os.path.join(pdb_output_dir, subdir_code)
         if not os.path.exists(subdir_path):
             os.mkdir(subdir_path)
         source_path = os.path.join(pdb_input_dir, pdb)
 
-        # Move the file
-        shutil.move(source_path, subdir_path)
+        # Copy the file
+        shutil.copy2(source_path, subdir_path)
 
 if __name__ == "__main__":
     main()

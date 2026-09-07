@@ -1,20 +1,616 @@
+- The preprocessed database contains no waters and
+no monatomic ions, and the rebuild must not go ahead until that is fixed. Measured by
+grepping every one of the 65,600 files in `prepwizard_BioLiP2` for a HETATM residue
+named HOH, ZN, MG, CA, NA, CL, MN or FE: **zero files contain any of them**. Not "rare"
+— zero, for all eight, across the whole database. Multi-atom het groups are unaffected
+(HEM appears in 28 of 300 sampled files, and NAP/NAD/FAD/ADP/ATP/GDP/SAH/GNP/PLP/FMN/
+H4B/SF4 and the sugars GAL/BMA/GLC/BGC/MAN/SIA all appear), so whatever removes them
+removes waters and single-atom ions specifically.
+  It is not s01 and not `_prep_filters`. s01's `parsed.select(f'within {radius} of
+ligobj')` is an atom-level selection over everything ProDy parsed and is then
+re-expanded to whole residues by resindex, so an ion or water inside the sphere would
+be kept; and `_prep_filters.single_carbon_het_resindices` deliberately restricts itself
+to carbon precisely so that "monatomic ions -- metals, halides, LU in 1plu" survive. It
+is probably not s02 either, but that rests on an assumption nobody has checked here:
+prepwizard is *believed* to delete waters by default (the command in
+`_protonate_pdbs.py` is `-rehtreat -noimpref`, with no `-keepfarwat`) while preserving
+metals, assigning them binding states rather than stripping them — so a Zn should have
+survived. That is recalled behaviour, not a measurement. Settle it by re-running
+prepwizard on a single metalloprotein and looking at the output — the original s02 run
+logs are NOT available (`_protonate_pdbs.py` writes one per PDB into a relative
+`./prepwizard_logs`, and no such directory exists anywhere under /wynton, so they were
+written on the old host or into a working directory that is gone). Do this before
+treating the BioLiP2 hypothesis as the answer.
+The leading hypothesis is therefore the source database,
+`consolidated_BioLiP2_split`: BioLiP2 splits its receptor files from its ligand files
+and treats each metal ion as its own ligand entry, so the receptor half never carries
+them. **This is unverified** — that directory is not on Wynton, so nobody has actually
+opened a source file and looked. Do that first; it decides whether the fix is a
+re-download, a different source, or a prepwizard flag.
+  Why this blocks the rebuild rather than being a nice-to-have. A zinc, a magnesium or
+a buried bridging water is usually the single largest determinant of the protonation
+state of the residues around it: a His coordinating a catalytic Zn is deprotonated on
+the coordinating nitrogen, an Asp/Glu pair bridged by a structural water has a shifted
+pKa, and prepwizard cannot know any of that from a file where the metal and the water
+are simply absent. It will confidently emit a plausible, wrong answer with no warning.
+Every downstream consumer inherits it: Probe contacts are computed from those
+hydrogens, so the mined vdG geometries are wrong; `fragment_aliases.tsv` collapses
+protonation variants using them; and the donor/acceptor distinction that the
+bioisostere work depends on is exactly the thing being corrupted. Note this also means
+metal-coordination vdGs cannot exist in the current library at all — a fragment whose
+real partner is a Zn is mined as though the Zn were not there.
+  Increasing the trim radius does NOT fix this and was never going to. The radius was
+raised 10 -> 20 A for a different reason (see below), and no radius recovers a residue
+that is not in the input file.
+  What "everything else" should mean when checking: waters (all of them within the
+sphere, not just the ones prepwizard would keep), monatomic metal ions and halides,
+polyatomic ions (SO4/PO4 appeared in only 3 of 300 sampled files, which is also
+suspiciously low and should be checked the same way), noncanonical and modified amino
+acids, covalent modifications, and any cofactor that is a separate residue from the
+ligand of interest. The verification to run after the fix is the same grep: pick a
+handful of structures known to have a catalytic metal (a carbonic anhydrase, a
+zinc-finger, a Mg-dependent kinase) and confirm the ion is present in the preprocessed
+file, then re-run the 8-resname count over the whole rebuilt database and expect
+nonzero everywhere. The most falsifying case, and the one to check first, is a metal
+that is the *ligand's own* partner rather than merely nearby — a Mg-ATP kinase. If
+BioLiP2 split that Mg off as its own ligand entry, the ATP receptor file is missing the
+ion that defines the binding geometry, and restoring it also changes which copies count
+as trim centres. A happy-path check on a structure whose metal sits off to one side
+proves nothing.
+  Related open decision, deliberately separate: if waters are restored, decide whether
+they should be *kept* through s02 (`-keepfarwat`) or only used to inform protonation
+and then dropped. They are not mineable as vdG partners today and would inflate Probe
+output substantially.
+
+- Trim radius raised from 10 A to 20 A in `s01_trim_database.py` (2026-09-05); takes
+effect only at the next rebuild, since the existing `prepwizard_BioLiP2` was cut at 10.
+Measured over 124 deposited RCSB entries, comparing each against its trimmed
+counterpart, with the trim centres identified as the ligand copies whose full 10 A
+neighbourhood is present in the trimmed file (the naive "nearest het atom" test is
+wrong — it counts copies that were never centres, and it is what produced the earlier,
+too-pessimistic figures). Shells defined at a 4.5 A contact cutoff; mean per entry is
+27 first-shell, 81 second-shell, 116 third-shell residues.
+
+    radius   +/-2 flanks   2nd shell   3rd shell   atoms    prep/probe on disk
+      10 A      93.2%        83.5%        8.2%     x1.00      11G / 24G
+      12 A      98.7%        97.1%       31.8%     x1.36      15G / 33G
+      15 A      99.9%        99.9%       75.5%     x1.95      21G / 47G
+      16 A     100.0%       100.0%       85.7%     x2.15      24G / 52G
+      18 A     100.0%       100.0%       96.6%     x2.57      28G / 62G
+      20 A     100.0%       100.0%       99.5%     x2.96      33G / 71G
+      22 A     100.0%       100.0%      100.0%     x3.31      36G / 79G
+
+  16 A would have been enough for the flank walk and the second shell; 20 A is the
+first radius that also delivers the third, which is the one protonation actually needs.
+The probe figures are a floor — probe output scales with contact count, not atom count.
+Two other things to fix before the rebuild run: `origin_dir` and `target_dir` at the
+top of the script are still stale `/home/sophia/` paths, and `radius` is a module
+constant with no CLI flag, so a radius sweep means editing the file. Third and
+easiest to miss: the trimming loop short-circuits on `if not overwrite_pdbs and
+os.path.exists(output_path): continue`, and the script ships with
+`overwrite_pdbs = False` and `skip_to_output_pdbs = True`. Pointed at a `target_dir`
+that already holds the 10 A spheres, the rebuild skips all 65,600 files, prints
+"Number of PDBs successfully output: 65600" and exits having written nothing at 20 A.
+Set `overwrite_pdbs = True`, or use a fresh empty `target_dir`.
 - Scrub the database of irrelevant PDBs (like extremely the extremely large complexes - PSI, PSII, ribosomes, interactions with iron sulfur clusters [of which there are many], etc.)
-- Migrate relevant smart-vdms scripts in ligand-vdGs. Address the errors in writeoutpdbs_portion_of_trimdatabase_script.log.
-- Provide a script in `preprocessing/` that divides the parent PDB database into subdirectories in
-the same format as a mirror of the PDB.
-- Give usage instructions for trim_database.py
-- Give usage instructions in `preprocessing/protonate_pdbs.py`.
-- Remove requirement that a vdm must have a phi and psi recorded, because this precludes terminal residues from being considered as vdms (e.g. phosphates preferentially bind N-terminal residues, which will be discarded because a phi torsion cannot be calculated from N-termini).
-- Automate finding smarts patterns in a query PDB for positive control purposes (refer to vdgs.py for finding smarts).
-- Determine what a "default bond" is in smarts patterns. For example, rdkit would miss examples of bromobenzene if there isn't explicit bond representation. Test case: for the saxitoxin ligand of 6a91, check if the results for 'C1[NH]~C([NH2])~NC1' is the same as without the "~"; it's especially tricky because it's a tautomer.
-- Add instructions in the README for putting vdG-miner in PYTHONPATH.
-- Investigate why there are no GLN vdms in vdGs of carboxamide...
-- Add a note in the README or documentation that when counting the atom indices within a smarts pattern (necessary for specifying symmetric/identical atoms), implicit atoms need to be skipped. For example, in C[NH2]C, the last C would be index 2 (skipping over the H) and not index 3.
-- smarts_to_cgs.py fails for polysaccharides, like 5a0y. The lines suppressing stdout/stderr
-in vdgs/cg.py must be commented out to view obabel errors. Unfortunately, sugars (connected to other residues) fail to be parsed completely and aren't recorded in the output file matches.pkl. This is true for all ligands that are covalently bonded to another residue; investigate to find out other instances of this edge case besides parsing sugars.
-- scripts/validate_known_poses.py, the query CG must have the same number of atoms as the database CG, but it doesn't always. Investigate those cases. This error is observed in the loop that samples the database vdGs (line 108).
-- Add pyyaml to environment.yml
-- Add symmetry for validate_known_poses.py (for example, the sulfonamide oxygens in 2ntr and 2nta)
-- Figure out why in /wynton/group/degradolab/skt/vdG/databases/vdgs/sulfonamide/vdg_pdbs/2vtd__A_1441_1.pdb, an extra N in "LKM" came along for the ride. And also UNDO the raise ValueError 'The query CG must have the same num. of atoms as the database CG.' in find_matches.py
-- Occasionally, in `get_pr_obj_to_print` in align_and_cluster.py, the parsePDB(clusmem_pdbpath) from different subprocesses (n=1, 2, 3) will try to read the same pdb, so the program crashes. Use filelock.
 - The probe file consume a lot of space. Redo the probe commands so that it only writes out contacts to ligands, not AA to AA.
+- Revisit hydrogens when supplementing the RCSB parent database with new structures. Open questions: do the new structures carry hydrogens already; if not, do they need to be built (s02/prepwizard, or something else); and are hydrogens needed at all if contacts come from somewhere other than Probe. Probe requires them; PLIP infers them and can add its own (see `NOTES_TODO_rebuild_lib`, which also covers the H-placement-is-model-dependent problem). Note PLINDER is a curated protein-ligand *dataset*, not a contact detector, so it would replace the structure source rather than Probe itself — decide which of the two is actually being swapped before designing around it.
+- Decide what statistical support means and make the consumers use it. The npz now
+carries `cluster_num_parents` (distinct parent structures) alongside `cluster_size`
+(raw observations), but `identify_bioisosteres/common.py` still counts *clusters*
+(`len(npz['cluster_id'])`) and `hit_finder_core` still just passes `cluster_size`
+through to the TSV. The caveat is written up in `docs/pitfalls.md` under "Every chain
+copy of a CG is mined, so NCS copies inflate cluster sizes" — NCS copies and
+homologous entries inflate raw counts, so propensities and hit evidence should use
+distinct parents, and ideally sequence-clustered parents (nothing computes those
+today). Unresolved: whether cluster count, distinct-parent count, or a
+sequence-clustered count is the right denominator for the bioisostere enrichment null
+model, and whether the three should be reported side by side rather than one chosen.
+- Calibrate the Stage-1 RMSD cutoff `T`. `utils.normalize_rmsd` interpolates 0.5 A at 8
+atoms to 1.0 A at 15+, which was never measured against recall. Calibrate on several
+fragments using *real mined environments*, not stored nr vdGs (already deduplicated,
+so they give pessimistic absolute numbers). No such test exists in the repo yet.
+Everything below depends on this number.
+- Revisit Stage 2 when `T` is calibrated. Stage 2 splits each pose cluster by flanking
+context (~2.6-6.7 subgroups per pose in a measured bucket), which hit finding never
+reads but which does give more stored representatives and therefore better recall. The
+open question is whether those rows are better spent on a tighter `T` instead. Answer
+it at matched representative budget on the same calibration data: cluster at `T` with
+the Stage-2 split, versus at a tighter `T` without it, and compare held-out miss rates.
+- Add RSCC/RSR/RSRZ to the per-vdG quality record. `--validation-dir` is already plumbed
+through `generate_environments.py` to `VDG.__init__` as an explicit no-op. B-factor and
+occupancy are stored per record now; these would join them, and like them should be
+recorded rather than hard-filtered so the threshold stays a read-path decision.
+- Occupancy carries no information in the current database, so `min_occ` is inert.
+Every atom in the prepwizard-prepared BioLiP2 mirror is occupancy `1.00` (prepwizard
+doesn't preserve deposited occupancy; checked across 40 structures). The `min_occ` floor
+in `VDG.mine_environments` (default `0.3`) filters nothing; `cg_min_occ`/`vdm_min_occ`
+are uniformly `1.0`. Don't filter or weight on them, or read them as evidence of a
+well-ordered ligand -- use `cg_max_b`/`vdm_max_b`, which are real. Strict `min_occ`
+would be the wrong instinct even on an occupancy-preserving database: a
+partial-occupancy ligand is often a binding-competent alternate conformation (see the
+next item).
+- Revisit the occupancy floor before mining any database that preserves occupancies.
+The pre-rewrite `mine_pdb` defaulted to `min_occ=0.99`, which would reject a ligand
+modelled at partial occupancy outright. That is the wrong default for this project: a
+partial-occupancy ligand is usually one of several modelled conformations, and a
+conformation the crystallographer resolved at 0.5 is still a conformation the pocket
+hosts -- exactly the binding-competent geometry a docking library wants. Design work
+has the opposite need, which is where the 0.99 came from. It cut nothing here only
+because prepwizard flattens every occupancy to 1.00 (see the item above), so the
+question is untested rather than settled. The per-row `*_min_occ` columns already exist
+for the read path to choose; keep the mining floor loose.
+- Retire or keep `vdg_npz_utils.resolve_fragment_alias`: hit finding no longer resolves
+query keys at all (since 2026-09-05 it matches the library's own charge-loose keys
+against the intact ligand, so a carboxylate reaches the acid directory without the
+table), leaving the resolver with no caller outside `tests/test_fragment_selection.py`.
+The `load_fragment_aliases` reader under it is still live -- `make_sge_scripts_for_frags.py`
+merges into an existing table on rebuild. Either delete the resolver plus its two tests,
+or keep it as the documented way to read the table and say so in its docstring.
+- Decide how to handle protonation for the next library build. Fragment
+selection pools protonation-state variants for counting and mining
+(`fragment_aliases.tsv` / `<work list stem>_aliases.tsv` records the mapping),
+but matching itself is charge-loose, so a "neutral" library actually mixes both
+protonation states while the charged key would have been clean. Making matching
+charge-strict would give a donor/acceptor distinction that matters for
+bioisosteres, but it changes the contents of every affected library and stakes
+the result on prepwizard's protonation calls, which are not independently
+trustworthy. The reverse direction -- a key that is itself charged, which a
+neutral-drawn query cannot reach -- is no longer silent:
+`hit_finder_core._warn_charge_only_miss` warns (once per fragment per process)
+when a charged key misses but its neutralized form matches the ligand, and says
+whether a usable neutral twin exists to fall back on. Empty in practice today: at the
+production threshold (250) 1 of 177 selected representatives carries a charge
+(aromatic nitro; the 100 cut adds quaternary ammonium, 2 of 324), and neither
+has a realizable neutral form -- nitro is normalized to the charge-separated
+form by sanitization, and a 4-substituent N is always +1. The warning is a
+tripwire for a future key set, not a live problem.
+- Key-encode a CG property only when hit finding needs a *hard* gate on it; otherwise
+store it per record and gate on the read path. The earlier framing here ("splitting is
+recoverable, pooling is not") was wrong in its generality and is retracted: every
+topological property of a CG -- ring membership, ring size, atom degree -- is a function
+of the stored `nr_cg_resname` + atom names, so both directions are recoverable by
+re-clustering a subset (the clustering phase, ~10% of a job). Demonstrated by
+splitting r5/r6 AA profiles post hoc on a library that never encoded rings at all.
+What is genuinely irreversible cuts the other way: a split piece below the selection
+threshold is never built, so its observations are lost rather than merely pooled --
+measured over the CCD, ring-membership encoding leaves 82% of split parents with a piece
+under the threshold, holding 0.6% of the ligands, and those pieces are ring/chain
+boundary fragments, i.e. the rare-interaction data this project exists to learn from.
+So the rule: put a property in the key when cross-context retrieval is a hard chemical
+error that the RMSD gate cannot catch (ring vs chain: CG geometry itself differs, 100%
+of chain vdGs have a ring vdG inside the budget); store it per record when the error is
+soft (r5 vs r6: 2-3x null divergence in protein partners for imidazole/pyrimidine, and
+the same donor/acceptor blur already exists inside imidazole via tautomer
+normalization). The instance-based threshold is what decides whether a boundary piece
+is rare in the mirror or only rare in CCD drawings.
+- RESOLVED 2026-09-05, left here for the rationale: residual nesting between ring-size
+keys at fused aliphatic bridgeheads. Keys record each atom's *smallest* ring
+(`[C;r5]`), which is what RDKit's `r<n>` means, but OpenBabel's `r<n>` means "in some
+ring of size n" -- so on the mining side a bridgehead atom in both a 5- and a 6-ring
+was matched by both keys and its observations went into both libraries. Fixed by
+re-imposing RDKit's reading on OpenBabel's matches (`cg.match_satisfies_ring_sizes`,
+via `OBAtom::MemberOfRingSize()`) rather than by lengthening the keys to the exact
+form `[C;r6;!r3;!r4;!r5]`, which would roughly double key length for a partition error
+confined to fused bicyclics. See docs/pitfalls.md, "RDKit and OpenBabel disagree on
+what `r<n>` means". Still open and filed alongside it: OpenBabel does not perceive
+macrocycles as rings at all, so ~3% of the 1338 keys with n>8 match nowhere on the
+mining side and yield an empty library from a job that runs to completion.
+
+- Decide whether `Frags.group_lig_sites_by_overlap` should use complete-linkage instead
+of single-linkage. It groups overlapping SMARTS matches with union-find, so grouping is
+transitive: A-B and B-C overlapping puts A and C in one group even when A and C share no
+atoms. Verified on `OCCOCCOCCOCCO` -- six matches of `[C;!R][O;!R][C;!R][C;!R][O;!R]`,
+spanning atoms 0-4 through 8-12, collapse into a single group.
+  The consequence is in hit finding, not generation: `hit_finder_core.py:560` uses the
+group's list index as `q_site_idx` and keeps one best hit per site, so two genuinely
+distinct binding sites on a polyether, a PEG chain or a polysaccharide are reported as
+one. Drug-like queries with few repeating units essentially never trigger it.
+  The fix is one condition -- require a new match to overlap *every* current member of a
+group rather than any one -- and the loop is already O(n^2), so it costs nothing. It is
+deferred because it changes what `q_site_idx` means for every query, not because it is
+hard: more sites means the one-best-hit-per-site dedup keeps more hits, so hit counts
+move everywhere.
+  How to decide: run hit finding on a polysaccharide or PEG-containing query and look at
+whether one hit for the whole chain is the answer you want. If your queries stay
+drug-like, leave it filed. Also filed in docs/pitfalls.md under Open bugs.
+- Benchmark an aromatic ring-size gate for hit finding before adding one. Fragment
+keys now carry ring size on saturated atoms (`[C;r5]`, `[C;r6]`) but leave aromatic
+atoms bare, so pyridine and pyrrole, pyrimidine and imidazole, pool in one bucket by
+design. Whether hit finding should separate them at query time is unmeasured. No
+per-record ring-size column exists; do the benchmark post hoc by classifying each nr
+vdG's `nr_cg_resname` against the CCD (aromatic keys resolve cleanly -- 98% of their
+components are single-context), and prototype the gate the same way before committing
+a format change. What to measure: on the pose-recovery benchmark, hit recall and
+false-positive rate with and without the gate, per fragment class -- azoles (imidazole
+vs pyrimidine, AA-profile divergence 2-3x the same-population null) and pyrrole vs
+pyridine (8-10x, but confounded: the r5 population is heme/chlorophyll, HEC 13% CLA 6%,
+and the r6 is nicotinamide). If the gate wins broadly, add `nr_cg_ring_size` per
+record in the next build and gate on it; if it wins only for azoles, gate per fragment
+class rather than globally.
+- Codify "chemically equivalent under model uncertainty" as a directed
+compatibility relation for hit finding. Half of this already exists and should not be
+rebuilt: `identify_mol_automorphisms` resonance-normalizes terminal N/O/S sets on a
+shared center, so a carboxylic acid's two oxygens are already interchangeable
+(verified: |Aut| = 2 for `[C;!R][C;!R](=[O;!R])[O;!R]`, and the ring annotation
+preserves it) while an amide's N and O correctly stay distinct (|Aut| = 1). Atom
+correspondence is therefore not the gap; *fragment reachability* is. The protonation case
+is handled structurally since 2026-09-05: hit finding matches the library's own keys
+against the query ligand, and the neutral key's charge-loose SMARTS matches the
+carboxylate, so no key resolution happens at all. What remains open is everything
+that does not cover -- H-count relaxation (NH2 -> NH) above all, and any case where
+the *library* key is the stricter of the two.
+  Recommendation: an explicit directed map,
+`query_key -> library_keys it may use`, built by relaxing a declared list of
+*model-uncertain* properties -- protonation state and H count, where the crystallographer's
+placement is often arbitrary -- while leaving properties that change the CG's own
+geometry as hard constraints. Ring context is the latter: 5- and 6-membered `ccncc`
+differ by 0.63 A in internal distances against a 0.18 A within-group spread, so
+relaxing it would reintroduce exactly the false positives the ring encoding was added
+to remove. Protonation and H count are the former: fragments are hydrogen-free, so
+those never change a stored coordinate at all.
+  Where the relaxation is not free, screen on the read path against the *query's* own
+atoms rather than narrowing the relation -- `hit_finder_core.backbone_slot_blockers` /
+`PRO_NH_DONOR_CUTOFF` is the working precedent. The case that needs it: an
+acid-derived vdG whose protein partner sits at H-bond distance as an acceptor requires
+the OH to donate, which a carboxylate query cannot do. NH -> NH2 and NH2 -> NH should
+both be allowed (an NH2 does not always donate bidentately), with the same screen
+catching the geometries that genuinely need the second donor.
+  Subsumes the two protonation items above rather than replacing them: they ask what
+to do, this proposes how.
+- Clustering spends most of its wall time spawning processes on fragments with many
+small buckets. Measured with compute profiling on `cP(=O)(O)O` (65 buckets, 284
+records): the `cluster` phase was 80 s wall and 0.10 s CPU in the parent, while the
+Stage-1 work across every bucket summed to 0.22 s. The pool uses the `spawn` context
+with `maxtasksperchild=1`, so each bucket costs a fresh interpreter. That is invisible
+on the large fragments the setting presumably exists for, but it dominates small ones
+and scales with bucket count. Find out what `maxtasksperchild=1` is guarding against
+(worker memory growth?) before changing it; batching buckets per task would also work.
+- figure out how we should treat icodes
+- Revisit the fragment-selection cutoff before the next library rebuild. Selection now
+thresholds on estimated CG *occurrences* (`--min-instances`, default 250) rather than
+on parent-structure or CCD-ligand counts: occurrences are the count of candidate vdG
+sites, and they come free from the same sampling pass as the cost estimate
+(`estimate_frag_cost.estimate_fragment_counts`).
+  The 250 is a judgement call, not a measured optimum. It was set just under tetrazole
+(`cnnnn`, 284 estimated occurrences), the cheapest fragment judged worth keeping, and
+it yields 734 fragments against the 849 the old `--min-structures 100` rule selected.
+Two known weaknesses:
+  (1) The estimate is quantised by the 3000-of-65600 sample (scale ~22), so near the
+cutoff a fragment is decided by a handful of sampled hits and can move with `--seed`.
+Raise `--sample-size` if the boundary matters more than the ~4 min the pass costs.
+  (2) Ring annotation splits one chemical fragment across several `r<n>` keys, so a
+per-key occurrence count is lower than the chemistry's true prevalence. Against the
+pre-ring 348-fragment set, 250 leaves ~100 old fragments uncovered, including every
+boronic acid (109-153 occurrences), `OC(F)(F)F` (197) and the aminopyrimidines
+(109-153). Decide whether those are genuinely rare or only split, ideally by counting
+over the *unannotated* form before thresholding.
+
+- AFTER THE PRODUCTION RUN: read the new `stage2.*` profile counters and decide whether
+the Stage-2 slot-permutation minimisation costs enough to be worth optimising. Stage 2
+now minimises the flank distance over the same-label slot orderings that Stage 1
+already quotients out (`align_and_cluster.get_leader_clusters(slot_orders=...)`), which
+fixes a real over-splitting bug: measured on synthetic modes with half their copies
+written slot-swapped, clustering recovered 20 modes as 41 clusters before the fix and
+exactly 20 after, with purity 1.00 in both cases -- so only the support counts
+(`cluster_size`, `cluster_num_parents`) were ever wrong, never the stored geometry.
+  What is NOT known is what it costs on real data. Synthetically it is ~2x on a
+same-label bucket in a non-merging regime and ~2.5x in a merging one (clusters come out
+twice as large, and `_exact_medoid` is quadratic in cluster size), and same-label
+buckets are ~9% of size-2 buckets holding ~9-12% of observations in the `cccnc` and
+`cnnnn` profile libraries, with `bb_bb` alone about 37% of the affected observations.
+That predicts a small total cost, but it was never measurable before: the profile
+recorded `stage1.stage1_wall_s` and nothing for Stage 2, leaving most of
+`cluster_and_deduplicate`'s wall time as an unattributed residual (for `cccnc`, 28,643 s
+of clustering wall against ~2,900 s wall-equivalent of Stage 1).
+  So `stage2.wall_s`, `stage2.same_label_wall_s`, `stage2.buckets`,
+`stage2.same_label_buckets` and `stage2.slot_orders_max` were added alongside the
+Stage-1 counters. After the run, compare `stage2.same_label_wall_s` against
+`stage2.wall_s` and `stage1.stage1_wall_s`. If the same-label share is small, this is
+settled and nothing needs doing. If it is large, the lever is `_EXACT_MEDOID_MAX`
+(currently 1000, and tied to `_RMSD_CACHE_MAXSIZE`) rather than the permutation
+minimisation itself, which is required for correctness.
+  Also worth checking from the same counters: whether Stage 2 is a large enough share of
+clustering overall to deserve the optimisation attention Stage 1 has had. Nobody has
+ever been able to answer that.
+
+- AFTER THE PRODUCTION RUN: decide whether Stage 1's neighbour graph needs CSR storage,
+and whether per-bucket cost needs a pre-flight log line. Both are deferred deliberately,
+because the failure they target has never been observed -- only inferred.
+  The observation is the phosphate `[O;!R]=[P;!R]([O;!R])([O;!R])[O;!R]` (22,151 est.
+structures, 24 CG automorphisms) sitting in `clus_and_deduplicate_vdgs` at 19.4 h
+without finishing. Note it was UNFINISHED, not killed, and the top resource tier already
+grants Wynton's 336 h maximum -- so wall time was never the binding constraint and no
+OOM was ever seen. The two candidate causes have different fixes and nobody has
+separated them.
+  `_stage1_neighbor_graph` accumulates `adj`/`adj_d` as Python lists, measured at 141 B
+per undirected edge (not the ~60 B a back-of-envelope gives: the int and float objects
+dominate, not the pointers). A CSR edge array of int32/int32/float32 would be ~24 B/edge,
+a ~6x reduction. That is worth doing IF memory is the failure, and dead weight if it is
+not.
+  The decisive numbers already exist in the profile: run the phosphate with
+`--profile-json` and compare `cluster.rss_peak_child_mb` against the per-slot `mem_free`,
+and `stage1.edges` against `stage1.exact`. High RSS => CSR. High `exact` with modest RSS
+=> the cost is `edges x len(perm_group)` Kabsch fits and CSR saves nothing; the lever is
+then the fingerprint prefilter (`cand = np.arange(i + 1, n)` is a full O(n) scan per row,
+and the fp constraints are scalar interval tests, so a sort + `searchsorted` window is
+available). That prefilter rewrite is exact only if the tolerance interval stays closed
+at the boundary, the `mask |= sub` over `res_orders` becomes a union of intervals, and
+the `j > i` upper-triangle constraint is re-imposed on the returned window; get any of
+those wrong and it silently drops true neighbours and over-splits the library, which
+raises nothing. Do not attempt it without the differential check in
+`tests/test_butina_clustering.py::ButinaGuaranteeTests::test_neighbour_graph_is_exactly_the_within_cutoff_graph`.
+  If CSR does get built: `NeighbourOrderTests` (added with this note) pins the invariant
+that makes it safe. Stage 2 is a leader algorithm reading Butina's member lists in
+order, so neighbour order decides the Stage-2 partition and the stored `cluster_size` /
+`cluster_num_parents`. `adj[x]` is currently ascending -- each node collects its
+lower-indexed neighbours in ascending order across flushes, then its own row's
+higher-indexed block -- so sorted-destination CSR is order-identical. Verified the tests
+catch a violation: reversing the append order inside `_flush` fails all three, while all
+16 pre-existing tests in that file still pass, since they compare the graph as a set and
+partitions as frozensets.
+  The pre-flight log (per-bucket record count and projected pair count before dispatch)
+is deliberately NOT a cap. `-m` is debug-only because it silently truncates; an aborting
+threshold would not corrupt the library but would not produce one either, and the goal
+is a complete run. Its only real use is feeding the resource tiers in
+`make_sge_scripts_for_frags.py`, which key on structure count while automorphism count
+moves wall time harder at the top end (phosphate vs. `cccnc`). Low priority until that
+table is revisited.
+
+- DEFERRED, decide at the next version: whether the CG element check's treatment of
+unpinned slots deserves an entry in `docs/pitfalls.md`. `clus_and_deduplicate_vdgs`
+validates a mined CG's elements against `--cg-smarts` position by position, and an
+OR/negation query atom (RDKit atomic number 0) leaves its own slot unconstrained, so at
+that position a wrong `--cg-match-dict-pkl` is no longer caught by anything. That is the
+residual narrowing left by removing the old per-worker `seen_elements` fallback, which
+made acceptance depend on how `--num-procs` partitioned the shards (regression test:
+`test_multi_subset_streaming.py::test_generic_smarts_slot_acceptance_is_chunk_independent`).
+  Deferred because it is unreachable from every production path, not because it is
+unimportant. All 6,144 annotated SMARTS in `database_frags_dict.pkl` are fully
+element-pinned, and `--include` cannot introduce a generic one: `select_fragments`
+resolves the requested SMARTS against the dict and raises on anything that does not
+match a key up to equivalent atom ordering (verified -- `[#7,#8]=[C;!R]([C;!R])[C;!R]`
+is rejected as absent), then writes the dict's own key into the job script rather than
+the string the caller typed. The only routes in are running `vdg_generation_wrapper.py
+--smarts` by hand, bypassing the scheduler, or adding a generic-atom key to the frags
+dict. Write the pitfalls entry if either becomes routine.
+
+- WHEN ADDING NEW LIGANDS: revisit the element filter in `fragment_database_ligs.py`.
+`UNDESIRED_ELEMENTS` is a denylist, so it cannot cover an element nobody enumerated --
+exactly the situation when the ligand source stops being the CCD. It already leaks:
+twelve elements in the current CCD are neither organic nor denylisted (Pu, Am, Cf, Cs,
+Rb, Sc, Sr, Ta, Th, Tl, Cm, Ac). Nothing is wrong in the shipped library only because
+all twelve happen to be bare ions (`[Cs+]`, `[Th+4]`, `F[Sc-](F)(F)F`, ...) that
+`Frags.is_organic` drops for having no carbon. That is luck, not design: `is_organic`
+is a carbon test, not a metal test, so any carbon-bearing complex of a non-denylisted
+element passes both filters and puts the metal straight into a fragment key. Verified
+by fragmenting synthetic organometallics at the production settings (bond radius 2,
+4-5 heavy atoms):
+    CCCC[Tl](CC)CC             -> [C;!R][Tl;!R]([C;!R])[C;!R]
+    CC(=O)O[Sc](OC(C)=O)OC(C)=O -> [O;!R][Sc;!R]([O;!R])[O;!R]
+    CCCCO[Cs]                  -> [C;!R][C;!R][C;!R][O;!R][Cs;!R]
+    CC(=O)O[Th](OC(C)=O)(OC(C)=O)OC(C)=O -> [O;!R][Th;!R]([O;!R])([O;!R])[O;!R]
+  A key like that is not merely useless: it would be selected, scheduled and mined like
+any other, and the vdGs under it describe metal coordination geometry mislabelled as an
+organic CG.
+  The fix is to invert the polarity -- allowlist the elements a druglike fragment may
+contain (C, N, O, S, P, F, Cl, Br, I, B; H is stripped before fragmentation) and reject
+everything else -- so a novel element fails closed instead of silently passing. Boron
+must stay allowed (boronic-acid warheads are deliberately mined; see the comment above
+`UNDESIRED_ELEMENTS`). Decide separately whether Se belongs in the allowlist:
+selenomethionine and selenocysteine are common in the database, are currently denylisted,
+and the aromatic form `[se]` parses.
+  Deferred because it changes fragmenter output, so it must not land between a library
+build and its consumers. Check when doing it: count how many ligands and fragments the
+allowlist drops relative to the denylist on the *new* ligand file, and confirm the
+difference is only the intended metals rather than a parsing artefact. Orthogonal to,
+and already handled by, `undesired_elements_in_dative_smiles`, which only reclassifies
+rows RDKit cannot parse at all and never reaches the fragmentation path.
+
+
+- remove cryoprotectants in the fragment_database_ligand stage
+
+
+- WHEN REBUILDING THE LIGAND FILE (novel non-CCD ligands): use that rebuild as the
+occasion to settle whether `fragment_database_ligs.py` can skip the permutation and
+site-grouping machinery. The script consumes only `substruct_site_groups[0][0][0]`, and
+only for its element string, but `Frags.get_fragments` still asks `manually_remove_Hs`
+for `'perms'`: `GetSubstructMatches(uniquify=False, maxMatches=1000)` plus a
+`Chem.Mol` deep copy and `RenumberAtoms` per permutation, then an O(n^2) union-find in
+`group_lig_sites_by_overlap`. All of it is discarded here. A `keys_only` path (an opt-in
+flag -- not a changed default, since the mining path genuinely needs the perms for CG
+atom correspondence) would skip the lot.
+  The check is a diff of the full pickle built both ways, and it must be a diff of
+`(bucket, key)` sets, *not* a `==` on the dicts: insertion order decides which of two
+degenerate keys becomes the recorded one (`record_frag` returns on the first equivalent
+key in bucket order), so an ordering-only difference is cosmetic while a membership
+difference is not. Deferred only because it was not worth a full-CCD run on its own;
+folded into a rebuild it is nearly free.
+  Do not treat "identical to the current output" as the pass condition -- the current
+output is not the ground truth here. Two perms-dependent paths in `manually_remove_Hs`
+*drop the fragment entirely*: the `_MAX_CG_ATOM_PERMS` cap and the
+`len(cg_atom_perms) == 0` fallthrough. Both exist to protect the mining path, where
+atom correspondence matters, and neither applies to a consumer that wants a key and an
+element string. So if the keys-only output is a strict superset, the extra fragments are
+ones the current build is losing for an irrelevant reason, and the shortcut is the more
+correct one. Now measured, and it is a no-op on the CCD: a full 48,709-row run
+(2026-09-06) with stdout captured has **zero** 'match cap' warnings, zero 'produced no
+whole-molecule atom mapping' warnings and zero ring-annotation drops, so neither
+perms-dependent drop path fires at `--max-frag-size 5` -- consistent with |Aut| for a
+4-5 heavy-atom fragment being bounded far below the 1000 cap. So on the CCD the diff
+should come back identical and the change is pure speed. Re-run the same grep on the
+novel ligand file rather than assuming it carries over: that is the case that could
+introduce a fragment symmetric enough to hit the cap, and it is the whole reason to do
+this at rebuild time.
+  Speed context: at the larger `--max-frag-size` a novel-ligand set may want, |Aut| grows
+and the perms work grows with it, so this is worth more then than it is now. The wins
+already taken (shared parent ring queries, size filter pushed into `fragment_on_bond_d`,
+precompiled regexes, `--nproc`) are output-identical and independent of this question.
+
+- FROM THE 2026-09-06 PRODUCTION RUN (671/673 fragments complete, library validated):
+  (1) `preprocessing/_prep_filters.py` did not catch the prepwizard orphan-backbone-N
+  artifact: 53 biounits still ship a ligand residue with two atoms named N (the orphan
+  re-emitted as an ammonium with a ligand's resname/chain/resnum, e.g. 2y1x SAH A:1001,
+  the two N's 54 A apart). Cost ~461 dropped environments. Fix before the rebuild.
+  (2) Resources in `make_sge_scripts_for_frags.py` are wrong at the top end. `mem_free=4G`
+  against observed maxvmem 18-48 G, and h_rt (28 h) is far too short for high-automorphism
+  phosphates: all three surviving jobs cleared 248/250 buckets and were left grinding on
+  `bb`/`bb_bb` alone, which are ~83% of clustering wall. Since there is **no resume or
+  skip-existing logic**, an h_rt kill discards the whole run. Add resume, or size the
+  tiers on automorphism count as the note above already flags.
+  (3) The remaining 32 `no_atomgroup` skips are genuine OpenBabel bond mis-perception
+  (verified 4tt5 36Y: invented C6-C4 at 2.62 A). Nothing to fix; the guard works. Its
+  misleading log message was fixed 2026-09-07.
+
+- FROM THE 2026-09-07 REBUILD VALIDATION (372/434 fragments complete at time of check;
+  62 still running, 0 crashed). The library itself is sound: a full sweep of every
+  bucket at both subset sizes found **zero** invariant violations (aa_bucket_parts vs
+  filename and subset size, resnames vs slot label, unique cluster_id, mem_cluster_id
+  subset of cluster_id, cluster_size == 1 + members, 1 <= num_parents <= cluster_size,
+  finite coords, coord shapes vs SMARTS atom count, automorphism rows distinct valid
+  permutations, cg_symmetry SMARTS vs dir name, parent PDB resolution), npz counts
+  reconcile exactly with every fragment's log line, and no skip counter other than
+  `no_atomgroup` is nonzero anywhere. Chemistry is right (sulfate -> ARG/bb/LYS/SER/
+  THR/HIS; CF3 -> LEU/ILE/bb/VAL/PHE/MET). Wall times median 5 min, max 24 min, so
+  h_rt is not a concern at this size distribution. Two things need a decision:
+
+  (1) **`_cg_atoms_are_bonded` cannot see an invented long bond.** THE REAL ONE.
+  The guard in `clus_and_deduplicate_vdgs.py` rejects a CG whose *max nearest-neighbour*
+  distance exceeds `MAX_CG_BOND_DIST` (2.5 A). That is order-independent, so it catches
+  an atom set scattered in space but not one that is spatially compact while its SMARTS
+  bonds run through pairs that are not bonded. Verified on `4xna`/B3K, fragment
+  `[N;!R][C;!R][C;!R][C;!R][O;!R]`: the stored row's SMARTS-bonded distances are
+  [2.53, 1.53, 2.54, 1.23] A, while the deposited residue's max nearest-neighbour
+  distance is 1.53 A and it has only one copy. OpenBabel perceived a bond across a 1-3
+  (geminal) pair, so the match walks N-CA-CB-C-O on a molecule bonded N-CB-CA-C-O.
+  Scale, from an element-aware audit (window 0.70-1.35 x sum of covalent radii) over
+  2,204,375 nr rows: **831 rows affected (3.8e-4), 74/341 fragments, ~30 distinct
+  deposited ligands**; of those, **488 are long bonds** (2.0-2.7 A) and this is the
+  mechanism. Concentrated in beta-amino acids (B3M/B3K/B3N in 6spn, 8brx, 4xna) plus
+  7wdb/7OC, 2osm/HTS, 2c3p/1TP.
+    Why it matters beyond the count: the row carries real coordinates but a CG atom
+  *ordering* that contradicts the SMARTS topology, and every downstream comparison
+  indexes the automorphism group by SMARTS-slot order (see CLAUDE.md). Nothing
+  downstream can detect it. Fix is to check the SMARTS-bonded pairs directly instead of
+  (or in addition to) nearest-neighbour distance. Cheap, and it belongs in the same pass.
+    Note the SMARTS-slot-order assumption itself is fine: for the same fragment 5438 of
+  5492 rows are clean, so this is a per-record perception failure, not a systematic
+  ordering bug.
+
+  (2) **The other 544 rows are short bonds, and they are deposited-geometry errors, not
+  a pipeline defect.** Verified against the raw PDB: `7y9l`/6VP has NAA-CAE = 0.68 A in
+  the deposited file; `1xds`/DRA O13-C37 = 1.02 A; `1a47`/ADH has N1 isolated at 2.30 A.
+  The pipeline is faithfully reproducing what was deposited. Decide whether the library
+  should carry them -- nothing currently rejects a chemically impossible bond length on
+  the short side, and unlike (1) these rows are correctly ordered, just badly modelled.
+  A minimum-bond-length screen would be the symmetric partner to the fix in (1).
+
+  Already fixed on 2026-09-07, recorded so nobody re-derives them:
+   - The `smarts_to_cgs.py` log line "N instances of SMARTS interacting with protein"
+     was wrong (no interaction filter is applied; the two differ by ~5x on some
+     fragments). Reworded, but only future runs get the new text -- the 372 completed
+     logs keep the old line.
+   - `_log_warn_capped` claimed "the end-of-streaming counters carry the true total"
+     while several keys reached no counter at all: `vdm_not_in_contact` and
+     `vdm_all_hydrogen` `continue` past one residue rather than dropping the
+     environment, and the rest collapsed into `no_atomgroup`. `_stream_one_chunk` now
+     returns per-key warning deltas and they are logged separately from the skip
+     counts (test: test_warning_counts_returned_are_per_chunk_deltas).
+   - The comment justifying the 4.5 A CG-vdM contact cutoff claimed such pairs "reach
+     25 A in the current library". They do not: `mine_environments` credits a residue
+     to a CG site only on a probe contact with an atom of that site (`cg_idx > 0`).
+     All 1261 observed drops are 4.5-4.9 A, ~85% because the probe contact is
+     hydrogen-mediated (incl-H median 3.44 A) and ~15% from overlapping SMARTS sites
+     sharing a contacted atom. Comment rewritten with the measurements.
+
+
+- BLOCKING-ISH FOR THE IMMINENT RUN (fragmenter): whole-ring fragments are recorded as
+several keys, one per cyclic rotation of the cut path, because dedup
+(`fragment_query_mols_equivalent`) compares the keys as OPEN CHAINS and `CCCCN` /
+`CCCNC` / `CCNCC` are genuinely different chains. When every atom of a key is `r<n>`
+and `len(atoms) == n`, the key IS the whole ring and all rotations+reversals are the
+same CG. Verified two ways: 11 such classes / 32 keys in the shipped
+`database_frags_dict.pkl`, and all three pyrrolidine rotations match the IDENTICAL
+atom set on both `C1CCNC1` and `OC(=O)C1CCCN1` (RDKit; a linear n-atom SMARTS over an
+n-ring must walk the whole ring on either engine, and OpenBabel additionally re-filters
+through `match_satisfies_ring_sizes`, which only narrows).
+    Not cosmetic at production scale: against `frag_cost_estimate.tsv`, 6 of these
+classes have >=2 rotations clearing `--min-instances 250`, i.e. **12 redundant jobs**,
+and the split is near-even so it is not one dominant key plus noise --
+THF `CCCCO` 43698/42778/42027, pyrrolidine `CCCCN` 24272/21440/17159, then
+`CCNCN` 1796/1689/945, `CCNCS` 1251/1176/428/426, `CCCCS` 494/476/458, `CCOCO` 426/336.
+Each rotation mines the same vdGs into its own directory, so the statistics for one
+chemical group are fragmented across 3 libraries and hit finding returns 3 hits for one
+site. The CCD ligand counts split arbitrarily too (1061/554/171 for pyrrolidine), only
+because not every parent emits every rotation -- so any count-based threshold on these
+keys is arbitrary.
+    Fix: canonicalize whole-ring keys over cyclic rotation + reversal before insertion.
+Aromatic rings cannot be fixed the same way and should be left alone -- aromatic atoms
+carry no ring-size primitive by design (`Frags.ring_query_for_atom`), so `cccnc` is
+indistinguishable from a genuine 5-atom path through a 6-ring.
+
+- BEFORE THE REBUILD, fragmenter fixes:
+  (1) `fragment_database_ligs.py` uses `mp.Pool` + `imap`, which HANGS FOREVER if a
+  worker dies abruptly (verified: one row monkeypatched to `os._exit(1)` wedged the run
+  with no error, no exit, no log). On SGE that silently burns the whole h_rt. Same
+  CPython issue already avoided in `estimate_frag_cost.py` by using
+  `ProcessPoolExecutor`; do the same here.
+  (2) The output pickle is written in place, so a mid-write kill leaves a truncated file
+  at the canonical path which then *blocks* every rerun via the `FileExistsError` guard
+  while looking like finished output. dump to `.tmp` + `os.replace`.
+  (3) `run_fragment_database_ligs.qsub` ships `--outdir resources`, but
+  `resources/database_frags_dict.pkl` already exists, so the guard aborts the job in <1 s.
+  Move the old dict aside first -- it fails loudly, but it looks like a broken script.
+  (4) An unexpected exception from one row propagates out of `imap` and kills the run
+  before `report_stats` writes the log, so a failure leaves no artifact at all.
+
+- BEFORE THE REBUILD, cost-estimate provenance (`estimate_frag_cost` /
+`make_sge_scripts_for_frags`). The TSV header records `pdb_dir`, `sample_size` and
+`seed`, but the consumer reads back only `frags_dict_sha256`, `max_size` and
+`sample_scale` -- **nothing verifies the mirror**. That matters now specifically because
+the trim radius is going 10 -> 20 A: the shipped `resources/frag_cost_estimate.tsv`
+records `pdb_dir /wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2`
+(sample_size 40000, scale 1.64), and its `frags_dict_sha256` DOES match the current dict
+(d04d5ffd...), so after the mirror is rebuilt this file will still pass every check the
+consumer makes and silently drive both selection and every resource tier off the old
+10 A mirror. Verify `pdb_dir` too, and decide whether a mismatch should raise.
+  Related asymmetry to settle at the same time: a `frags_dict_sha256` mismatch only
+warns (`make_sge_scripts_for_frags.py:411`) while the equivalent provenance conflict on
+the `--include-only` path raises `SystemExit` (:237). One warning among thousands of
+lines of rebuild output is not a guard.
+  (Already fixed 2026-09-07: `estimate_fragment_counts` now clears `_LAST_SAMPLE_SCALE`
+on entry -- the empty-fragment-list early return left the module global holding the
+PREVIOUS pass's scale, which the consumer reads at :435.)
+
+- MINOR, fragment selection (`extract_fragment_smiles.py`), none blocking:
+  (1) :234/:236 -- the size and solvent-artifact drops are the only two paths that
+  remove a fragment without a counter or a message, unlike the unparseable branch.
+  0/6144 fire at `--max-size 5` today, so a nonzero drop at rebuild time would be
+  invisible.
+  (2) :446 -- the portable work-list path writes `<output stem>_aliases.tsv`, but the
+  reader (`vdg_npz_utils.FRAGMENT_ALIASES_FILENAME`) only ever looks for
+  `<vdg_lib_dir>/fragment_aliases.tsv`. The SGE path (:485 of make_sge) writes the
+  canonical name and is fine; only the non-SGE path produces a file nothing reads.
+  (3) :141 -- `charge_normalized_fragment` silently declines to normalize if the charge
+  falls after the first `;` (`[O;!R;-]`) or an atom map follows it (`[N+:1]`). Frags
+  emits charge-first today so this is latent, but the failure is exactly the silent
+  double-mining the docstring warns about; assert no bracket still holds `+`/`-`.
+  (4) :269 -- "a donor and an acceptor stay split" is false as written: `cc(c)[n+]`
+  pools onto `cc(c)n`, `CC(=O)[O-]` onto `CC(=O)O`. Defensible (the neutral SMARTS
+  mines both) but misleading when auditing bucket composition.
+  (5) :117 -- "Verified on 13 alias/representative pairs" is stale; the current dict
+  yields 491, and the superset property was re-verified on all 491 with 0 failures.
+  (6) :203 -- `len(members) > 1 and key in members`: `key in members` is always true,
+  so the `else` branch only runs for singletons. Dead clause hiding the real invariant.
+
+- Either delete `_has_deliberate_charge_assignment` or lower the threshold that would
+make it reachable. The carve-out (four or more single-bonded terminal atoms of one
+element with non-uniform charges) fires on exactly one fragment in the whole dictionary,
+`[O-]S([O-])([O-])O`, which has 3 ligands -- below `--min-instances` (250), so
+`select_fragments()` filters it out before any vdG generation runs and hit finding reads
+the stored group from `cg_symmetry.npz` rather than re-deriving it. The function is not
+dead code (`_find_resonance_terminal_groups` calls it on every fragment's automorphism
+computation); it is the `True` branch that no production run has ever exercised. See
+docs/symmetry_edge_cases.md #1, and the two standing prohibitions any symmetry work
+must respect (keep improper permutations; never rely on stored CG atom order) in
+docs/pitfalls.md under Caveats.
