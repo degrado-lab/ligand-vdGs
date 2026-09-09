@@ -354,11 +354,6 @@ vdGs inside it, one directory per cluster, and requires `--top-clusters` or
 `--reps` caps how many structures are written per cluster **including the nr vdG**,
 so `--reps 20` is the nr vdG plus 19 randomly sampled members.
 
-Cluster IDs are unique only within one npz, so `--clusters` — and members mode, which is
-always about specific clusters — requires `--aa-buckets` and `--subset-sizes` to name
-exactly one value each. Flags belonging to the mode that is not in effect are rejected
-rather than ignored.
-
 ### Output file names
 
 Names are built by joining fields with a **single `_`**, so they can be parsed

@@ -45,7 +45,7 @@ from ligand_vdgs.generate_vdgs.estimate_frag_cost import (
     read_estimate_header, sampling_upper_bound, _LAST_SAMPLE_SCALE)
 
 
-# Slot/wall-time tiers, keyed by the number of mirror structures a fragment
+# Slot/wall-time tiers, keyed by the number of structures a fragment
 # occurs in (the first return of estimate_frag_cost.estimate_fragment_counts).
 # Validated against a
 # real 317-fragment build: this predictor reaches log-log correlation 0.63 with
@@ -198,6 +198,11 @@ def _selection_inputs(args):
 def write_provenance(vdg_lib_dir, args):
     record = _selection_inputs(args)
     record['min_instances'] = args.min_instances      # recorded, not compared
+    # Also recorded, not compared: the parent db is machine-local, so a top-up run
+    # elsewhere legitimately differs. Buckets store this per file too; here it is
+    # one editable place saying what the library was built against, for a copy
+    # whose reader must point $PARENT_PDBS_DIR somewhere local.
+    record['parent_pdb_dir'] = os.path.abspath(args.pdb_dir)
     os.makedirs(vdg_lib_dir, exist_ok=True)
     # Written via a temp file: a crash mid-dump would otherwise leave truncated
     # JSON that makes every later check_provenance raise on json.load, which
@@ -267,15 +272,7 @@ def parse_args():
     parser.add_argument('--min-instances', default=250, type=int,
                         help="Min candidate vdG sites for a fragment to be built: CG "
                              "occurrences, i.e. SMARTS matches summed over every ligand "
-                             "copy in the mirror, counted on the fly from a sample of "
-                             "--pdb-dir. Not CCD ligand counts, which measure how many "
-                             "drawings contain the fragment rather than how many vdGs "
-                             "it can yield. Default: 250. For scale, measured on a "
-                             "65600-structure mirror with the current 5713-candidate "
-                             "dict: 50 -> 1383 fragments, 100 -> 1103, 250 -> 734, "
-                             "300 -> 683, 500 -> 551. The default is set just under "
-                             "tetrazole (284 occurrences), which is the cheapest "
-                             "pharmacophore worth keeping; see docs/TODO.")
+                             "copy in the parent PDB db. Default: 250.")
     parser.add_argument('--max-size', default=5, type=int,
                         help="Max fragment heavy-atom count. Default: 5.")
     parser.add_argument('--sge-out-dir',
@@ -317,7 +314,7 @@ def parse_args():
                              "fragment. Omit to compute it inline from --pdb-dir, which "
                              "is the default: ~1 min for 5713 fragments over a "
                              "3000-structure sample at 16 procs, and it keeps a build "
-                             "dependent on nothing but the mirror and the fragment dict.")
+                             "dependent on nothing but the parent db and the fragment dict.")
     parser.add_argument('--sample-size', default=DEFAULT_SAMPLE_SIZE, type=int,
                         help="Structures sampled when estimating cost inline. "
                              f"Default: {DEFAULT_SAMPLE_SIZE}.")
@@ -360,7 +357,7 @@ def main():
     # These are interpolated into every generated script (--log-dir also into
     # `#$ -o`), so a missing one fails at qsub time across all ~850 jobs rather
     # than here. --pdb-dir additionally drives fragment *selection* via the
-    # inline cost estimate, so a wrong-but-existing mirror silently changes
+    # inline cost estimate, so a wrong-but-existing parent db silently changes
     # which fragments get built -- validate its existence at minimum.
     for path, flag in [(args.log_dir, '--log-dir'), (args.pdb_dir, '--pdb-dir'),
                        (args.probe_dir, '--probe-dir')]:

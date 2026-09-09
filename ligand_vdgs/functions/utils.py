@@ -477,7 +477,7 @@ def aromatic_h_constrained_atoms(fragment):
     SMARTS carries no H constraint, but ``[nH]`` demands exactly one, and the
     structures being mined are protonated by prepwizard rather than by the
     depositor. A query that names the tautomer therefore silently keeps only the
-    ligands modeled in it -- measured over the mirror, ``c1nnn[nH]1`` finds 7% of
+    ligands modeled in it -- measured over the database, ``c1nnn[nH]1`` finds 7% of
     the tetrazoles ``cnnnn`` does and ``c1cnc[nH]1`` 15% of the imidazoles.
 
     Fragment keys written by ``fragment_database_ligs.py`` never carry an H count,

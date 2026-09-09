@@ -87,7 +87,7 @@ def _log_warn_capped(logfile, key, msg, cap=_WARN_CAP):
 
     These fire once per environment, and every one takes an exclusive flock on a
     single logfile on NFS. Under a systematic failure -- wrong --pdb-dir, a
-    mismatched match dict, a mirror that stopped resolving -- that is one
+    mismatched match dict, a parent db that stopped resolving -- that is one
     serialized network write per environment across every worker, which turns a
     fast failure into a multi-GB log and a run that never finishes. The
     suppressed warnings are not lost information: _stream_one_chunk returns the
@@ -498,13 +498,13 @@ def _write_bucket_npz(vdglib_dir, size_subset, reordered_AAs, clusters):
         "nr_cg_coords": np.empty((C, n_cg, 3), dtype=np.float32),
         "nr_vdm_bb_coords": np.empty((C, num_vdms, 3, 3), dtype=np.float32),
         # Parent structures are stored as the biounit stem ("1f8s", or "1f8s_1"
-        # when the mirror carries assembly suffixes), not the absolute path:
+        # when the database carries assembly suffixes), not the absolute path:
         # the path is identical for every record in a library, so storing it in
         # full made two arrays ~80% of the bytes np.load pulls into memory.
         # `parent_pdb_dir` below records the directory once per file so a bucket
         # stays self-describing; readers rebuild the path with
         # vdg_npz_utils.resolve_parent_pdb_path, which takes an override so a
-        # relocated PDB mirror (e.g. a collaborator's copy) still resolves.
+        # relocated PDB database (e.g. a collaborator's copy) still resolves.
         "parent_pdb_dir": np.asarray(str(parent_pdb_dir or ""), dtype="U512"),
         "nr_parent_biounit": np.empty(C, dtype="U16"),
         "nr_scrr_seg": np.empty((C, num_vdms), dtype="U8"),
@@ -636,7 +636,7 @@ def _write_bucket_npz(vdglib_dir, size_subset, reordered_AAs, clusters):
     arrays["cg_elements"][:] = np.asarray(resolved_elements, dtype="U2")
 
     # Fixed-width assignment truncates silently in numpy. A clipped biounit stem
-    # or mirror path makes resolve_parent_pdb_path fail for every row in the
+    # or database path makes resolve_parent_pdb_path fail for every row in the
     # bucket, and nothing downstream can tell a clipped value from a real one.
     for _name in ("nr_parent_biounit", "mem_parent_biounit"):
         _arr = arrays.get(_name)
@@ -1717,7 +1717,7 @@ def main():
             # Nothing streamed at all. This is never a normal outcome for a
             # fragment that cleared the selection threshold, and every cause is
             # a configuration or I/O problem rather than a property of the
-            # chemistry: a wrong -P/--pdb-dir, an unreadable mirror, a mismatched
+            # chemistry: a wrong -P/--pdb-dir, an unreadable parent db, a mismatched
             # --cg-match-dict-pkl, or every environment failing to build.
             if stream_skips.get("cg_elements_mismatch") and not any(
                     n for r, n in stream_skips.items() if r != "cg_elements_mismatch"):

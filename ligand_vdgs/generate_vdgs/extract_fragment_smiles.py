@@ -12,10 +12,10 @@ vdG sites for them (SMARTS matches summed over every ligand copy, not structures
 and not CCD entries), they contain no more than --max-size heavy atoms, and they
 are not crystallographic solvent artifacts. The count is measured on the fly by
 sampling --pdb-dir rather than read from a stored table, so a work list depends on
-nothing but the mirror and the fragment dict. These are the same thresholds and
+nothing but the pdb parent db and the fragment dict. These are the same thresholds and
 selection rule used by make_sge_scripts_for_frags.py.
 
-Usage (--pdb-dir is required: the counts are sampled from the mirror):
+Usage (--pdb-dir is required: the counts are sampled from the parent db):
     python ligand_vdgs/generate_vdgs/extract_fragment_smiles.py \
         --pdb-dir <path/to/pdb_database/>
     python ligand_vdgs/generate_vdgs/extract_fragment_smiles.py \
@@ -79,11 +79,11 @@ def parse_args():
                         help="Path to write the one-column work list. "
                              "Default: resources/fragment_work_list.txt.")
     parser.add_argument('--pdb-dir', required=True,
-                        help="Parent PDB mirror, sampled to count how many CG sites "
+                        help="Parent PDB database, sampled to count how many CG sites "
                              "each fragment has in it.")
     parser.add_argument('--min-instances', default=250, type=int,
                         help="Min candidate vdG sites (CG occurrences: SMARTS matches "
-                             "summed over every ligand copy in the mirror) for a "
+                             "summed over every ligand copy in the database) for a "
                              "fragment to qualify. Default: 250. See "
                              "make_sge_scripts_for_frags.py for the measured "
                              "fragment-count-vs-threshold table.")

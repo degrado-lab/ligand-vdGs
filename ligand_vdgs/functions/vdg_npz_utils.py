@@ -69,7 +69,7 @@ def _append_full_ligand_from_parent(all_coords, names, resnames, resnums, chids,
     """Add non-CG ligand atoms from parent PDB, mapped into cg_coords frame.
 
     ``pdb`` is the already-parsed parent (the caller parses it once and shares it
-    with _append_backbone_carbonyls); ``parent_pdb_path`` is kept for messages.
+    with _append_vdm_parent_atoms).
 
     They are marked NONCG_LIGAND_OCC, which sits below the CG band (see the
     occupancy protocol in vdg_struct_utils) -- not above it, where a reader
@@ -182,26 +182,68 @@ def _append_full_ligand_from_parent(all_coords, names, resnames, resnums, chids,
 
 # A backbone triplet re-selected from its own parent should superpose exactly on
 # the stored one. Anything above this is a mismatched structure, not noise.
-_CARBONYL_FIT_TOLERANCE = 0.1   # Angstrom
+_VDM_FIT_TOLERANCE = 0.1   # Angstrom
+
+# Not sidechain: the stored triplet, the carbonyl (its own flag), and OXT.
+_NON_SIDECHAIN_NAMES = frozenset(("N", "CA", "C", "O", "OXT"))
 
 
-def _append_backbone_carbonyls(all_coords, names, resnames, resnums, chids, segnames,
+def _atom_element(atom, name):
+    """Element of a parent atom, falling back to the atom name when the PDB's
+    element column is blank."""
+    elem = str(atom.getElement() or "").strip()
+    return elem if elem else (name.lstrip("0123456789")[:1].upper() or "C")
+
+
+def _sidechain_atoms(struct, seg, chain, resnum):
+    """Heavy sidechain atoms of one residue, at most one per atom name.
+
+    Resolved name by name through ``_select_one_atom`` rather than as one
+    selection, so altlocs go through the same occupancy/altloc tie-break the rest
+    of the pipeline uses. 
+    """
+    seg_s = "" if seg in (None, "", "None") else str(seg)
+    seg_clause = f"segment {seg_s} and " if seg_s else ""
+    sel = struct.select(f"{seg_clause}chain {chain} and "
+                        f"resnum {_resnum_selstr(int(resnum))}")
+    if sel is None:
+        return []
+    wanted = []
+    for raw_name, raw_elem in zip(sel.getNames(), sel.getElements()):
+        name = str(raw_name).strip()
+        if name in _NON_SIDECHAIN_NAMES or name in wanted:
+            continue
+        elem = str(raw_elem or "").strip() or name.lstrip("0123456789")[:1]
+        if elem.upper() in ("H", "D"):
+            continue
+        wanted.append(name)
+    atoms = []
+    for name in wanted:
+        atom = _select_one_atom(struct, seg, chain, resnum, name)
+        if atom is not None:
+            atoms.append((name, atom))
+    return atoms
+
+
+def _append_vdm_parent_atoms(all_coords, names, resnames, resnums, chids, segnames,
     elements, occupancies, parent_pdb_path, vdm_bb_coords, scrr_seg, scrr_chain,
-    scrr_resnum, scrr_resname, struct):
-    """Add each vdM's backbone carbonyl O, re-derived from the parent PDB.
+    scrr_resnum, scrr_resname, struct, include_carbonyl=False,
+    include_sidechain=False):
+    """Add each vdM's backbone carbonyl O and/or its sidechain, re-derived from
+    the parent PDB.
 
     ``struct`` is the already-parsed parent, shared with
     _append_full_ligand_from_parent so the biounit is read once per vdG.
 
     The npz stores N/CA/C only, deliberately: those three atoms are what the
-    hit-finding RMSD is computed over, and storing O would invite the reading
-    that it took part. The O is recovered here instead by superposing the
-    parent residue's own N/CA/C onto the stored triplet and carrying its O
-    through the same transform -- so this is a *display* atom, added at write
-    time, and nothing about the library or the matching changes.
+    hit-finding RMSD is computed over. The extra atoms are recovered here.
     """
+    if not (include_carbonyl or include_sidechain):
+        return
+    what = " and ".join([w for w, on in (("carbonyl O", include_carbonyl),
+                                         ("sidechain", include_sidechain)) if on])
     if not parent_pdb_path:
-        print("[WARNING] backbone carbonyls requested without a parent PDB; skipping.")
+        print(f"[WARNING] vdM {what} requested without a parent PDB; skipping.")
         return
     if struct is None:
         return
@@ -218,48 +260,66 @@ def _append_backbone_carbonyls(all_coords, names, resnames, resnums, chids, segn
                 missing = True
                 break
             parent[a] = np.asarray(atom.getCoords()).reshape(3)
-        oxygen = None if missing else _select_one_atom(struct, seg, ch, resnum, "O")
-        if missing or oxygen is None:
-            print(f"[WARNING] carbonyl O of vdM slot {v_idx} (chain {ch}, "
-                  f"resnum {resnum}) not resolvable in {parent_pdb_path}; skipping it.")
+        if missing:
+            print(f"[WARNING] backbone of vdM slot {v_idx} (chain {ch}, resnum "
+                  f"{resnum}) not resolvable in {parent_pdb_path}; skipping its "
+                  f"{what}.")
             continue
         # utils.kabsch returns R, t under Y ~= X @ R + t, so the parent frame is
         # X and the stored frame is Y. Applying R.T here would be a silent,
         # plausible-looking bug. Y must be batched, hence the [None].
         R, t, ssd = utils.kabsch(parent, vdm_bb_coords[v_idx][None])
-        # The same three atoms of the same residue in two frames should fit
-        # exactly. A real residual means the parent PDB is not the structure this
-        # vdG came from, and the rotation would then place O somewhere arbitrary.
+        # N/CA/C must align perfectly - otherwise, it's not the correct PDB.
         rmsd = float(np.sqrt(max(float(ssd[0]), 0.0) / 3.0))
-        if rmsd > _CARBONYL_FIT_TOLERANCE:
+        if rmsd > _VDM_FIT_TOLERANCE:
             print(f"[WARNING] vdM slot {v_idx} (chain {ch}, resnum {resnum}) backbone "
                   f"does not match {parent_pdb_path} (fit RMSD {rmsd:.2f} A); "
-                  "skipping its carbonyl O.")
+                  f"skipping its {what}.")
             continue
-        o_coord = np.asarray(oxygen.getCoords()).reshape(1, 3) @ R[0] + t[0]
 
-        all_coords.append(o_coord.reshape(3))
-        names.append("O")
-        resnames.append(resname)
-        resnums.append(resnum)
-        chids.append("" if ch in (None, "None") else str(ch))
-        segnames.append("" if seg in (None, "", "None") else str(seg))
-        elements.append("O")
-        occupancies.append(VDM_OCC)
+        extras = []
+        if include_carbonyl:
+            oxygen = _select_one_atom(struct, seg, ch, resnum, "O")
+            if oxygen is None:
+                print(f"[WARNING] carbonyl O of vdM slot {v_idx} (chain {ch}, "
+                      f"resnum {resnum}) not resolvable in {parent_pdb_path}; "
+                      "skipping it.")
+            else:
+                extras.append(("O", oxygen))
+        if include_sidechain:
+            sidechain = _sidechain_atoms(struct, seg, ch, resnum)
+            # GLY has no sidechain; anything else that has none is a stripped or
+            # mismatched residue worth naming.
+            if not sidechain and resname != "GLY":
+                print(f"[WARNING] no sidechain heavy atoms for vdM slot {v_idx} "
+                      f"({resname} chain {ch}, resnum {resnum}) in "
+                      f"{parent_pdb_path}.")
+            extras.extend(sidechain)
+
+        for name, atom in extras:
+            coord = np.asarray(atom.getCoords()).reshape(1, 3) @ R[0] + t[0]
+            all_coords.append(coord.reshape(3))
+            names.append(name)
+            resnames.append(resname)
+            resnums.append(resnum)
+            chids.append("" if ch in (None, "None") else str(ch))
+            segnames.append("" if seg in (None, "", "None") else str(seg))
+            elements.append(_atom_element(atom, name))
+            occupancies.append(VDM_OCC)
 
 
 def build_vdg_atomgroup_from_npz(cg_coords, cg_names, cg_elements, cg_seg, cg_chain,
     cg_resnum, cg_resname, vdm_bb_coords, scrr_seg, scrr_chain, scrr_resnum, scrr_resname,
     include_full_ligand=False, parent_pdb_path=None, include_backbone_carbonyl=False,
-    parent_struct=None,):
+    include_sidechain=False, parent_struct=None,):
     """Materialize a vdG AtomGroup from the nr vdG arrays.
 
-    CG plus vdM backbone N/CA/C always; optionally the rest of the ligand, and
-    optionally each vdM's backbone carbonyl O. Both extras come from the parent
-    PDB -- neither is stored in the npz -- and both read the *same* biounit, so
-    it is parsed once here and shared (parsing dominates on a network
-    filesystem). ``parent_struct`` lets a caller that has already parsed it (a
-    member loop that just called ``rederive_member_coords``) skip even that.
+    CG plus vdM backbone N/CA/C always; optionally the rest of the ligand, each
+    vdM's backbone carbonyl O, and each vdM's sidechain. All three extras come
+    from the parent PDB -- none is stored in the npz -- so re-derive here.
+
+    The returned fit block is CG + N/CA/C regardless of the extras: they are
+    display atoms and never enter an alignment.
     """
     cg_coords, vdm_bb_coords = np.asarray(cg_coords, float), np.asarray(vdm_bb_coords, float)
     n_cg, num_vdms = cg_coords.shape[0], vdm_bb_coords.shape[0]
@@ -289,7 +349,7 @@ def build_vdg_atomgroup_from_npz(cg_coords, cg_names, cg_elements, cg_seg, cg_ch
     # adds nothing), so a bad parent PDB degrades the same way it did when they
     # parsed it themselves.
     if parent_struct is None and parent_pdb_path and (
-            include_full_ligand or include_backbone_carbonyl):
+            include_full_ligand or include_backbone_carbonyl or include_sidechain):
         parent_struct = parse_pdb_or_none(
             parent_pdb_path, "no parent-derived atoms are added")
 
@@ -321,10 +381,12 @@ def build_vdg_atomgroup_from_npz(cg_coords, cg_names, cg_elements, cg_seg, cg_ch
             elements.append(a_elem)
             occupancies.append(VDM_OCC)
 
-    if include_backbone_carbonyl:
-        _append_backbone_carbonyls(all_coords, names, resnames, resnums, chids,
+    if include_backbone_carbonyl or include_sidechain:
+        _append_vdm_parent_atoms(all_coords, names, resnames, resnums, chids,
             segnames, elements, occupancies, parent_pdb_path, vdm_bb_coords,
-            scrr_seg, scrr_chain, scrr_resnum, scrr_resname, parent_struct)
+            scrr_seg, scrr_chain, scrr_resnum, scrr_resname, parent_struct,
+            include_carbonyl=include_backbone_carbonyl,
+            include_sidechain=include_sidechain)
 
     all_coords = np.asarray(all_coords, float)
     ag = pr.AtomGroup("vdg_nr")
@@ -346,7 +408,7 @@ NR_FIELDS = ("cg_coords", "cg_names", "cg_seg", "cg_chain",
 
 
 def nr_build_kwargs(data, idx, include_full_ligand=False, pdb_dir=None,
-                          include_backbone_carbonyl=False):
+                          include_backbone_carbonyl=False, include_sidechain=False):
     """kwargs for ``build_vdg_atomgroup_from_npz`` from nr vdG ``idx`` of a bucket.
 
     Just unwraps the ``nr_``-prefixed columns; the scrr_* arrays come back in
@@ -355,30 +417,180 @@ def nr_build_kwargs(data, idx, include_full_ligand=False, pdb_dir=None,
     kwargs = {f: data[f"nr_{f}"][idx] for f in NR_FIELDS}
     # Bucket-level, not per nr vdG (see _write_bucket_npz).
     kwargs["cg_elements"] = data["cg_elements"]
+    # Every mode puts this path in the output filename; only these read the file.
+    reads_parent = (include_full_ligand or include_backbone_carbonyl
+                    or include_sidechain)
     kwargs["parent_pdb_path"] = resolve_parent_pdb_path(
-        data, str(data["nr_parent_biounit"][idx]), pdb_dir=pdb_dir)
+        data, str(data["nr_parent_biounit"][idx]), pdb_dir=pdb_dir,
+        for_reading=reads_parent)
     kwargs["include_full_ligand"] = include_full_ligand
     kwargs["include_backbone_carbonyl"] = include_backbone_carbonyl
+    kwargs["include_sidechain"] = include_sidechain
     return kwargs
 
 
-def resolve_parent_pdb_path(data, biounit, pdb_dir=None):
+PDB_DIR_ENV_VAR = "PARENT_PDBS_DIR"
+
+# Appended to every message about a missing or unusable parent database.
+PDB_DIR_HELP = (
+    f"${PDB_DIR_ENV_VAR} is the parent structure database this vdG library was mined "
+    "from: two-character subdirs of uncompressed PDBs, i.e. <dir>/f8/1f8s.pdb. Set it "
+    f"with\n    export {PDB_DIR_ENV_VAR}=/path/to/parent_pdbs\n"
+    "(or pass --pdb-dir where a script offers it).")
+
+class ParentPdbDirError(ValueError):
+    "Unusable parent PDB database." 
+
+
+# Parent-dir checks already run in this process, keyed by the directory they passed
+# for. resolve_parent_pdb_path is called once per record, so the check has to be
+# memoised to be affordable there.
+_checked_pdb_dirs = set()
+
+
+def effective_parent_pdb_dir(data=None, pdb_dir=None):
+    """The parent PDB database.
+
+    Precedence: an explicit ``pdb_dir`` argument, then ``$PARENT_PDBS_DIR``,
+    then the build-time ``parent_pdb_dir`` stored in the bucket. The env var exists
+    because that stored value is an absolute path on the build machine, so a
+    library copied elsewhere resolves every parent to a path that does not exist.
+
+    ``data=None`` consults only the first two, returning ``(None, ...)`` when
+    neither is set -- for a caller checking before it has a bucket in hand.
+    """
+    if pdb_dir is not None:
+        return str(pdb_dir), "pdb_dir argument"
+    env_dir = os.environ.get(PDB_DIR_ENV_VAR)
+    if env_dir:
+        return env_dir, f"${PDB_DIR_ENV_VAR}"
+    if data is None:
+        return None, "not yet known"
+    return str(data["parent_pdb_dir"]), "parent_pdb_dir recorded in the bucket"
+
+
+def require_parent_pdb_dir(data=None, pdb_dir=None):
+    """``effective_parent_pdb_dir``, raising if it does not name a real directory.
+
+    Passing directories are remembered, so repeat calls are a set lookup.
+
+    With ``data=None`` and nothing overriding, returns None: only the bucket can
+    supply a directory, so the check defers to a later call that has one.
+    """
+    resolved, source = effective_parent_pdb_dir(data, pdb_dir=pdb_dir)
+    if resolved is None:
+        return None
+    if resolved in _checked_pdb_dirs:
+        return resolved
+    if not resolved:
+        raise ParentPdbDirError(
+            "No parent PDB directory is available, so parent structures cannot be "
+            f"read.\n{PDB_DIR_HELP}")
+    if not os.path.isdir(resolved):
+        raise ParentPdbDirError(
+            f"Parent PDB directory does not exist: {resolved} (from {source}).\n"
+            f"{PDB_DIR_HELP}")
+    # isdir alone passes a parent database with the wrong layout (flat, gzipped, .cif),
+    # which then costs one warning per record and still exits 0 having written
+    # only what needs no parent. Try a few stems, failing only if none resolve:
+    # one absent file is a partial database (already warned about per record),
+    # all absent is the wrong layout.
+    stems = [] if data is None else [str(b) for b in data["nr_parent_biounit"][:3]]
+    stems = [b for b in stems if b]
+    if stems:
+        test_probes = [os.path.join(resolved, b[1:3].lower(), b + ".pdb") for b in stems]
+        if not any(os.path.isfile(test_probe) for test_probe in test_probes):
+            raise ParentPdbDirError(
+                f"Parent PDB database {resolved} (from {source}) holds none of "
+                f"{test_probes}. Parents are resolved as "
+                "<dir>/<stem[1:3]>/<stem>.pdb -- uncompressed .pdb, in "
+                "two-character subdirectories -- so a flat, gzipped or mmCIF "
+                "database will not work even though the directory exists.\n"
+                f"{PDB_DIR_HELP}")
+        # Only a probed directory is remembered: a check made before any bucket was
+        # loaded saw no stems, so it cannot stand in for the layout check.
+        _checked_pdb_dirs.add(resolved)
+    return resolved
+
+
+# Printed once per distinct problem, so a run that calls the check twice (before the
+# walk, then again once a bucket supplies the library's recorded path) says it once.
+_warned_missing_parent_db = set()
+
+
+def missing_parent_db_message(extras, reason=None):
+    """The one message both PDB writers print when no parent database is available.
+
+    Says what the output is instead (CG + vdM N/CA/C), which flags were dropped, and
+    how to get them back. Kept here, not in either script, so the two cannot drift.
+    """
+    lines = [
+        "No parent PDB database is available, so the vdGs written here are the CG "
+        "plus the vdM backbone N/CA/C only."]
+    if reason:
+        lines.append(f"  Reason: {reason}")
+    if extras:
+        subject = "it adds" if len(extras) == 1 else "they add"
+        lines.append(
+            f"  {', '.join(extras)} dropped: the atoms {subject} are not stored in the "
+            "library -- they are re-derived at write time from the structure each vdG "
+            "was mined from.")
+    lines.append(
+        "  To include them, point at that structure database -- two-character subdirs "
+        f"of uncompressed PDBs, i.e. <dir>/f8/1f8s.pdb -- and rerun:\n"
+        f"      export {PDB_DIR_ENV_VAR}=/path/to/parent_pdbs\n"
+        "  or pass it per run with --pdb-dir /path/to/parent_pdbs.")
+    return "\n".join(lines)
+
+
+def parent_extras_available(extras, data=None, pdb_dir=None):
+    """True if ``extras`` (flag names) can be re-derived from a parent PDB database.
+
+    False, with one ``missing_parent_db_message``, if none is reachable. Shared by
+    both PDB writers so their behaviour is identical: the extras are display atoms,
+    so a missing database is not a reason to write nothing -- the vdG itself, CG +
+    vdM N/CA/C, is in the npz and needs no parent. Callers that cannot fall back on
+    stored coordinates (the members mode of materialize_vdg_pdbs, whose members store
+    none) must keep calling ``require_parent_pdb_dir`` and fail instead.
+    """
+    if not extras:
+        return False
+    try:
+        require_parent_pdb_dir(data, pdb_dir=pdb_dir)
+    except ParentPdbDirError as err:
+        # ParentPdbDirError spells out $PARENT_PDBS_DIR itself; keep only its first
+        # line as the reason, since the message below gives that guidance once.
+        msg = missing_parent_db_message(extras, reason=str(err).split("\n")[0])
+        if msg not in _warned_missing_parent_db:
+            _warned_missing_parent_db.add(msg)
+            print(f"[WARNING] {msg}")
+        return False
+    return True
+
+
+def resolve_parent_pdb_path(data, biounit, pdb_dir=None, for_reading=True):
     """Absolute path of a parent structure from its biounit stem.
 
     Buckets store the stem ("1f8s") plus the build-time directory once per file,
     rather than a full path per record -- see the note in `_write_bucket_npz`.
     The layout mirrors how generation built the path:
     ``<pdb_dir>/<biounit[1:3].lower()>/<biounit>.pdb``.
- 
+
+    Raises ``ParentPdbDirError`` (once-per-directory check, memoised) if the database is
+    missing or laid out differently, so any caller that reads parents gets the check
+    and its how-to for free. Pass ``for_reading=False`` where the path is only a
+    display tag.
     """
     biounit = str(biounit).strip()
     if not biounit:
+        return ""  # a record with no parent stem
+    if for_reading and effective_parent_pdb_dir(
+            data, pdb_dir=pdb_dir)[0] not in _checked_pdb_dirs:
+        require_parent_pdb_dir(data, pdb_dir=pdb_dir)
+    resolved, _ = effective_parent_pdb_dir(data, pdb_dir=pdb_dir)
+    if not resolved:
         return ""
-    if pdb_dir is None:
-        pdb_dir = str(data["parent_pdb_dir"])
-    if not pdb_dir:
-        return ""
-    return os.path.join(pdb_dir, biounit[1:3].lower(), biounit + ".pdb")
+    return os.path.join(resolved, biounit[1:3].lower(), biounit + ".pdb")
 
 
 def _resnum_selstr(resnum):
@@ -434,7 +646,7 @@ def rederive_member_coords(pdbpath, cg_seg, cg_chain, cg_resnum, cg_names,
     them on demand from the lightweight identity fields that are stored.
 
     Returns ``(cg_coords, vdm_bb_coords)`` or ``(None, None)`` if any named atom
-    is missing (e.g. the PDB mirror changed, or the atom was never resolved).
+    is missing (e.g. the PDB database changed, or the atom was never resolved).
     """
     struct = parsed_pdb
     if struct is None:  # short-circuit: an already-parsed structure is reused as is
@@ -733,3 +945,12 @@ def aa_perm_indices(bucket_parts):
           ['bb', 'SER']         -> [[0,1]]  (different labels, no swap)
     """
     return utils.group_preserving_permutations(bucket_parts)
+
+
+def run_cli(main):
+    """Entry-point wrapper: report a bad parent PDB database as a message, not a
+    traceback. Use as ``if __name__ == "__main__": vdg_npz_utils.run_cli(main)``."""
+    try:
+        main()
+    except ParentPdbDirError as err:
+        raise SystemExit(f"[ERROR] {err}")

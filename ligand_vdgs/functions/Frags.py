@@ -168,7 +168,7 @@ def ring_query_for_atom(atom):
     # Smallest ring, uncapped. There is deliberately no plain-`R` fallback for
     # large rings: SMARTS `R` matches *any* ring atom, so a macrocycle-derived
     # `[C;R][C;R][O;R][C;R][C;R]` key (42 CCD ligands) would, as a mining query,
-    # pull in every THF and sugar in the mirror -- estimated 27,399 structures --
+    # pull in every THF and sugar in the database -- estimated 27,399 structures --
     # and 266 such keys cleared the build threshold as superset jobs. `r<n>` is
     # exact per ring size, so a macrocycle key mines only macrocycles, and the
     # long tail of large-ring keys simply falls below the structure threshold.

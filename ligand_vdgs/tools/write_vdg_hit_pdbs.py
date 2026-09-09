@@ -56,10 +56,18 @@ def slot_order_from_perm_idx(bucket_parts, aa_perm_idx):
     return list(perms[idx])
 
 
-def load_centroid(npz_path, idx, slot_order):
-    """build_kwargs, parent name, and vdM residue tags in query BSR order."""
+def load_centroid(npz_path, idx, slot_order, carbonyl=False, sidechain=False,
+                  pdb_dir=None):
+    """build_kwargs, parent name, and vdM residue tags in query BSR order.
+
+    ``carbonyl``/``sidechain`` add display atoms re-derived from the library vdG's
+    parent PDB. They ride the hit's rigid transform like every other atom, so the
+    superposition the hit finder scored -- CG + vdM N/CA/C -- is unchanged.
+    """
     with np.load(npz_path) as data:
-        build_kwargs = vdg_npz.nr_build_kwargs(data, idx)
+        build_kwargs = vdg_npz.nr_build_kwargs(
+            data, idx, include_backbone_carbonyl=carbonyl,
+            include_sidechain=sidechain, pdb_dir=pdb_dir)
     source_name = strip_known_exts(build_kwargs["parent_pdb_path"])
 
     # scrr_* are stored in library slot order; slot_order (from aa_perm_idx)
@@ -128,7 +136,26 @@ def main():
     parser.add_argument("--vdg-lib-dir", required=True)
     parser.add_argument("--outdir", required=True)
     parser.add_argument("--max-per-frag-bsr", type=int, default=MAX_PER_FRAG_BSR)
+    parser.add_argument("--sidechain", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Write each vdM's sidechain heavy atoms, re-derived from "
+                             "the library vdG's parent PDB. On by default.")
+    parser.add_argument("--carbonyl", action="store_true",
+                        help="Also write each vdM's backbone carbonyl O, on the same "
+                             "terms as --sidechain.")
+    parser.add_argument("-P", "--pdb-dir", default=None,
+                        help="RCSB-style PDB mirror to resolve parent structures "
+                             "against. Only used by --sidechain/--carbonyl.")
     args = parser.parse_args()
+    if args.pdb_dir is not None:
+        if not os.path.isdir(args.pdb_dir):
+            raise SystemExit(f"[ERROR] --pdb-dir is not a directory: {args.pdb_dir}")
+
+    extras = [flag for flag, on in (("--carbonyl", args.carbonyl),
+                                    ("--sidechain", args.sidechain)) if on]
+    if extras and not vdg_npz.parent_extras_available(extras, pdb_dir=args.pdb_dir):
+        args.sidechain = args.carbonyl = False
+        extras = []
 
     df = pd.read_csv(args.hits_tsv, sep="\t")
     counts = defaultdict(int)
@@ -158,6 +185,11 @@ def main():
         with np.load(npz_path) as data:
             num_vdgs = len(data["nr_cg_coords"])
             bucket_parts = [str(x) for x in data["aa_bucket_parts"]]
+            if extras:
+                if not vdg_npz.parent_extras_available(extras, data,
+                                                       pdb_dir=args.pdb_dir):
+                    args.sidechain = args.carbonyl = False
+                extras = []
         if not 0 <= vdg_idx < num_vdgs:
             skip(row_idx, row, f"vdg_index {vdg_idx} out of range "
                                f"[0, {num_vdgs-1}] in {npz_path}")
@@ -165,7 +197,8 @@ def main():
 
         slot_order = slot_order_from_perm_idx(bucket_parts, row["aa_perm_idx"])
         build_kwargs, source_name, scrr_tags = load_centroid(
-            npz_path, vdg_idx, slot_order)
+            npz_path, vdg_idx, slot_order, carbonyl=args.carbonyl,
+            sidechain=args.sidechain, pdb_dir=args.pdb_dir)
         ag, _ = vdg_npz.build_vdg_atomgroup_from_npz(**build_kwargs)
         ag = vdg_npz.apply_rigid_transform(ag.copy(), *make_R_t(row))
 

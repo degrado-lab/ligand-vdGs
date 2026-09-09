@@ -1,5 +1,5 @@
 """
-Materialize vdG PDBs (CG + vdM backbone) from nr_vdgs .npz files.
+Materialize vdG PDBs (CG + vdM backbone + sidechain) from nr_vdgs .npz files.
 
 Centroids mode (default): one PDB per cluster, largest first, flat in --out-dir.
 
@@ -19,9 +19,9 @@ Members store no coordinates and are re-derived from their parent PDB
         <frag>_NR_clus<id>_size<size>_<source>_<vdm tags>_<lig tag>.pdb.gz
         <frag>_<source>_<vdm tags>_<lig tag>.pdb.gz   (one per member)
 
-Everything a run writes shares one frame (CGs superposed on the first centroid, over
-the CG automorphism group), so a directory loads into PyMOL as one overlay; the
-fragment prefix keeps different fragments' objects apart there.
+Fits are on CG + vdM backbone N/CA/C (--align-cg-weight splits the two) against a reference
+from the same AA bucket; the hop between buckets is on the CG alone, over the CG
+automorphism group, because backbone slots correspond only within a bucket.
 
 Both modes select by rank (--top-clusters) or by id (--clusters). Ids are unique only
 within one bucket npz, so --clusters and --members each need exactly one --aa-buckets
@@ -34,9 +34,12 @@ positionally parseable (<frag> and <AA_BUCKET> each span a variable number of fi
 -- parse from the right: strip the extension and any '~<n>' suffix, take the last
 4 * (subset_size + 1) fields, cut into tags of 4.
 
---include-full-ligand, --carbonyl and --members read parent PDBs, resolved against the
-directory recorded in the buckets unless --pdb-dir overrides it. --pdb-dir is rejected
-in the other modes rather than silently ignored.
+Parent structures resolve against the parent PDB database the library was mined from: 
+the path recorded at build time, unless $PARENT_PDBS_DIR or --pdb-dir overrides it.
+--sidechain is on by default. Regardless of the "extra" display atoms, every fit
+stays on CG + vdM N/CA/C, so with no database reachable they are dropped with a
+warning and the run still writes backbone-only vdGs from the npz. --members has no
+such fallback: a member stores no coordinates, so it fails outright. 
 """
 
 import argparse
@@ -58,8 +61,10 @@ DEFAULT_REPS = 20
 DEFAULT_ALIGN_CG_WEIGHT = 0.99
 DEFAULT_SEED = 0
 
-# Modes that read a parent PDB; everything else is served from the npz.
-PARENT_READING_FLAGS = ("--include-full-ligand", "--carbonyl", "--members")
+# Modes that read a parent PDB; everything else is served from the npz. Sidechains
+# are on by default, so every run reads parents unless --no-sidechain turns them off.
+PARENT_READING_FLAGS = ("--include-full-ligand", "--carbonyl", "--sidechain",
+                        "--members")
 
 
 def parse_args():
@@ -71,6 +76,9 @@ def parse_args():
                    help="Also write each vdM's backbone carbonyl O, re-derived from "
                         "the parent PDB. Display only: hit-finding RMSD uses the "
                         "stored N/CA/C.")
+    p.add_argument("--sidechain", action=argparse.BooleanOptionalAction, default=True,
+                   help="Write each vdM's sidechain heavy atoms, re-derived from the "
+                        "parent PDB. On by default, but falls back to CG + bb-only.")
     p.add_argument("-P", "--pdb-dir", default=None,
                    help="RCSB-style PDB mirror to resolve parent structures against, "
                         "overriding the build-time directory recorded in the buckets. "
@@ -79,7 +87,8 @@ def parse_args():
     sel = p.add_argument_group("selection (both modes)")
     sel.add_argument("--members", action="store_true",
         help="Write every member of each selected cluster instead of just its "
-             "centroid. Needs exactly one --aa-buckets and one --subset-sizes value.")
+             "centroid. Needs exactly one --aa-buckets and one --subset-sizes value, "
+             "and a reachable parent PDB database: members store no coordinates.")
     sel.add_argument("--aa-buckets", nargs="+", default=None,
         help="AA bucket label(s) to materialize. Default: all buckets.")
     sel.add_argument("--subset-sizes", type=int, nargs="+", default=None,
@@ -97,14 +106,14 @@ def parse_args():
              "Default: 10; pass 1 for every cluster.")
     g1.add_argument("--max-files", type=int, default=None, help="Cap on files.")
 
+    sel.add_argument("-w", "--align-cg-weight", type=float, default=None,
+        help="Weight on the CG block, the rest going to the vdM backbone, when "
+             "fitting onto a reference. Default: 0.99.")
+
     g2 = p.add_argument_group("members mode only (--members)")
     g2.add_argument("-m", "--reps", type=int, default=None,
         help="Max structures to write per cluster, counting the centroid: the "
              "centroid plus REPS-1 members sampled at random. 0 = all. Default: 20.")
-    g2.add_argument("-w", "--align-cg-weight", type=float, default=None,
-        help="Weight on the CG block (vs vdM backbone) when fitting a member onto "
-             "its cluster centroid. Default: 0.99. Centroids mode fits on the CG "
-             "alone.")
     g2.add_argument("--seed", type=int, default=None,
         help="Seed for the --reps sample, so a rerun reproduces it. Default: 0.")
     return p.parse_args()
@@ -204,14 +213,43 @@ def align_first_to_reference(ag, cg_coords, cg_vdmbb_coords):
     return ag, np.asarray(cg_vdmbb_coords, dtype=float) @ R + t
 
 
-def align_cg_to_reference(ag, cg_coords, ref_cg_coords, cg_automorphisms=None):
-    """Superpose on the CG block alone, over the automorphism group -- the centroids-mode
-    shared frame. The reference centroid usually comes from another bucket, whose vdM
-    backbone slots are not in correspondence (or even the same length)."""
+def _apply_rigid(ag, cg_vdmbb_flat, R, t):
+    """Move an AtomGroup and its CG+backbone fit block by one rigid transform.
+
+    The block is carried separately rather than sliced back out of ``ag``: with
+    --include-full-ligand or --carbonyl the AtomGroup holds display atoms that are
+    not part of the fit, so its row order is not the block's.
+    """
+    ag.setCoords(ag.getCoords() @ R + t)
+    return ag, np.asarray(cg_vdmbb_flat, dtype=float) @ R + t
+
+
+def align_cg_to_reference(ag, cg_coords, cg_vdmbb_flat, ref_cg_coords,
+                          cg_automorphisms=None):
+    """Superpose on the CG block alone, over the automorphism group.
+
+    Used where the target's vdM backbone slots are not in correspondence with this
+    record's -- across AA buckets, whose slots differ in identity and, for a different
+    subset size, in count. Within a bucket, ``align_to_bucket_reference`` fits the
+    backbone too.
+    """
     R, t = _best_perm_rigid(cg_coords, None, ref_cg_coords,
                             cg_automorphisms=cg_automorphisms)
-    ag.setCoords(ag.getCoords() @ R + t)
-    return ag
+    return _apply_rigid(ag, cg_vdmbb_flat, R, t)
+
+
+def align_to_bucket_reference(ag, cg_coords, vdm_bb_coords, cg_vdmbb_flat,
+                              ref_flat, weights, cg_automorphisms=None):
+    """Superpose on CG + vdM backbone, over the automorphism group.
+
+    Valid only against a target from the same AA bucket: one bucket's records share
+    a slot count and slot AA labels, so row i of the backbone block means the same
+    thing in both. Only the CG block is permuted -- backbone slot order is fixed
+    within a bucket (AA-duplicate permutations were expanded before clustering).
+    """
+    R, t = _best_perm_rigid(cg_coords, vdm_bb_coords, ref_flat, weights,
+                            cg_automorphisms)
+    return _apply_rigid(ag, cg_vdmbb_flat, R, t)
 
 
 def rank_clusters(cluster_size, min_cluster_size=1, top_n=None):
@@ -258,11 +296,19 @@ def make_base_tag(kw):
 def materialize_nr_vdgs(nr_root, out_root, max_files=None,
     aa_buckets=None, subset_sizes=None, top_clusters=None, cluster_ids=None,
     min_cluster_size=DEFAULT_MIN_CLUSTER_SIZE, include_full_ligand=False,
-    include_backbone_carbonyl=False, pdb_dir=None):
+    include_backbone_carbonyl=False, include_sidechain=True, pdb_dir=None,
+    align_cg_weight=DEFAULT_ALIGN_CG_WEIGHT):
     """One PDB per cluster (the centroid), largest first, flat in ``out_root`` and all in
     one frame. No subset-size dir or field: a bucket label has one AA token per vdM slot,
     so it already says its subset size. ``cluster_ids`` names clusters outright; ids only
-    mean something within one npz, so pass a single bucket and subset size."""
+    mean something within one npz, so pass a single bucket and subset size.
+
+    Centroids are fitted on CG + vdM backbone (``align_cg_weight`` splits the two, as in
+    members mode) against the first centroid of their own bucket. Each bucket's first
+    centroid is placed on the run-wide CG frame by its CG alone, since backbone slots
+    are only in correspondence within a bucket -- so a single-bucket run is CG+backbone
+    throughout, and a multi-bucket run is CG+backbone within each bucket.
+    """
     nr_root = os.path.abspath(nr_root)
     out_root = os.path.abspath(out_root)
     frag_name = frag_name_from_nr_root(nr_root)
@@ -270,6 +316,12 @@ def materialize_nr_vdgs(nr_root, out_root, max_files=None,
     # Sidecar first: a missing cg_symmetry.npz is fatal, and raising after fresh_dir
     # has claimed out_root leaves a directory the next attempt refuses to reuse.
     cg_automorphisms = _load_cg_automorphisms(nr_root)
+    extras = [flag for flag, on in (("--include-full-ligand", include_full_ligand),
+                                    ("--carbonyl", include_backbone_carbonyl),
+                                    ("--sidechain", include_sidechain)) if on]
+    if extras and not vdg_npz.parent_extras_available(extras, pdb_dir=pdb_dir):
+        include_full_ligand = include_backbone_carbonyl = include_sidechain = False
+        extras = []
     # The freshness unit is whatever shares a frame -- here the whole run -- so name
     # every bucket in one invocation; fresh_dir refuses a non-empty out_root. Partial
     # sets are still possible (--max-files, a skipped bucket): check the return value.
@@ -278,7 +330,7 @@ def materialize_nr_vdgs(nr_root, out_root, max_files=None,
     aa_buckets = set(aa_buckets) if aa_buckets is not None else None
     subset_sizes = {str(s) for s in subset_sizes} if subset_sizes is not None else None
     total_written = 0
-    global_ref_cg = None  # the CG block everything else is aligned onto
+    global_ref_cg = None  # cross-bucket CG frame: every bucket's first centroid lands here
 
     for subset_name in sorted(os.listdir(nr_root)):
         subset_dir = os.path.join(nr_root, subset_name)
@@ -299,9 +351,17 @@ def materialize_nr_vdgs(nr_root, out_root, max_files=None,
             if data is None:
                 print(f"[WARNING] Skipping unreadable bucket {npz_path}.")
                 continue
+            if extras:  # bucket-level field, so one check covers the run
+                if not vdg_npz.parent_extras_available(extras, data, pdb_dir=pdb_dir):
+                    include_full_ligand = False
+                    include_backbone_carbonyl = include_sidechain = False
+                extras = []
             cg = data["nr_cg_coords"]
             clus_id, clus_size = data["cluster_id"], data["cluster_size"]
             n_cg = cg.shape[1]
+            # Reset per bucket: the backbone target is only meaningful against records
+            # that share this bucket's slot count and slot AA labels.
+            bucket_ref_flat, weights = None, None
 
             if cluster_ids is None:
                 order = rank_clusters(clus_size, min_cluster_size=min_cluster_size,
@@ -319,14 +379,25 @@ def materialize_nr_vdgs(nr_root, out_root, max_files=None,
                 idx = int(idx)
                 kw = vdg_npz.nr_build_kwargs(
                     data, idx, include_full_ligand, pdb_dir=pdb_dir,
-                    include_backbone_carbonyl=include_backbone_carbonyl)
+                    include_backbone_carbonyl=include_backbone_carbonyl,
+                    include_sidechain=include_sidechain)
                 ag, cg_vdmbb_coords = vdg_npz.build_vdg_atomgroup_from_npz(**kw)
                 if global_ref_cg is None:
-                    ag, _ = align_first_to_reference(ag, kw["cg_coords"], cg_vdmbb_coords)
+                    ag, cg_vdmbb_coords = align_first_to_reference(
+                        ag, kw["cg_coords"], cg_vdmbb_coords)
                     global_ref_cg = ag.getCoords()[:n_cg].copy()
+                elif bucket_ref_flat is None:
+                    ag, cg_vdmbb_coords = align_cg_to_reference(
+                        ag, kw["cg_coords"], cg_vdmbb_coords, global_ref_cg,
+                        cg_automorphisms)
                 else:
-                    ag = align_cg_to_reference(ag, kw["cg_coords"], global_ref_cg,
-                                               cg_automorphisms)
+                    ag, cg_vdmbb_coords = align_to_bucket_reference(
+                        ag, kw["cg_coords"], kw["vdm_bb_coords"], cg_vdmbb_coords,
+                        bucket_ref_flat, weights, cg_automorphisms)
+                if bucket_ref_flat is None:
+                    bucket_ref_flat = cg_vdmbb_coords.copy()
+                    weights = _get_weights(n_cg, kw["vdm_bb_coords"].shape[0] * 3,
+                                           align_cg_weight)
                 stem = (f"{frag_name}_{sanitize(aa_label)}_clus{int(clus_id[idx])}"
                         f"_size{int(clus_size[idx])}_{make_base_tag(kw)}")
                 # Unique by construction, but nothing checks the path on write.
@@ -339,20 +410,22 @@ def materialize_nr_vdgs(nr_root, out_root, max_files=None,
 
 
 def _member_build_kwargs(mem, cg_coords, vdm_bb_coords, include_full_ligand=False,
-                         include_backbone_carbonyl=False):
+                         include_backbone_carbonyl=False, include_sidechain=True):
     kw = {k: mem[k] for k in ("cg_names", "cg_elements", "cg_seg", "cg_chain",
                               "cg_resnum", "cg_resname", "scrr_seg", "scrr_chain",
                               "scrr_resnum", "scrr_resname")}
     kw.update(cg_coords=cg_coords, vdm_bb_coords=vdm_bb_coords,
               parent_pdb_path=mem["pdbpath"],
               include_full_ligand=include_full_ligand,
-              include_backbone_carbonyl=include_backbone_carbonyl)
+              include_backbone_carbonyl=include_backbone_carbonyl,
+              include_sidechain=include_sidechain)
     return kw
 
 
 def materialize_cluster_members(nr_root, out_root, subset_size, aa_bucket, cluster_ids=None,
     top_clusters=None, reps=None, seed=0, align_cg_weight=DEFAULT_ALIGN_CG_WEIGHT,
-    include_full_ligand=False, include_backbone_carbonyl=False, pdb_dir=None):
+    include_full_ligand=False, include_backbone_carbonyl=False,
+    include_sidechain=True, pdb_dir=None):
     """Members of one or more clusters, aligned to each cluster's centroid, one
     directory per cluster.
 
@@ -372,6 +445,9 @@ def materialize_cluster_members(nr_root, out_root, subset_size, aa_bucket, clust
     data = vdg_npz.load_bucket_npz(npz_path)
     if data is None:
         raise ValueError(f"Bucket npz is unreadable or corrupt: {npz_path}")
+    # Members carry no coordinates, so every one of them is re-derived from its parent
+    # biounit -- unconditionally, unlike centroids mode. 
+    vdg_npz.require_parent_pdb_dir(data, pdb_dir=pdb_dir)
 
     if (cluster_ids is None) == (top_clusters is None):
         raise ValueError("Pass exactly one of cluster_ids or top_clusters.")
@@ -404,7 +480,8 @@ def materialize_cluster_members(nr_root, out_root, subset_size, aa_bucket, clust
 
         kw = vdg_npz.nr_build_kwargs(
             data, idx, include_full_ligand, pdb_dir=pdb_dir,
-            include_backbone_carbonyl=include_backbone_carbonyl)
+            include_backbone_carbonyl=include_backbone_carbonyl,
+            include_sidechain=include_sidechain)
         ag_cent, cg_vdmbb_cent = vdg_npz.build_vdg_atomgroup_from_npz(**kw)
         ag_cent, cg_vdmbb_cent = align_first_to_reference(ag_cent, kw["cg_coords"], cg_vdmbb_cent)
         n_cg = kw["cg_coords"].shape[0]
@@ -418,8 +495,7 @@ def materialize_cluster_members(nr_root, out_root, subset_size, aa_bucket, clust
         else:
             R, t = _best_perm_rigid(ag_cent.getCoords()[:n_cg], None, global_ref_cg,
                                     cg_automorphisms=cg_automorphisms)
-            ag_cent.setCoords(ag_cent.getCoords() @ R + t)
-            cg_vdmbb_cent = cg_vdmbb_cent @ R + t
+            ag_cent, cg_vdmbb_cent = _apply_rigid(ag_cent, cg_vdmbb_cent, R, t)
 
         weights = _get_weights(n_cg, kw["vdm_bb_coords"].shape[0] * 3, align_cg_weight)
 
@@ -460,7 +536,7 @@ def materialize_cluster_members(nr_root, out_root, subset_size, aa_bucket, clust
                 clus_skipped += 1
                 continue
             mem_kw = _member_build_kwargs(mem, cg_coords, vdm_bb_coords,
-                include_full_ligand, include_backbone_carbonyl)
+                include_full_ligand, include_backbone_carbonyl, include_sidechain)
             ag, _ = vdg_npz.build_vdg_atomgroup_from_npz(
                 **mem_kw, parent_struct=mem_struct)
             ag = align_member_to_centroid(ag, cg_coords, vdm_bb_coords, cg_vdmbb_cent,
@@ -495,7 +571,8 @@ def _check_pdb_dir(args):
     per parent, writing the vdGs without the atoms it was passed for."""
     if args.pdb_dir is None:
         return
-    if not (args.include_full_ligand or args.carbonyl or args.members):
+    if not (args.include_full_ligand or args.carbonyl or args.sidechain
+            or args.members):
         raise ValueError(
             f"--pdb-dir has no effect without one of {', '.join(PARENT_READING_FLAGS)}; "
             "every other mode is served from the bucket npz alone.")
@@ -508,8 +585,7 @@ def _reject_other_mode_flags(args):
     it: a run that looks configured and is not."""
     centroids_only = (("--min-cluster-size", args.min_cluster_size),
                       ("--max-files", args.max_files))
-    members_only = (("--reps", args.reps), ("--seed", args.seed),
-                    ("--align-cg-weight", args.align_cg_weight))
+    members_only = (("--reps", args.reps), ("--seed", args.seed))
     bad, mode, other = ((members_only, "centroids mode", "--members")
                         if not args.members else
                         (centroids_only, "members mode (--members)", "the default mode"))
@@ -550,6 +626,7 @@ def main():
                              else args.align_cg_weight),
             include_full_ligand=args.include_full_ligand,
             include_backbone_carbonyl=args.carbonyl,
+            include_sidechain=args.sidechain,
             pdb_dir=args.pdb_dir,
         )
         msg = f"Wrote {n} PDB file(s)."
@@ -579,10 +656,13 @@ def main():
                           else args.min_cluster_size),
         include_full_ligand=args.include_full_ligand,
         include_backbone_carbonyl=args.carbonyl,
+        include_sidechain=args.sidechain,
         pdb_dir=args.pdb_dir,
+        align_cg_weight=(DEFAULT_ALIGN_CG_WEIGHT if args.align_cg_weight is None
+                         else args.align_cg_weight),
     )
     print(f"Wrote {n} PDB file(s).")
 
 
 if __name__ == "__main__":
-    main()
+    vdg_npz.run_cli(main)
