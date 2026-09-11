@@ -172,13 +172,13 @@ class SidechainDefaultTests(unittest.TestCase):
 
     def test_the_npz_builder_still_defaults_off(self):
         """Both CLIs pass the flag explicitly; the raw builder stays off so an
-        importer does not silently acquire a parent PDB mirror dependency."""
+        importer does not silently acquire a parent database dependency."""
         param = inspect.signature(
             vdg_npz.build_vdg_atomgroup_from_npz).parameters["include_sidechain"]
         self.assertEqual(param.default, False)
 
     def test_a_missing_mirror_drops_the_extras_instead_of_failing(self):
-        """The average user has no parent PDB mirror; backbone-only vdGs still
+        """The average user has no parent database; backbone-only vdGs still
         come out of the npz, and the warning says what was lost."""
         vdg_npz._warned_missing_parent_db.clear()  # warn-once is process-wide
         with mock.patch.object(vdg_npz, "require_parent_pdb_dir",

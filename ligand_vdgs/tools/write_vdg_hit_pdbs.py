@@ -144,7 +144,7 @@ def main():
                         help="Also write each vdM's backbone carbonyl O, on the same "
                              "terms as --sidechain.")
     parser.add_argument("-P", "--pdb-dir", default=None,
-                        help="RCSB-style PDB mirror to resolve parent structures "
+                        help="RCSB-style parent database to resolve parent structures "
                              "against. Only used by --sidechain/--carbonyl.")
     args = parser.parse_args()
     if args.pdb_dir is not None:

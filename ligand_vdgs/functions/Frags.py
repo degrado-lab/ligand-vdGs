@@ -25,10 +25,10 @@ def get_fragments(bond_radius, mol, min_frag_size=4, max_frag_size=5, quiet=True
     substructs = []
     # Computed once and shared across radii: it is a property of the parent mol,
     # which does not change here.
-    ring_queries = parent_ring_queries(mol)
+    annotations = parent_atom_annotations(mol)
     for rad in list(range(1, bond_radius + 1)):
         substructs += fragment_on_bond_d(mol, rad, min_frag_size, max_frag_size,
-                                         ring_queries)
+                                         annotations)
     # Add substructs to `filtered_frags`.
     for orig_sub, orig_mol_inds in substructs: # contains H's that need to be scrubbed.
         # apply size threshold.
@@ -122,11 +122,49 @@ def group_lig_sites_by_overlap(data, key_index=2, threshold=0.5):
 
     return list(groups.values())
 
-# The property `fragment_on_bond_d` writes on each submol atom, carrying the
-# ring class the atom had *in its parent*. It has to travel as a property
-# because PathToSubmol cuts ring bonds: a pyridine-derived fragment is a chain
-# in the submol, so by the time the key is written the ring is gone.
-RING_QUERY_PROP = '_vdgRingQuery'
+# The property `fragment_on_bond_d` writes on each submol atom, carrying every
+# annotation the atom had *in its parent*. They have to travel as a property
+# because PathToSubmol cuts bonds: a pyridine-derived fragment is a chain in the
+# submol, so by the time the key is written both its ring and the degree of the
+# atoms at the cut are gone. 47.1% of acyclic bridging heteroatoms were keyed as
+# terminal before degree travelled this way.
+ANNOTATION_PROP = '_vdgAtomAnnotation'
+
+
+def atom_annotations(atom):
+    """The parent-context SMARTS primitives for one atom, ';'-joined or ''.
+
+    Three independent annotations, all read from the *parent* graph:
+
+    * ring context -- `ring_query_for_atom` below.
+    * heavy-atom degree `D<n>`, on every non-carbon. This is what keeps a
+      bridging O out of a terminal O's bucket (phosphate mono- vs di-ester,
+      phenol vs diaryl ether, aniline vs diarylamine) and what restricts the CG
+      permutation group to the automorphisms of the annotated key.
+    * `H0`/`!H0`, on carbon only. Binary, so it is protonation-independent;
+      the heteroatom H count is provenance-bound and is stored as per-observation
+      metadata instead of entering the key (rebuild-notes 1, DR-1).
+
+    Degree counts heavy neighbours rather than calling `GetDegree()`: on a graph
+    that still holds explicit H's, `GetDegree()` is the same off-by-the-hydrogens
+    error that makes `[O;D1]` miss a hydroxyl at match time.
+
+    Hydrogens themselves get '' -- they are not part of any key.
+    """
+    if atom.GetAtomicNum() == 1:
+        return ''
+    parts = []
+    ring = ring_query_for_atom(atom)
+    if ring is not None:
+        parts.append(ring)
+    if atom.GetAtomicNum() == 6:
+        parts.append('H0' if atom.GetTotalNumHs(includeNeighbors=True) == 0
+                     else '!H0')
+    else:
+        heavy_degree = sum(1 for nbr in atom.GetNeighbors()
+                           if nbr.GetAtomicNum() != 1)
+        parts.append(f'D{heavy_degree}')
+    return ';'.join(parts)
 
 
 def ring_query_for_atom(atom):
@@ -185,7 +223,7 @@ _EXPLICIT_H = re.compile(r'H(?![a-z])\d*')
 _NON_LETTER = re.compile(r'[^A-Za-z]')
 
 
-def _remove_bracket_hydrogens_in_smiles(smiles: str, ring_queries=None) -> str:
+def _remove_bracket_hydrogens_in_smiles(smiles: str, annotations=None) -> str:
     """
     Strip explicit hydrogens from bracket atoms in a SMILES string (string-only).
     - [CH3] -> C
@@ -196,11 +234,12 @@ def _remove_bracket_hydrogens_in_smiles(smiles: str, ring_queries=None) -> str:
     (letters only, e.g., C, N, n). If charge/chirality/isotope/class remains,
     brackets are kept.
 
-    `ring_queries`, when given, is one entry per bracket atom in written order
-    (see ring_query_for_atom): a SMARTS ring primitive, or None to leave that
-    atom bare. A primitive is appended inside its atom's brackets and the
-    brackets are then kept -- `[C;!R][C;!R][N;R]` is a different query from
-    `CCN` and must stay one. The caller owns the ordering;
+    `annotations`, when given, is one entry per bracket atom in written order
+    (see atom_annotations): a ';'-joined primitive string, or None/'' to leave
+    that atom bare. It is appended inside its atom's brackets and the brackets
+    are then kept -- `[C;!R;!H0][C;!R;!H0][N;!R;D2]` is a different query from
+    `CCN` and must stay one. Appended *after* the explicit-H strip, because
+    `_EXPLICIT_H` would eat an `H0` and leave a bare `!`. The caller owns the ordering;
     MolToSmiles(allHsExplicit=True) brackets every atom, which is what makes
     bracket order and `_smilesAtomOutputOrder` line up.
     """
@@ -208,7 +247,7 @@ def _remove_bracket_hydrogens_in_smiles(smiles: str, ring_queries=None) -> str:
 
     # Rewrite every bracket atom content. Standalone [H] is dropped here, not in a
     # pre-pass: it is a bracket atom like any other, so it must consume its
-    # ring_queries slot or every following atom gets the wrong ring context.
+    # annotations slot or every following atom gets the wrong annotation.
     def _rewrite(m):
         inner = m.group(1)
         idx = next(counter)
@@ -219,9 +258,9 @@ def _remove_bracket_hydrogens_in_smiles(smiles: str, ring_queries=None) -> str:
         # Remove explicit H or H<number> that is not part of an element symbol like Hg/He
         cleaned = _EXPLICIT_H.sub('', inner)
 
-        ring_query = None if ring_queries is None else ring_queries[idx]
-        if ring_query is not None:
-            return f'[{cleaned};{ring_query}]'
+        annotation = None if annotations is None else annotations[idx]
+        if annotation:
+            return f'[{cleaned};{annotation}]'
 
         # If anything special remains, we must keep the brackets (e.g., [N+], [C@H],
         # [13C]). One test covers all of them: charge, chirality, isotope/class digits
@@ -239,7 +278,7 @@ def _remove_bracket_hydrogens_in_smiles(smiles: str, ring_queries=None) -> str:
     return s
 
 
-class _RingAnnotationUnmappable(Exception):
+class _AnnotationUnmappable(Exception):
     """Raised when an annotated fragment's ring context can't be placed on its SMILES.
 
     Distinct from "this molecule was never annotated": the bare key is a strictly
@@ -249,22 +288,22 @@ class _RingAnnotationUnmappable(Exception):
     """
 
 
-def _ring_queries_in_written_order(mol, smiles_w_H):
+def _annotations_in_written_order(mol, smiles_w_H):
     """Ring primitives ordered to match the bracket atoms of `smiles_w_H`.
 
     Returns None only for molecules that carry no ring annotation at all -- the
     hit-finding query path, which legitimately writes an unannotated key. If the
     molecule *is* annotated but the correspondence can't be established, raises
-    `_RingAnnotationUnmappable` rather than guessing at it or degrading to a bare
+    `_AnnotationUnmappable` rather than guessing at it or degrading to a bare
     key: a misaligned annotation would silently attach one atom's ring context to
     another, producing a plausible key for the wrong chemistry.
     """
-    if not mol.GetNumAtoms() or not mol.GetAtomWithIdx(0).HasProp(RING_QUERY_PROP):
+    if not mol.GetNumAtoms() or not mol.GetAtomWithIdx(0).HasProp(ANNOTATION_PROP):
         return None
     props = mol.GetPropsAsDict(includePrivate=True, includeComputed=True)
     order = props.get('_smilesAtomOutputOrder')
     if order is None:
-        raise _RingAnnotationUnmappable('MolToSmiles did not record '
+        raise _AnnotationUnmappable('MolToSmiles did not record '
                                         '_smilesAtomOutputOrder')
     if isinstance(order, str):
         order = json.loads(order)
@@ -272,18 +311,18 @@ def _ring_queries_in_written_order(mol, smiles_w_H):
     # allHsExplicit=True brackets every atom, so these must agree; if they do
     # not, the SMILES was not written the way this assumes.
     if len(order) != mol.GetNumAtoms():
-        raise _RingAnnotationUnmappable(
+        raise _AnnotationUnmappable(
             f'output order covers {len(order)} of {mol.GetNumAtoms()} atoms')
     n_brackets = len(_BRACKET_ATOM_LOOSE.findall(smiles_w_H))
     if n_brackets != len(order):
-        raise _RingAnnotationUnmappable(
+        raise _AnnotationUnmappable(
             f'{n_brackets} bracket atoms in {smiles_w_H!r} for {len(order)} atoms')
     queries = []
     for atom_idx in order:
         atom = mol.GetAtomWithIdx(atom_idx)
-        if not atom.HasProp(RING_QUERY_PROP):
-            raise _RingAnnotationUnmappable('fragment is only partially annotated')
-        queries.append(atom.GetProp(RING_QUERY_PROP) or None)
+        if not atom.HasProp(ANNOTATION_PROP):
+            raise _AnnotationUnmappable('fragment is only partially annotated')
+        queries.append(atom.GetProp(ANNOTATION_PROP) or None)
     return queries
 
 
@@ -312,6 +351,14 @@ def manually_remove_Hs(orig_substruct, return_single_mol_or_perms):
     # also drops charged/isotopic H's, and preserves conformer coords of the atoms kept.
     try:
         substruct = Chem.RemoveAllHs(orig_substruct, sanitize=False)
+        # RemoveAllHs(sanitize=False) drops the graph H's without crediting them
+        # to the heavy atom they were on, so a SMILES written `[H]OCC` comes back
+        # with the hydroxyl O at zero H and `[H]C([H])([H])O` with the methyl C at
+        # zero -- which would key that carbon `H0` instead of `!H0`. This restores
+        # the counts without sanitizing, so fragments still inherit the parent's
+        # aromaticity and ring perception (docs/pitfalls.md). Measured: on 599
+        # ligands (201 of them written with bracket H) it changes no fragment key.
+        substruct.UpdatePropertyCache(strict=False)
     except Exception as e:
         # Don't fall back to the H-bearing graph: it defeats the guarantee above,
         # and the fragment would be dropped a few lines down anyway (the H-free
@@ -352,8 +399,8 @@ def manually_remove_Hs(orig_substruct, return_single_mol_or_perms):
     # ligand -- which is exactly where the key is used.
     smiles_no_Hs = _remove_bracket_hydrogens_in_smiles(smiles_w_H)
     try:
-        ring_queries = _ring_queries_in_written_order(substruct, smiles_w_H)
-    except _RingAnnotationUnmappable as e:
+        annotations = _annotations_in_written_order(substruct, smiles_w_H)
+    except _AnnotationUnmappable as e:
         # The fragment was annotated but the annotation can't be placed. Falling
         # back to `smiles_no_Hs` would file it under a bare key that is both a
         # looser query and indistinguishable from a legitimate aromatic-only one.
@@ -361,8 +408,8 @@ def manually_remove_Hs(orig_substruct, return_single_mol_or_perms):
               f'could not be mapped onto the written SMILES ({e}); dropping '
               'fragment.', flush=True)
         return None
-    annotated_key = (smiles_no_Hs if ring_queries is None
-                     else _remove_bracket_hydrogens_in_smiles(smiles_w_H, ring_queries))
+    annotated_key = (smiles_no_Hs if annotations is None
+                     else _remove_bracket_hydrogens_in_smiles(smiles_w_H, annotations))
 
     # Complication: after converting the Mol obj to smiles, the Mol obj won't have the same 
     # atom order as the original Mol obj, which is important when extract CG coords. 
@@ -425,19 +472,19 @@ def manually_remove_Hs(orig_substruct, return_single_mol_or_perms):
     return cg_atom_perms, annotated_key # return all permutations. `cg_atom_perms` is a 
                                         # list of (substructure Mol objs, perm_inds)
 
-def parent_ring_queries(mol):
-    """`ring_query_for_atom` for every atom of `mol`, indexed by atom index.
+def parent_atom_annotations(mol):
+    """`atom_annotations` for every atom of `mol`, indexed by atom index.
 
     Hoisted out of `fragment_on_bond_d`: the answer depends only on the parent
     atom, but the naive version recomputed it once per (center atom, radius,
     submol atom) -- 708k calls for 3k ligands where 119k distinct ones exist.
     '' means "leave bare", matching the property convention below.
     """
-    return [ring_query_for_atom(atom) or '' for atom in mol.GetAtoms()]
+    return [atom_annotations(atom) for atom in mol.GetAtoms()]
 
 
 def fragment_on_bond_d(mol, radius, min_frag_size=None, max_frag_size=None,
-                       ring_queries=None):
+                       annotations=None):
     # Code from https://iwatobipen.wordpress.com/2020/08/12/get-and-draw-molecular-fragment-with-user-defined-path-rdkit-memo/
     #
     # `min_frag_size`/`max_frag_size` apply the caller's heavy-atom window here
@@ -446,8 +493,8 @@ def fragment_on_bond_d(mol, radius, min_frag_size=None, max_frag_size=None,
     # check, so the surviving set is unchanged; it only avoids annotating
     # submols that were about to be discarded. None disables the filter.
     atoms = mol.GetAtoms()
-    if ring_queries is None:
-        ring_queries = parent_ring_queries(mol)
+    if annotations is None:
+        annotations = parent_atom_annotations(mol)
     submols = []
     for atom in atoms:
         env = Chem.FindAtomEnvironmentOfRadiusN(mol, radius, atom.GetIdx(), 
@@ -465,10 +512,10 @@ def fragment_on_bond_d(mol, radius, min_frag_size=None, max_frag_size=None,
         # that correspondence).
         for orig_idx, sub_idx in amap.items():
             # '' means "leave bare"; the property must be set on every atom so
-            # _ring_queries_in_written_order can tell a real annotation set from
+            # _annotations_in_written_order can tell a real annotation set from
             # a mol built by a path that never annotated at all.
-            submol.GetAtomWithIdx(sub_idx).SetProp(RING_QUERY_PROP,
-                                                   ring_queries[orig_idx])
+            submol.GetAtomWithIdx(sub_idx).SetProp(ANNOTATION_PROP,
+                                                   annotations[orig_idx])
         # Store the submol and its atom indices in the original mol to ensure that if there 
         # are >1 instances of a frag in a single ligand, they won't get skipped
         orig_inds = sorted(amap.keys())

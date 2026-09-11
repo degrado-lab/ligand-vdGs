@@ -520,6 +520,90 @@ class GraphAutomorphismTests(unittest.TestCase):
             )
 
 
+class DeclaredAnnotationTests(unittest.TestCase):
+    """`D<n>` and `H0`/`!H0` in a fragment key restrict the permutation group.
+
+    Fragment keys are radius-balls, so a bridging heteroatom cut out of its
+    parent has fragment-graph degree 1 and used to join the terminal resonance
+    set -- letting a bridging O map onto a terminal O and making the group the
+    full dictionary-wide one.
+    """
+
+    def test_declared_degree_keeps_bridging_atoms_out_of_terminal_groups(self):
+        # Unannotated: all four oxygens still interchange.
+        self.assertEqual(
+            len(_automorphisms("[O;!R][P;!R]([O;!R])([O;!R])[O;!R]")), 24)
+        # Monoester: three terminal O, one bridging.
+        self.assertEqual(
+            len(_automorphisms(
+                "[O;D1;!R][P;!R]([O;D1;!R])([O;D1;!R])[O;D2;!R]")), 6)
+        # Diester: 2! terminal x 2! bridging.
+        self.assertEqual(
+            len(_automorphisms(
+                "[O;D1;!R][P;!R]([O;D1;!R])([O;D2;!R])[O;D2;!R]")), 4)
+        # Triester: one terminal O left, so no terminal group forms at all and
+        # only the three graph-identical bridging O exchange.
+        self.assertEqual(
+            len(_automorphisms(
+                "[O;D1;!R][P;!R]([O;D2;!R])([O;D2;!R])[O;D2;!R]")), 6)
+        self.assertEqual(
+            len(_automorphisms("[O;D1;!R][P;!R]([O;D1;!R])[O;D2;!R]")), 2)
+
+    def test_declared_degree_survives_resonance_label_nulling(self):
+        # Resonance membership nulls the atom's SMARTS label, so degree has to
+        # reach the label tuple by its own slot. Terminal finder (O) ...
+        self.assertEqual(
+            len(_automorphisms("[O;D1;!R][C;!R](=[O;D1;!R])[O;D1;!R]")), 6)
+        self.assertEqual(
+            len(_automorphisms("[O;D1;!R][C;!R](=[O;D1;!R])[O;D2;!R]")), 2)
+        # ... and the C-N finder, which nulls all three nitrogens.
+        self.assertEqual(
+            len(_automorphisms("[N;D1;!R][C;!R](=[N;D1;!R])[N;D1;!R]")), 6)
+        self.assertEqual(
+            len(_automorphisms("[N;D1;!R][C;!R](=[N;D1;!R])[N;D2;!R]")), 2)
+
+    def test_every_returned_mapping_preserves_declared_degree_and_h(self):
+        """The group order alone is a weak check -- a wrong group can match it."""
+        for smarts in (
+            "[O;D1;!R][P;!R]([O;D1;!R])([O;D1;!R])[O;D2;!R]",
+            "[O;D1;!R][P;!R]([O;D1;!R])([O;D2;!R])[O;D2;!R]",
+            "[N;D1;!R][C;!R](=[N;D1;!R])[N;D2;!R]",
+            "[c;!H0]1[c;!H0][c;!H0][c;H0][c;!H0][c;!H0]1",
+        ):
+            mol = utils.mol_from_fragment(smarts)
+            declared = [
+                (utils._query_primitive(atom, utils._QUERY_DEGREE_LINE),
+                 utils._query_primitive(atom, utils._QUERY_HCOUNT_LINE))
+                for atom in mol.GetAtoms()
+            ]
+            for permutation in utils.identify_mol_automorphisms(mol):
+                for i, image in enumerate(permutation):
+                    self.assertEqual(declared[i], declared[image], smarts)
+
+    def test_carbon_h_flag_splits_otherwise_identical_positions(self):
+        self.assertEqual(
+            len(_automorphisms("[c;!H0]1[c;!H0][c;!H0][c;!H0][c;!H0][c;!H0]1")),
+            12)
+        self.assertEqual(
+            len(_automorphisms("[c;!H0]1[c;!H0][c;!H0][c;H0][c;!H0][c;!H0]1")), 2)
+        self.assertEqual(
+            len(_automorphisms("[C;!R;!H0][O;D2;!R][C;!R;!H0]")), 2)
+        self.assertEqual(
+            len(_automorphisms("[C;!R;!H0][O;D2;!R][C;!R;H0]")), 1)
+
+    def test_declared_h_on_heteroatoms_stays_normalized(self):
+        """`H0`/`!H0` is a carbon primitive.
+
+        On N/O/S a declared H is the protonation drawing that the resonance
+        normalization exists to erase, so it must not re-split a terminal set.
+        """
+        self.assertEqual(
+            len(_automorphisms("[O;D1;!R;H1][C;!R](=[O;D1;!R;H0])[C;!R]")), 2)
+        self.assertEqual(
+            len(_automorphisms("[N;D2;!R;H1][C;!R](=[N;D1;!R;H0])[N;D1;!R;H0]")),
+            2)
+
+
 class ExtractElementsTests(unittest.TestCase):
     """One token per atom, in SMILES order -- the contract dock_utils raises on."""
 

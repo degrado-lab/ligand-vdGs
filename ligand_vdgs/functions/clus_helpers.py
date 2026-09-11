@@ -4,6 +4,7 @@ import os
 import numpy as np
 from itertools import combinations
 import getpass
+from ligand_vdgs.functions import vdg_npz_utils
 from ligand_vdgs.functions.vdg_struct_utils import (FLANK_UNCOMPARABLE,
     is_valid_backbone_coords)
 
@@ -25,7 +26,46 @@ COLUMN_DTYPES = {
     "quality": np.float32,      # (N, 4) cg_max_b, cg_min_occ, vdm_max_b, vdm_min_occ
     "vdm_o": np.float32,        # (N, n_res, 3) backbone carbonyl O per slot, NaN when
                                 # absent. Not a Stage-1 atom: never in cgvdmbb / RMSD.
+    # Per-CG-atom chemistry, not part of the fragment key, kept in SMARTS-slot
+    # order. Comparable across rows only after minimizing over cg_automorphisms
+    # (nr_vdgs/cg_symmetry.npz). -1 = perception couldn't determine it; 0 is an
+    # error (a CG is always a connected >=4-atom fragment), not a real value.
+    "cg_heavy_degree": np.int8,     # (N, n_cg)
+    # Nominal H count; protonation-bound under OpenBabel (see `perception`).
+    # Metadata only -- the key's carbon H flag is binary, not this.
+    "cg_num_h": np.int8,            # (N, n_cg)
+    "cg_formal_charge": np.int8,    # (N, n_cg)
+    # Each CG atom's heavy neighbours outside the match, packed as an element
+    # multiset (vdg_npz_utils.decode_nbr_elems). Metadata, not a key/partition
+    # field. Packed rather than string-stored to save space.
+    "cg_nbr_elems": np.uint32,      # (N, n_cg)
+    # Which perception produced this row's chemistry
+    # (ligand_perception.PERCEPTION_*). Non-negative so it can't collide with
+    # the -1 sentinel above.
+    "perception": np.int8,          # (N,)
+    # Per-slot SASA contact strength (session 3), stored unfiltered --
+    # filtering/weighting happens at read time. A^2 of CG surface this
+    # residue buries exclusively.
+    "vdm_buried_area": np.float32,    # (N, n_res)
+    # A^2 of jointly occluded CG surface credited to this residue: shared
+    # points are split 1/k over the k occluding residues (ligand included), so
+    # buried+shared sums to total occluded surface exactly once. 0.0 is a real
+    # value, not missing.
+    "vdm_shared_area": np.float32,    # (N, n_res)
+    "vdm_n_atom_pairs": np.int16,     # (N, n_res)
+    "vdm_min_heavy_dist": np.float32, # (N, n_res)
 }
+
+# Record fields with no default. Contact strength in particular must never be
+# filled with NaN when the environment dict lacks it: a silently zero-strength
+# library looks exactly like a real one until someone weights by it.
+_REQUIRED_RECORD_FIELDS = (
+    "cg_coords", "bbcoords", "flankseqs", "flankCAs", "biounit", "scrr",
+    "cg_names", "cg_elements", "cg_seg", "cg_chain", "cg_resnum", "cg_resname",
+    "slot_flags", "quality", "bbo",
+    "cg_heavy_degree", "cg_num_h", "cg_formal_charge", "cg_nbr_elems",
+    "perception", "buried_area", "shared_area", "n_atom_pairs", "min_heavy_dist",
+)
 
 
 def stage1_record_is_complete(record, n_cg, n_res):
@@ -53,6 +93,12 @@ def records_to_columns(records):
     """
     n = len(records)
     r0 = records[0]
+    for k, rec in enumerate(records):
+        missing = [f for f in _REQUIRED_RECORD_FIELDS if f not in rec]
+        if missing:
+            raise KeyError(
+                f"vdG record {k} is missing required field(s) {missing}; these "
+                "have no default (see _REQUIRED_RECORD_FIELDS)")
     n_cg, n_res = len(r0["cg_coords"]), len(r0["bbcoords"])
     n_flank = n_res * len(r0["flankseqs"][0])
     cols = {
@@ -73,7 +119,15 @@ def records_to_columns(records):
         "slot_flags": np.empty((n, n_res), dtype=np.int8),
         "quality": np.empty((n, 4), dtype=np.float32),
         "vdm_o": np.empty((n, n_res, 3), dtype=np.float32),
-    }
+        "cg_heavy_degree": np.empty((n, n_cg), dtype=np.int8),
+        "cg_num_h": np.empty((n, n_cg), dtype=np.int8),
+        "cg_formal_charge": np.empty((n, n_cg), dtype=np.int8),
+        "cg_nbr_elems": np.empty((n, n_cg), dtype=np.uint32),
+        "perception": np.empty(n, dtype=np.int8),
+        "vdm_buried_area": np.empty((n, n_res), dtype=np.float32),
+        "vdm_shared_area": np.empty((n, n_res), dtype=np.float32),
+        "vdm_n_atom_pairs": np.empty((n, n_res), dtype=np.int16),
+        "vdm_min_heavy_dist": np.empty((n, n_res), dtype=np.float32),}
     longest = {key: 0 for key, arr in cols.items() if arr.dtype.kind == "U"}
     for k, rec in enumerate(records):
         try:
@@ -101,10 +155,22 @@ def records_to_columns(records):
             cols["slot_flags"][k] = rec["slot_flags"]
             cols["quality"][k] = rec["quality"]
             cols["vdm_o"][k] = np.asarray(rec["bbo"], dtype=np.float32).reshape(n_res, 3)
+            cols["cg_heavy_degree"][k] = rec["cg_heavy_degree"]
+            cols["cg_num_h"][k] = rec["cg_num_h"]
+            cols["cg_formal_charge"][k] = rec["cg_formal_charge"]
+            # The record carries the miner's symbol strings, which stay
+            # readable in the annotation pickle; packing happens here, once.
+            cols["cg_nbr_elems"][k] = [vdg_npz_utils.encode_nbr_elems(sym)
+                                       for sym in rec["cg_nbr_elems"]]
+            cols["vdm_buried_area"][k] = rec["buried_area"]
+            cols["vdm_shared_area"][k] = rec["shared_area"]
+            cols["vdm_n_atom_pairs"][k] = rec["n_atom_pairs"]
+            cols["vdm_min_heavy_dist"][k] = rec["min_heavy_dist"]
         except ValueError as exc:
             raise ValueError(f"vdG record {k} does not match record 0's shape "
                              f"(n_cg={n_cg}, n_res={n_res}, flank={n_flank}): {exc}")
         cols["cg_resnum"][k] = rec["cg_resnum"]
+        cols["perception"][k] = rec["perception"]
         for key in ("biounit", "cg_seg", "cg_chain", "cg_resname"):
             cols[key][k] = rec[key]
             longest[key] = max(longest[key], len(rec[key]))

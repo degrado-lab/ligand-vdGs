@@ -1,8 +1,10 @@
 """Multi-character chain IDs (columns 21-22) collide under every single-column reader.
 
 Real case: 8any in the 2026-09 database, chain ``A4`` residue 66 (ASP, HETATM) and
-chain ``4`` residue 66 (PHE, ATOM) -- ProDy 2.6 gives both one resindex, and vdG-miner
-then drops the structure because probe and PDB lines hash differently.
+chain ``4`` residue 66 (PHE, ATOM) -- ProDy 2.6 gives both one resindex, so two
+residues merge into one and the contact gate measures the merged pair. The miner no
+longer drops such a structure outright (that was the Probe-line hash mismatch), which
+makes the residue-level collision the remaining defect, not a secondary one.
 """
 import io
 import unittest

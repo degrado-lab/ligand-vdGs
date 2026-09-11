@@ -29,8 +29,11 @@ class StemTests(unittest.TestCase):
         path = parent_db.structure_path("/db", "1abc_2")
         self.assertEqual(path, os.path.join("/db", "ab", "1abc_2.pdb"))
         self.assertEqual(parent_db.stem_of(path), "1abc_2")
-        self.assertEqual(parent_db.probe_path("/probe", "1abc_2"),
-                         os.path.join("/probe", "ab", "1abc_2.probe.gz"))
+
+    def test_no_probe_mirror_is_addressable_any_more(self):
+        """The contact gate reads structures only; a probe mirror is not an input."""
+        self.assertFalse(hasattr(parent_db, "probe_path"))
+        self.assertFalse(hasattr(parent_db, "PROBE_EXT"))
 
 
 class MirrorTests(unittest.TestCase):

@@ -1,5 +1,6 @@
 # vdg_npz_utils.py
 
+import json
 import os
 import time
 import zipfile
@@ -721,6 +722,12 @@ def load_bucket_npz(npz_path):
         return None
     try:
         with np.load(npz_path) as data:
+            # Checked here too, not only in load_vdg_bucket
+            version = bucket_schema_version(data)
+            if version != BUCKET_SCHEMA_VERSION:
+                raise BucketSchemaMismatch(
+                    f"{npz_path} was written pre-refactor; "
+                    f"rebuild the frag lib.")
             return {key: data[key] for key in data.files}
     except CORRUPT_NPZ_ERRORS as e:
         print(f"[WARNING] Could not load {npz_path}: {type(e).__name__}: {e}")
@@ -743,6 +750,88 @@ def _vdg_job_completed(frag_name, vdg_lib_dir):
     if key not in _vdg_job_status_cache:
         _vdg_job_status_cache[key] = check_vdg_job_status(frag_name, vdg_lib_dir)
     return _vdg_job_status_cache[key]
+
+
+# Neighbour-element multiset packing. 
+# Multiplicity is kept -- a carbon with two carbon neighbours outside the
+# match is not the same environment as one with a single carbon.
+NBR_ELEM_SLOTS = ('C', 'N', 'O', 'S', 'P', 'F', 'Cl', 'Br', 'I', 'X')
+_NBR_ELEM_BITS = 3          # counts 0-7, saturating; 10 slots = 30 bits
+_NBR_ELEM_MAX = (1 << _NBR_ELEM_BITS) - 1
+_NBR_ELEM_INDEX = {sym: i for i, sym in enumerate(NBR_ELEM_SLOTS)}
+
+
+def encode_nbr_elems(symbols):
+    """Element symbols of one atom's out-of-match heavy neighbours -> uint32.
+
+    Anything outside NBR_ELEM_SLOTS counts into the 'X' slot, so a metal or a
+    selenium neighbour is recorded as present rather than dropped. Counts
+    saturate at 7, which no real atom reaches (at most four heavy neighbours).
+    """
+    code = 0
+    for symbol in symbols:
+        i = _NBR_ELEM_INDEX.get(str(symbol).strip().capitalize(),
+                                _NBR_ELEM_INDEX['X'])
+        shift = i * _NBR_ELEM_BITS
+        count = (code >> shift) & _NBR_ELEM_MAX
+        if count < _NBR_ELEM_MAX:
+            code += 1 << shift
+    return code
+
+
+def decode_nbr_elems(code):
+    """uint32 -> tuple of element symbols, with multiplicity.
+
+    Canonical in NBR_ELEM_SLOTS order, which is not the alphabetical order the
+    miner's debug string used; compare decoded tuples, not strings.
+    """
+    out = []
+    for i, symbol in enumerate(NBR_ELEM_SLOTS):
+        out.extend([symbol] * ((int(code) >> (i * _NBR_ELEM_BITS)) & _NBR_ELEM_MAX))
+    return tuple(out)
+
+
+def cg_annot_pkl_path(cg_match_dict_pkl):
+    """The per-CG-atom annotation pickle that sits beside a matches pickle.
+    """
+    base = cg_match_dict_pkl
+    if base.endswith('.pkl'):
+        base = base[:-len('.pkl')]
+    return f'{base}.annot.pkl'
+
+
+class BucketSchemaMismatch(Exception):
+    """A bucket npz written by an incompatible version of the writer.
+
+    Deliberately outside CORRUPT_NPZ_ERRORS, which downgrades a bad file to a
+    warning so one unreadable bucket cannot abort a run over thousands.
+    """
+
+
+BUCKET_SCHEMA_VERSION = 2
+# What the per-atom annotation columns mean, recorded alongside the version so a
+# later reader can tell a schema bump from a semantics change.
+ANNOTATION_SCHEMA = (
+    "cg_heavy_degree/cg_num_h/cg_formal_charge int8 per CG atom (-1 unreadable, "
+    "degree 0 invalid); cg_nbr_elems uint32 packed heavy-neighbour element "
+    "multiset outside the match (decode_nbr_elems); "
+    "perception int8 (0 ccd, 1 openbabel, 2 smiles, 3 atom-name table); "
+    "vdm_buried_area / vdm_shared_area float32, vdm_n_atom_pairs int16, "
+    "vdm_min_heavy_dist float32 per vdM slot")
+
+
+def bucket_schema_version(data):
+    """The schema version recorded in an open bucket npz.
+
+    Version 1 is any bucket written before the provenance block refactor 
+    existed, so its numbers are not comparable with a current build.
+    """
+    if "schema" not in getattr(data, "files", []):
+        return 1
+    try:
+        return int(json.loads(str(data["schema"]))["schema_version"])
+    except Exception:
+        return 1
 
 
 def load_vdg_bucket(vdg_lib_dir, frag_name, subset_size, aa_bucket):
@@ -771,6 +860,12 @@ def load_vdg_bucket(vdg_lib_dir, frag_name, subset_size, aa_bucket):
 
     try:
         with np.load(npz_path) as data:
+            version = bucket_schema_version(data)
+            if version != BUCKET_SCHEMA_VERSION: # refuse
+                raise BucketSchemaMismatch(
+                    f"{npz_path} was written with bucket schema version "
+                    f"{version}, but this code reads version "
+                    f"{BUCKET_SCHEMA_VERSION}; rebuild the fragment.")
             return dict(
                 aa_bucket_parts=[str(x) for x in data["aa_bucket_parts"]],
                 cluster_id=data["cluster_id"].astype(np.int32),

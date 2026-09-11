@@ -14,7 +14,6 @@ All defaults are set for the Wynton HPC cluster. If you are running on a differe
 cluster or with a custom database, override the relevant flags (see usage below).
 Paths that typically need to change for a custom setup:
     --pdb-dir      directory of prepared, protonated PDB files (your parent database)
-    --probe-dir    directory of Probe output files for those PDBs
     --vdg-lib-dir  where to write the vdG library output
     --log-dir      where SGE should write job logs
 
@@ -22,7 +21,6 @@ Paths that typically need to change for a custom setup:
 Usage:
     python ligand_vdgs/generate_vdgs/make_sge_scripts_for_frags.py \\
         --pdb-dir   <path/to/your/pdb_database/> \\
-        --probe-dir <path/to/your/probe_output/> \\
         --vdg-lib-dir <path/to/output/vdg_library/> \\
         --log-dir   <path/to/sge_logs/> \\
         --max-h-rt  <HH:MM:SS>
@@ -36,6 +34,7 @@ import argparse
 import pickle as pkl
 from ligand_vdgs.functions import utils
 from ligand_vdgs.functions.utils import _int_or_none, file_sha256
+from ligand_vdgs.functions.db_identity import identity_of
 from ligand_vdgs.functions.vdg_npz_utils import load_fragment_aliases
 from ligand_vdgs.generate_vdgs.extract_fragment_smiles import (
     alias_kind, fragment_dict_keys, prepare_fragments, resolve_include_fragments,
@@ -198,11 +197,14 @@ def _selection_inputs(args):
 def write_provenance(vdg_lib_dir, args):
     record = _selection_inputs(args)
     record['min_instances'] = args.min_instances      # recorded, not compared
-    # Also recorded, not compared: the parent db is machine-local, so a top-up run
+    # Recorded, not compared: the parent db is machine-local, so a top-up run
     # elsewhere legitimately differs. Buckets store this per file too; here it is
     # one editable place saying what the library was built against, for a copy
-    # whose reader must point $PARENT_PDBS_DIR somewhere local.
+    # whose reader must point $PARENT_PDBS_DIR somewhere local. What *is* compared
+    # is the database's contents (functions/db_identity), so the same parent database at a
+    # different path is accepted while a different database at the same path is not.
     record['parent_pdb_dir'] = os.path.abspath(args.pdb_dir)
+    record['parent_db_identity'] = identity_of(args.pdb_dir)['sha256']
     os.makedirs(vdg_lib_dir, exist_ok=True)
     # Written via a temp file: a crash mid-dump would otherwise leave truncated
     # JSON that makes every later check_provenance raise on json.load, which
@@ -215,12 +217,100 @@ def write_provenance(vdg_lib_dir, args):
     os.replace(tmp, final)
 
 
+def check_recorded_inputs(recorded, args, source, top_up, max_size_is_error):
+    """One policy for every recorded-vs-current comparison, so the library's provenance
+    and the cost estimate's header cannot drift apart.
+
+    *recorded* is the normalised record (see the two callers); a key it does not carry
+    was written before that line existed, so it is "unknown", not "mismatched", and only
+    warns. *top_up* is --include-only.
+
+    Severity per field:
+
+    - `db_identity`: always fatal. The counts and the mined environments are both
+      properties of one parent database, and a different one is never legitimate -- not
+      even in top-up mode, where the additions would come from a database the rest of
+      the library was not built from. Compared by contents, not by path
+      (functions/db_identity), so the same parent database at a different path passes and a
+      different database at the same path does not. A record written before identities
+      existed carries none; the identity is then computed from the directory on demand
+      and, if it can be cached, will be present next time.
+    - `pdb_dir`: informational. It is where the database was when the record was
+      written, which a copy to another machine legitimately changes, so it only warns.
+    - `frags_dict_sha256`: fatal on a full build, a warning under --include-only. A
+      top-up grows the dict by design, and the real guard there is select_fragments,
+      which raises if the estimate does not cover an included fragment.
+    - `max_size`: fatal only where a mismatch actually invalidates the record
+      (*max_size_is_error*), because the two callers differ -- see them.
+    """
+    problems = []
+
+    recorded_identity = recorded.get('db_identity')
+    if recorded_identity is None:
+        print(f'[WARNING] {source} records no parent-database identity (written before '
+              f'that was added), so this run cannot confirm it describes '
+              f'{os.path.abspath(args.pdb_dir)}.')
+    else:
+        current = identity_of(args.pdb_dir)
+        if recorded_identity != current['sha256']:
+            problems.append(
+                f'parent database contents: recorded identity '
+                f'{recorded_identity[:12]}..., {os.path.abspath(args.pdb_dir)} is '
+                f'{current["sha256"][:12]}... ({current["n_structures"]} structures)')
+
+    recorded_pdb_dir = recorded.get('pdb_dir')
+    if (recorded_pdb_dir is not None
+            and os.path.abspath(recorded_pdb_dir) != os.path.abspath(args.pdb_dir)):
+        # Not a problem: the identity above decides whether it is the same database.
+        print(f'[WARNING] {source} was written against {recorded_pdb_dir}, this run uses '
+              f'{os.path.abspath(args.pdb_dir)}. Informational only -- the database '
+              f'contents are what is checked.')
+
+    recorded_sha = recorded.get('frags_dict_sha256')
+    current_sha = file_sha256(args.frags_dict)
+    dict_name = os.path.basename(args.frags_dict)
+    if recorded_sha is None:
+        print(f'[WARNING] {source} records no frags_dict hash (written before that was '
+              f'added), so it cannot be verified against --frags-dict. Regenerate it if '
+              f'the dict has changed.')
+    elif recorded_sha != current_sha:
+        detail = (f'{dict_name}: recorded sha256 {recorded_sha[:12]}..., this run has '
+                  f'{current_sha[:12]}...')
+        if top_up:
+            print(f'[WARNING] {source} was computed from a different {dict_name} '
+                  f'({detail}). A top-up grows the dict by design; fragment grouping may '
+                  f'still have changed, so regenerate to be sure.')
+        else:
+            problems.append(detail)
+
+    recorded_max_size = recorded.get('max_size')
+    if recorded_max_size is not None and int(recorded_max_size) != args.max_size:
+        detail = (f'--max-size: recorded {recorded_max_size}, this run uses '
+                  f'{args.max_size}')
+        if max_size_is_error:
+            problems.append(detail)
+        else:
+            print(f'[WARNING] {source} was computed at {detail}.')
+
+    if problems:
+        raise SystemExit(
+            f'ERROR: {source} does not match this run ('
+            + '; '.join(problems) +
+            '). The recorded inputs decide which fragments are built and which key a '
+            'SMARTS resolves to, so they must match the run that uses them. Either '
+            'regenerate the record, or restore the recorded inputs.')
+
+
 def check_provenance(vdg_lib_dir, args):
     """Refuse a top-up whose fragment resolution would not match the library's.
 
-    A missing file means the library predates this check, which cannot be
-    verified either way -- warn rather than block, so an older library stays
-    usable.
+    A missing file means the library predates this check, which cannot be verified
+    either way -- warn rather than block, so an older library stays usable.
+
+    --max-size is fatal here: prepare_fragments derives the representative/alias mapping
+    from it, so a change silently resolves the same SMARTS to a different key and writes
+    a directory the rest of the library does not match. That is a property of the
+    library, not of a threshold, so growing the dict does not excuse it.
     """
     path = provenance_path(vdg_lib_dir)
     if not os.path.isfile(path):
@@ -230,21 +320,30 @@ def check_provenance(vdg_lib_dir, args):
               f'the rest of the library does not use.')
         return
     with open(path) as handle:
-        recorded = json.load(handle)
-    current = _selection_inputs(args)
-    differing = {k: (recorded.get(k), v) for k, v in current.items()
-                 if recorded.get(k) != v}
-    # A moved-but-identical dict is not a conflict; the hash is what matters.
-    differing.pop('frags_dict', None)
-    if differing:
-        detail = '; '.join(f'{k}: library has {was!r}, this run has {now!r}'
-                           for k, (was, now) in sorted(differing.items()))
-        raise SystemExit(
-            f'ERROR: --include-only cannot add to {vdg_lib_dir}: the inputs that '
-            f'decide how a fragment SMARTS resolves have changed since it was '
-            f'built ({detail}). The same request can now resolve to a different '
-            f'fragment key than the rest of the library uses. Either rebuild the '
-            f'library, or restore the recorded inputs.')
+        record = json.load(handle)
+    # write_provenance names the parent database parent_pdb_dir; normalise so one
+    # policy function sees one vocabulary. A moved-but-identical dict is not a
+    # conflict, so frags_dict itself is not passed on -- the hash is what matters.
+    recorded = {'pdb_dir': record.get('parent_pdb_dir'),
+                'db_identity': record.get('parent_db_identity'),
+                'frags_dict_sha256': record.get('frags_dict_sha256'),
+                'max_size': record.get('max_size')}
+    check_recorded_inputs(recorded, args, f'{path} (this library\'s provenance)',
+                          top_up=args.include_only, max_size_is_error=True)
+
+
+def check_estimate_header(header, args):
+    """Verify a pre-computed --frag-cost-estimate against this run's inputs.
+
+    --max-size only warns here: the estimate is a set of counts, and the membership
+    check in main() already raises when it does not cover every current candidate,
+    which is the case a changed --max-size actually breaks. A smaller --max-size leaves
+    the estimate a superset, which is still usable.
+    """
+    recorded = dict(header)
+    recorded['db_identity'] = header.get('pdb_db_identity')
+    check_recorded_inputs(recorded, args, args.frag_cost_estimate,
+                          top_up=args.include_only, max_size_is_error=False)
 
 
 def parse_args():
@@ -287,9 +386,6 @@ def parse_args():
     parser.add_argument('--pdb-dir',
                         default='/wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2/',
                         help="Path to parent PDB database.")
-    parser.add_argument('--probe-dir',
-                        default='/wynton/group/degradolab/skt/docking/databases/probe_output/',
-                        help="Path to Probe output directory.")
     parser.add_argument('--max-num-clus', default=None, type=_int_or_none,
                         help="Max number of vdGs to cluster per subset. Default: no limit.")
     parser.add_argument('--h-rt', default=None, type=_h_rt,
@@ -359,14 +455,12 @@ def main():
     # than here. --pdb-dir additionally drives fragment *selection* via the
     # inline cost estimate, so a wrong-but-existing parent db silently changes
     # which fragments get built -- validate its existence at minimum.
-    for path, flag in [(args.log_dir, '--log-dir'), (args.pdb_dir, '--pdb-dir'),
-                       (args.probe_dir, '--probe-dir')]:
+    for path, flag in [(args.log_dir, '--log-dir'), (args.pdb_dir, '--pdb-dir')]:
         if not os.path.isdir(path):
             raise NotADirectoryError(f"{flag} directory does not exist: {path}")
 
     replace = {'$LOG_DIR':       args.log_dir,
                '$PDB_DIR':       args.pdb_dir,
-               '$PROBE_DIR':     args.probe_dir,
                '$OUTPUT_DIR':    args.vdg_lib_dir,
                '$MAX_NUM_CLUS':  str(args.max_num_clus),
                '$SUBSET_SIZES':  ' '.join(str(s) for s in sorted(set(args.subset_sizes))),
@@ -400,22 +494,7 @@ def main():
         # *grouping* changed keeps every key present while silently reassigning
         # which of them is a representative, so compare the recorded identity too.
         _hdr = read_estimate_header(args.frag_cost_estimate)
-        _recorded = _hdr.get('frags_dict_sha256')
-        if _recorded is None:
-            print(f'[WARNING] {args.frag_cost_estimate} records no frags_dict hash '
-                  f'(written before that was added), so it cannot be verified '
-                  f'against --frags-dict. Regenerate it if the dict has changed.')
-        elif _recorded != file_sha256(args.frags_dict):
-            print(f'[WARNING] {args.frag_cost_estimate} was computed from a '
-                  f'different {os.path.basename(args.frags_dict)} (sha256 '
-                  f'{_recorded[:12]}... vs {file_sha256(args.frags_dict)[:12]}...). '
-                  f'Counts still cover every current candidate or the check below '
-                  f'would fail, but fragment grouping may have changed since. '
-                  f'Regenerate with estimate_frag_cost.py to be sure.')
-        _hdr_max_size = _hdr.get('max_size')
-        if _hdr_max_size is not None and int(_hdr_max_size) != args.max_size:
-            print(f'[WARNING] {args.frag_cost_estimate} was computed at --max-size '
-                  f'{_hdr_max_size}, this run uses {args.max_size}.')
+        check_estimate_header(_hdr, args)
         _scale = _hdr.get('sample_scale')
         sample_scale = float(_scale) if _scale is not None else None
         missing = [s for s in candidates if s not in est]

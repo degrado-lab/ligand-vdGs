@@ -59,6 +59,7 @@ import pickle as pkl
 from collections import defaultdict
 from rdkit import Chem, RDLogger
 from ligand_vdgs.functions import Frags
+from ligand_vdgs.functions import ligand_perception
 from ligand_vdgs.functions.utils import (fragment_key_query_mol,
                                          fragment_query_mols_equivalent)
 
@@ -127,7 +128,7 @@ def process_ligand(task):
     # and the element filter below only needs atom symbols. Sanitizing before
     # that filter would reclassify metal complexes that fail valence checks
     # as parse failures instead of as non-druglike.
-    orig_mol = Chem.MolFromSmiles(smiles, sanitize=False)
+    orig_mol = ligand_perception.perceive_ligand_graph(lig_resname, smiles).mol
 
     if orig_mol is None:
         # The CCD writes dative bonds as '|', which RDKit rejects (it uses
@@ -239,6 +240,18 @@ def main():
     out_dict_path = os.path.join(args.outdir, 'database_frags_dict.pkl')
     if os.path.exists(out_dict_path):
         raise FileExistsError(f'Output file {out_dict_path} already exists. Exiting.')
+
+    # Warned, not raised: unlike the miner, this script has a real fallback
+    # (the ligand table's SMILES), and non-CCD ligands legitimately use it.
+    # But a run where the store is simply missing produces a whole library
+    # built on SMILES chemistry that will not agree with the miner's, and the
+    # only other trace is the provenance counter at the end.
+    try:
+        ligand_perception.require_template_store()
+    except Exception as exc:
+        print(f'[WARNING] CCD template store unusable ({exc}); every ligand '
+              'will fall back to its SMILES, which is NOT the chemistry the '
+              'miner will use.', flush=True)
 
     os.makedirs(args.outdir, exist_ok=True)
     log_dir = os.path.dirname(args.logfile)

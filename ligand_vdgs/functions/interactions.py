@@ -10,7 +10,14 @@ def get_nr_res_interactions_with_ligs_in_pdb(ligand, atoms, dist_cutoff=4.8,
     single PDB. Unrefined redundancy refers to a crude/quick and dirty way of measuring
     redundancy. Later on in the vdg creation process, there will be an opportunity to refine
     redundancy checks. This quick/dirty approximation is to reduce the size of the database in
-    the first place (for prepwizard, probe, etc.)
+    the first place (for prepwizard, etc.)
+
+    This is the database-*selection* step and deliberately not the contact gate. It
+    asks only "does this ligand have any protein near it at all", on the whole
+    ligand, before anything is prepared; the vdG membership criterion is buried CG
+    surface (`ligand_vdgs.functions.sasa`), measured per chemical group after
+    preparation. Do not collapse the two: loosening this cutoff changes which
+    structures enter the database, not which residues enter a vdG.
 
     dist_cutoff refers to distance between ligand heavy atom and protein heavy atom.
 

@@ -3,15 +3,13 @@
 The parent database is an RCSB-style mirror, ``<dir>/<shard>/<stem>.pdb`` with
 ``shard = stem[1:3].lower()``. A stem is ``1abc`` or ``1abc_2`` (assembly 2);
 its *entry* is the text before the first underscore, which also holds for
-PLINDER system IDs (``1abc__1__1.A__1.B``). Probe output mirrors the same
-layout with its own extension. Nothing else in the pipeline slices a stem or
-builds one of these paths.
+PLINDER system IDs (``1abc__1__1.A__1.B``). Nothing else in the pipeline slices
+a stem or builds one of these paths.
 """
 import glob
 import os
 
 STRUCTURE_EXT = ".pdb"
-PROBE_EXT = ".probe.gz"
 KNOWN_STRUCT_EXTS = (".pdb.gz", ".pdb", ".cif.gz", ".cif", ".gz")
 
 
@@ -21,10 +19,6 @@ def shard(stem):
 
 def structure_path(pdb_dir, stem):
     return os.path.join(pdb_dir, shard(stem), stem + STRUCTURE_EXT)
-
-
-def probe_path(probe_dir, stem):
-    return os.path.join(probe_dir, shard(stem), stem + PROBE_EXT)
 
 
 def stem_of(path):

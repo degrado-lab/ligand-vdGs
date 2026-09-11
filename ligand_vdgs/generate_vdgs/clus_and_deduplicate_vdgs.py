@@ -24,6 +24,8 @@ import hashlib
 import fcntl
 import errno
 import itertools
+import datetime
+import subprocess
 from collections import OrderedDict, deque, namedtuple
 
 # Distinct exit code for "the run completed but streamed nothing". Not 1:
@@ -127,31 +129,37 @@ add_vdg_miner_paths()
 from fingerprint_helpers import (align_coords_sanity_check,
     _resolve_duplicate_ligand_occupancies,)
 from constants import cg_atoms
+try:
+    import cg  # vdG-miner, for its git rev only
+except Exception:  # pragma: no cover - provenance is best-effort
+    cg = None
 
 from ligand_vdgs.functions import align_and_cluster as clust
-from ligand_vdgs.functions import parent_db
+from ligand_vdgs.functions import ligand_perception, parent_db
 from ligand_vdgs.functions.clus_helpers import (
     get_vdg_subsets_target_size, select_diverse_pdbIDs, _aa_tmp_dir,
     _stream_root, stage1_record_is_complete, records_to_columns, concat_columns,
     save_shard, load_shard, save_columns, load_columns, load_stage1, COLUMNS_FILE)
 from ligand_vdgs.functions.vdg_struct_utils import (VDM_OCC, cg_slot_occupancy,
     get_cg_atoms, is_hydrogen)
+from ligand_vdgs.functions import vdg_npz_utils
 from ligand_vdgs.functions.vdg_npz_utils import (write_cg_symmetry, name_selstr,
     parse_pdb_with_retry)
 from ligand_vdgs.functions.vdg_fp_utils import build_perm_group, slot_orders
-from ligand_vdgs.functions.align_and_cluster import butina_partition, neighbor_csr, stage1_edges
+from ligand_vdgs.functions.align_and_cluster import (
+    butina_partition, neighbor_csr_from_chunks, stage1_edges)
 from ligand_vdgs.functions.dock_utils import cg_element_symbols
 from ligand_vdgs.functions.compute_profile import ComputeProfile
 from ligand_vdgs.functions.utils import (convert_time_elapsed, normalize_rmsd,
     identify_mol_automorphisms, mol_from_fragment, validate_atom_permutations,
     _int_or_none,)
 
-# Max distance from a CG atom to the nearest heavy atom of a vdM residue. Numerically
-# the same 4.5 A that align_and_cluster.reorder_vdg_subset uses, but that one only
-# *labels* a slot (sidechain vs backbone moiety) and never rejects it, so this is the
-# only place a non-contacting slot is actually dropped -- don't expect a second check
-# downstream.
-CG_VDM_CONTACT_CUTOFF = 4.5
+# There is deliberately no CG-vdM distance cutoff here. Membership is decided
+# upstream by buried SASA of the CG atoms (rebuild-notes 4), under which a
+# residue legitimately buries CG surface out to ~6.5 A -- the 4.5 A heavy-atom
+# guard that used to live here re-dropped exactly those members, and discarded
+# the whole environment when any one slot failed. Contact strength is stored
+# per slot instead and thresholded at read time.
 
 # Longest distance treated as a plausible covalent bond between two CG atoms. Set
 # above every bond a drug-like fragment can contain (C-I is 2.14 A, S-S 2.05 A) plus
@@ -325,6 +333,56 @@ Subgroup = namedtuple("Subgroup", "stage1_id stage2_id nr_idx member_idxs radius
 
 _QUALITY_FIELDS = ("cg_max_b", "cg_min_occ", "vdm_max_b", "vdm_min_occ")
 
+# Room for the JSON below plus two 40-char git revs and a long parent_pdb_dir.
+_SCHEMA_JSON_WIDTH = 2048
+
+
+_GIT_REV_CACHE = {}
+
+
+def _git_rev(path):
+    """Short git rev of the repo containing `path`, or '' if unavailable.
+
+    Best-effort on purpose: compute nodes have no network and a build from a
+    tarball has no .git, neither of which should stop a bucket being written.
+
+    Cached per process: this is called from _write_bucket_npz, i.e. once per
+    bucket and thousands of times per fragment job, and each miss is a
+    subprocess on Wynton's NFS with a 10 s timeout.
+    """
+    directory = os.path.dirname(path) or "."
+    if directory in _GIT_REV_CACHE:
+        return _GIT_REV_CACHE[directory]
+    _GIT_REV_CACHE[directory] = _git_rev_uncached(directory)
+    return _GIT_REV_CACHE[directory]
+
+
+def _git_rev_uncached(directory):
+    try:
+        out = subprocess.run(["git", "-C", directory,
+                              "rev-parse", "--short", "HEAD"],
+                             capture_output=True, text=True, timeout=10)
+        return out.stdout.strip() if out.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _bucket_schema_provenance(parent_pdb_dir):
+    """The provenance block every bucket carries, as JSON (not pickle).
+
+    `schema_version` is what the reader refuses on: the columns and their
+    meanings changed incompatibly in the rebuild, and a mixed-version library
+    would fail as wrong numbers rather than as an error.
+    """
+    return json.dumps({
+        "schema_version": vdg_npz_utils.BUCKET_SCHEMA_VERSION,
+        "build_date": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "parent_pdb_dir": str(parent_pdb_dir or ""),
+        "annotation_schema": vdg_npz_utils.ANNOTATION_SCHEMA,
+        "ligand_vdgs_rev": _git_rev(__file__),
+        "vdg_miner_rev": _git_rev(cg.__file__) if cg is not None else "",
+    }, sort_keys=True)
+
 
 def _write_bucket_npz(vdglib_dir, size_subset, reordered_AAs, cols, subgroups,
                       parent_pdb_dir):
@@ -435,6 +493,38 @@ def _write_bucket_npz(vdglib_dir, size_subset, reordered_AAs, cols, subgroups,
         "mem_cg_resnum": cols["cg_resnum"][mem],
         "mem_cg_resname": cols["cg_resname"][mem],
     }
+    # Per-CG-atom chemistry and per-slot contact strength, on BOTH row sets:
+    # counting observations rather than clusters needs mem_ rows, and any
+    # read-time pooling or weighting on these fields is invalid if half the
+    # observations lack them.
+    for key, col in (("cg_heavy_degree", "cg_heavy_degree"),
+                     ("cg_num_h", "cg_num_h"),
+                     ("cg_formal_charge", "cg_formal_charge"),
+                     ("cg_nbr_elems", "cg_nbr_elems"),
+                     ("perception", "perception"),
+                     ("vdm_buried_area", "vdm_buried_area"),
+                     ("vdm_shared_area", "vdm_shared_area"),
+                     ("vdm_n_atom_pairs", "vdm_n_atom_pairs"),
+                     ("vdm_min_heavy_dist", "vdm_min_heavy_dist")):
+        arrays[f"nr_{key}"] = cols[col][nr]
+        arrays[f"mem_{key}"] = cols[col][mem]
+
+    # A CG is a connected fragment of at least four heavy atoms, so no CG atom
+    # can have zero heavy neighbours. Zero here means the perception returned a
+    # degree it never computed, and it would be indistinguishable from a real
+    # value once written. -1 is the legitimate "could not read it" value.
+    bad_degree = (cols["cg_heavy_degree"][np.concatenate([nr, mem])] == 0)
+    if bad_degree.any():
+        raise ValueError(
+            f"bucket {'_'.join(reordered_AAs)}: {int(bad_degree.sum())} CG atoms "
+            "carry heavy degree 0, which no atom of a connected fragment can "
+            "have; use -1 for unreadable.")
+
+    arrays["schema"] = np.asarray(_bucket_schema_provenance(parent_pdb_dir),
+                                  dtype=f"U{_SCHEMA_JSON_WIDTH}")
+    if len(str(arrays["schema"])) >= _SCHEMA_JSON_WIDTH:
+        raise ValueError("bucket provenance JSON reaches the dtype width and "
+                         "would be truncated; widen _SCHEMA_JSON_WIDTH.")
     # Measured on the atoms that enter the vdG -- CG atoms and the contacting
     # residues' heavy atoms. Stored so a stricter cut is a read-path decision.
     for k, key in enumerate(_QUALITY_FIELDS):
@@ -629,8 +719,11 @@ def _edges_path(bucket, k):
 def _task_stage1_block(run, bucket, payload):
     """Within-cutoff pairs for one block of rows, written to scratch."""
     k, start, stop = payload
-    cols = {"cgvdmbb": np.asarray(load_stage1(bucket.bucket_dir, mmap=True)),
-            "cg_names": load_shard(os.path.join(bucket.bucket_dir, COLUMNS_FILE))["cg_names"]}
+    # One block of many, so read only the column this needs: load_shard
+    # materializes every array in the npz, and only cg_names' width is used.
+    with np.load(os.path.join(bucket.bucket_dir, COLUMNS_FILE)) as columns:
+        cols = {"cgvdmbb": np.asarray(load_stage1(bucket.bucket_dir, mmap=True)),
+                "cg_names": columns["cg_names"]}
     n_cg, cutoff, perm_group = _bucket_geometry(run, bucket, cols)
     stats = {}
     t0 = time.time()
@@ -653,12 +746,17 @@ def _task_stage1_partition(run, bucket, n_blocks):
     """Assemble the row blocks' edges into the neighbour graph and partition it.
     The partition goes to scratch (largest cluster first); the sizes come back."""
     t0 = time.time()
-    parts = [np.load(_edges_path(bucket, k)) for k in range(n_blocks)]
-    qi = np.concatenate([part[0] for part in parts])
-    qj = np.concatenate([part[1] for part in parts])
-    del parts
-    clusters = _rank_clusters(butina_partition(*neighbor_csr(bucket.n, qi, qj)))
-    del qi, qj
+
+    def _chunks():
+        # Streamed, not concatenated: this task is the one point where the whole
+        # pool waits on a single process, and holding every block's edges at
+        # once cost several times the neighbour lists they build.
+        for k in range(n_blocks):
+            part = np.load(_edges_path(bucket, k))
+            yield part[0], part[1]
+
+    clusters = _rank_clusters(butina_partition(
+        *neighbor_csr_from_chunks(bucket.n, _chunks)))
     sizes = np.asarray([len(c) for c in clusters], dtype=np.int32)
     indptr = np.zeros(sizes.size + 1, dtype=np.int64)
     np.cumsum(sizes, out=indptr[1:])
@@ -681,7 +779,14 @@ def _load_partition(bucket):
 
 
 def _task_stage2_block(run, bucket, cluster_ids):
-    cols = load_columns(bucket.bucket_dir)
+    # Runs once per Stage-2 block, so a full load_columns re-read the whole
+    # bucket per block and gave each concurrent worker its own copy. Only these
+    # three columns are read, and mmapping the coordinates lets the blocks share
+    # the page cache instead; Stage 2 gathers its own clusters' rows out of it.
+    with np.load(os.path.join(bucket.bucket_dir, COLUMNS_FILE)) as columns:
+        cols = {name: columns[name]
+                for name in ("cg_names", "flank_seq", "flank_ca")}
+    cols["cgvdmbb"] = load_stage1(bucket.bucket_dir, mmap=True)
     n_cg, _cutoff, perm_group = _bucket_geometry(run, bucket, cols)
     clusters = _load_partition(bucket)
     return _stage2_for_clusters(run, bucket, cols, clusters, cluster_ids, perm_group, n_cg)
@@ -707,13 +812,17 @@ def _run_task(kind, run, bucket, payload):
     look like a finished library. Failures come back as text; the driver drops
     a .FAILED marker, skips the bucket's remaining tasks, and exits non-zero
     at the end."""
+    # time.time(), not perf_counter(): the driver compares spans across worker
+    # processes to reconstruct how many slots were busy, and perf_counter's
+    # origin is per-process.
+    t0 = time.time()
     try:
-        return kind, bucket.key, _TASKS[kind](run, bucket, payload), None
+        return kind, bucket.key, _TASKS[kind](run, bucket, payload), None, t0, time.time()
     except Exception as exc:
         return kind, bucket.key, None, (
             f"[WORKER ERROR] AA bucket: {bucket.key[1]} (subset size "
             f"{bucket.size_subset}, task {kind})\nException: {exc}\n"
-            f"Traceback:\n{traceback.format_exc()}")
+            f"Traceback:\n{traceback.format_exc()}"), t0, time.time()
 
 def _parse_pdb_with_retry(pdb_file, attempts=3, delay=0.5):
     """pr.parsePDB with retries -- worker chunks are file-level while biounits are
@@ -917,8 +1026,8 @@ def _get_atomgroup_for_env(
                         align_coords[align_atoms.index(j)] = c
 
             else:
-                # A vdM must contact the CG on *heavy* atoms, not merely be a probe
-                # neighbour of it.
+                # A residue with no heavy atoms cannot have been measured by the
+                # SASA gate; drop the residue, not the environment.
                 _names = substruct.getNames()
                 _els = substruct.getElements()
                 if _els is None:  # no element column at all; names carry it
@@ -926,26 +1035,14 @@ def _get_atomgroup_for_env(
                 _heavy_mask = np.array(
                     [not is_hydrogen(n, e) for n, e in zip(_names, _els)], dtype=bool)
                 if not _heavy_mask.any():
-                    # Same reasoning as the contact cutoff below: drop the residue,
-                    # not the environment. 
                     _log_warn_capped(logfile, 'vdm_all_hydrogen',
                         f"[WARNING] {biounit} (chain {scr[1]}, resnum {scr[2]}): "
                         f"no heavy atoms in this residue; dropping it from the "
                         f"environment.\n")
                     continue
-                vdm_heavy_coords = np.asarray(substruct.getCoords())[_heavy_mask]
-                # i == 0 sets cg_atom_coords or returns, so it is always set here; a
-                # None would silently disable the contact filter for every vdM slot.
-                assert cg_atom_coords is not None, "CG coords missing at the vdM branch"
-                d = np.sqrt(((cg_atom_coords[:, None, :]
-                              - vdm_heavy_coords[None, :, :]) ** 2).sum(-1)).min()
-                if d > CG_VDM_CONTACT_CUTOFF:
-                    _log_warn_capped(logfile, 'vdm_not_in_contact',
-                        f"[WARNING] {biounit} (chain {scr[1]}, resnum {scr[2]}): "
-                        f"nearest heavy atom is {d:.1f} A from the CG (cutoff "
-                        f"{CG_VDM_CONTACT_CUTOFF} A); not a CG contact, "
-                        f"dropping this residue from the environment.\n")
-                    continue
+                # No distance test: the gate upstream already decided membership
+                # on buried CG surface, and a heavy-atom cutoff here would undo
+                # it for the 4.5-6.5 A members it admits.
                 # Non-CG residues: mark them differently
                 substruct.setOccupancies(VDM_OCC)
 
@@ -1008,8 +1105,21 @@ def _stream_one_chunk(args):
     if cg_match_dict_pkl:
         with open(cg_match_dict_pkl, "rb") as _fh:
             cg_match_dict = pickle.load(_fh)
+        # Same keys and the same list positions as cg_match_dict; required, not
+        # optional, because every record must carry real per-atom annotations
+        # or none at all (a fabricated column is indistinguishable from a
+        # measured one once written).
+        _annot_path = vdg_npz_utils.cg_annot_pkl_path(cg_match_dict_pkl)
+        if not os.path.isfile(_annot_path):
+            raise FileNotFoundError(
+                f"{_annot_path} is missing beside {cg_match_dict_pkl}; re-run "
+                "smarts_to_cgs.py, which writes the per-CG-atom annotations "
+                "the bucket npz requires.")
+        with open(_annot_path, "rb") as _fh:
+            cg_annot_dict = pickle.load(_fh)
     else:
         cg_match_dict = {}
+        cg_annot_dict = {}
     pdb_cache_size, pdb_cache_atom_budget = pdb_cache_limits
     pdb_cache = (_LRUCache(maxsize=pdb_cache_size,
                            max_weight=pdb_cache_atom_budget,
@@ -1049,6 +1159,21 @@ def _stream_one_chunk(args):
                 environment = record["env"]
                 env_quality = (record["cg_max_b"], record["cg_min_occ"],
                                record["vdm_max_b"], record["vdm_min_occ"])
+
+                # Contact strength from the SASA gate, keyed by residue identity
+                # rather than by position. The lists arrive aligned with
+                # env[1:], but _get_atomgroup_for_env drops residues and
+                # reorder_vdg_subset permutes and subsets what is left, so any
+                # positional indexing after that point attaches one residue's
+                # strength to another -- silently, since every value is
+                # plausible for some residue.
+                try:
+                    contact_by_res = _contact_strength_by_residue(
+                        record, environment)
+                except ValueError as _e:
+                    raise ValueError(
+                        f"{env_path}: {_e}. Contact strength is required at "
+                        "build time and is never filled in.")
 
                 pdb_label = "_".join([str(el) for el in environment[0]])
                 _biounit = environment[0][0]
@@ -1109,6 +1234,29 @@ def _stream_one_chunk(args):
                             f"{list(expected_element_seq)}; skipping.\n")
                     continue
 
+                # Per-CG-atom annotations for this ligand copy. Looked up once
+                # per environment: the CG is the same for every vdM subset below.
+                _cg_key = (str(_biounit), str(environment[0][1]),
+                           str(environment[0][2]), str(environment[0][3]),
+                           str(cg_resname))
+                if CG in cg_atoms:
+                    # The predefined-atom-name path has no ligand graph behind
+                    # it, so there is nothing to annotate. Recorded as the
+                    # unreadable sentinel under its own perception code rather
+                    # than as plausible-looking zeros.
+                    _n_cg = len(cg_names)
+                    _cg_annot = {
+                        "heavy_degree": [ANNOT_UNREADABLE] * _n_cg,
+                        "num_h": [ANNOT_UNREADABLE] * _n_cg,
+                        "formal_charge": [ANNOT_UNREADABLE] * _n_cg,
+                        "nbr_elems": [""] * _n_cg,
+                        "perception": ligand_perception.PERCEPTION_ATOM_NAME_TABLE,
+                    }
+                else:
+                    _cg_annot = _cg_annotations_in_slot_order(
+                        cg_annot_dict, cg_match_dict, _cg_key,
+                        environment[0][4] - 1, cg_names, pdb_label)
+
                 vdms_dict = clust.get_vdm_res_features(atomgroup, pdb_label, num_flanking)
                 vdm_resinds = list(vdms_dict.keys())
 
@@ -1140,6 +1288,18 @@ def _stream_one_chunk(args):
                             _log_write(logfile,
                                 f'[WARNING] ({pdb_label}) {_e}; skipping vdG subset.\n')
                             continue
+                        # After the reorder, so the per-slot columns follow the
+                        # same slot order as every other per-slot array.
+                        _slot_keys = [(str(_s), str(_ch), int(_r))
+                                      for (_s, _ch, _r, _rn) in re_ordered_scrr]
+                        _absent = [_k for _k in _slot_keys
+                                   if _k not in contact_by_res]
+                        if _absent:
+                            raise KeyError(
+                                f"{pdb_label}: vdM slots {_absent} have no "
+                                "contact strength in the environment record; "
+                                "the gate and the assembled environment "
+                                "disagree about membership.")
                         rec = {
                             # Preserve SMARTS-slot order; comparisons enumerate
                             # the CG automorphism group.
@@ -1154,6 +1314,19 @@ def _stream_one_chunk(args):
                             "cg_resnum": int(cg_resnum), "cg_resname": str(cg_resname),
                             "slot_flags": [int(f) for f in re_ordered_slot_flags],
                             "quality": tuple(float(q) for q in env_quality),
+                            "cg_heavy_degree": _cg_annot["heavy_degree"],
+                            "cg_num_h": _cg_annot["num_h"],
+                            "cg_formal_charge": _cg_annot["formal_charge"],
+                            "cg_nbr_elems": _cg_annot["nbr_elems"],
+                            "perception": _cg_annot["perception"],
+                            "buried_area": [contact_by_res[_k][0]
+                                            for _k in _slot_keys],
+                            "shared_area": [contact_by_res[_k][1]
+                                            for _k in _slot_keys],
+                            "n_atom_pairs": [contact_by_res[_k][2]
+                                             for _k in _slot_keys],
+                            "min_heavy_dist": [contact_by_res[_k][3]
+                                               for _k in _slot_keys],
                             # Carbonyl O per slot, NaN where the parent lacks it.
                             # Kept out of cgvdmbb so it never enters an RMSD.
                             "bbo": [np.asarray(x, dtype=np.float32) for x in re_ordered_bbo],
@@ -1182,6 +1355,85 @@ def _stream_one_chunk(args):
              for key, count in _WARN_COUNTS.items()
              if count - warn_counts_at_entry.get(key, 0) > 0}
     return worker_tmp_root, skips, warns
+
+
+ANNOT_UNREADABLE = -1
+
+_CONTACT_FIELDS = ("buried_area", "shared_area", "n_atom_pairs", "min_heavy_dist")
+
+
+def _contact_strength_by_residue(record, environment):
+    """{(seg, chain, resnum): (buried_area, shared_area, n_atom_pairs, min_heavy_dist)}.
+
+    The gate (vdg.py) emits one value per vdM slot, aligned with ``env[1:]``.
+    Keyed here by residue identity because nothing downstream preserves that
+    alignment: residues are dropped during environment assembly and the slots
+    are permuted and subsetted by ``reorder_vdg_subset``.
+
+    Raises rather than substituting a default. A zero is a real, meaningful
+    value for both areas -- a water-bridged-only slot buries nothing, and a
+    residue whose whole patch is shared has `buried_area == 0.0` with
+    `shared_area > 0` -- so a filled-in zero cannot be told from a measured
+    one, and a library whose contact strengths are partly invented looks
+    exactly like a real one until someone weights by them. Only
+    `min_heavy_dist` has a sentinel (inf) and it is rejected.
+    """
+    n_slots = len(environment) - 1
+    for field in _CONTACT_FIELDS:
+        if field not in record:
+            raise ValueError(
+                f"environment record has no {field!r}; contact strength is "
+                "required at build time (rebuild-notes 3)")
+        if len(record[field]) != n_slots:
+            raise ValueError(
+                f"{field!r} has {len(record[field])} values for {n_slots} vdM "
+                "slots; the gate and the environment disagree")
+    out = {}
+    for j, tup in enumerate(environment[1:]):
+        dist = float(record["min_heavy_dist"][j])
+        if not np.isfinite(dist):
+            # inf is the gate's "never measured" marker, which cannot happen
+            # for a residue it admitted as a member.
+            raise ValueError(
+                f"vdM slot {tuple(tup[1:4])} has non-finite min_heavy_dist "
+                f"{dist}, so the gate never measured a residue it admitted")
+        out[(str(tup[1]), str(tup[2]), int(tup[3]))] = (
+            float(record["buried_area"][j]), float(record["shared_area"][j]),
+            int(record["n_atom_pairs"][j]), dist)
+    return out
+
+
+def _cg_annotations_in_slot_order(cg_annot_dict, cg_match_dict, key, match_idx,
+                                  cg_names, pdb_label):
+    """Per-CG-atom annotations reordered to match ``cg_names``.
+
+    ``get_cg_atoms`` returns the CG in SMARTS-slot order recovered from the slot
+    occupancies, which need not be the order the match list was written in.
+    Matching by atom name rather than by position keeps the annotation attached
+    to its atom if those ever diverge.
+    """
+    entry = (cg_annot_dict.get(key) or [None])[match_idx] \
+        if cg_annot_dict.get(key) and match_idx < len(cg_annot_dict[key]) else None
+    if entry is None:
+        raise KeyError(
+            f"{pdb_label}: no CG annotations for key {key} match {match_idx}; "
+            "the annotation pickle is out of step with the matches pickle.")
+    match_names = cg_match_dict[key][match_idx]
+    position = {str(name): i for i, name in enumerate(match_names)}
+    order = []
+    for name in cg_names:
+        if str(name) not in position:
+            raise KeyError(
+                f"{pdb_label}: CG atom {name!r} is not in the matched atom "
+                f"names {list(match_names)}; annotation would be misassigned.")
+        order.append(position[str(name)])
+    return {
+        "heavy_degree": [entry["heavy_degree"][i] for i in order],
+        "num_h": [entry["num_h"][i] for i in order],
+        "formal_charge": [entry["formal_charge"][i] for i in order],
+        "nbr_elems": [entry["nbr_elems"][i] for i in order],
+        "perception": int(entry["perception"]),
+    }
 
 
 def _cap_distinct_entries(cols, aa_key, max_num_to_clus, logfile):
@@ -1286,6 +1538,56 @@ def _record_bucket_stats(profile, stats):
     profile.merge(stage1, prefix="stage1.")
 
 
+def _buckets_jsonl_path(run):
+    """Sidecar for the per-bucket rows, beside the run's logfile."""
+    return os.path.splitext(run.logfile)[0] + "_buckets.jsonl"
+
+
+def _append_bucket_row(path, bucket, stats, split, blocks):
+    """Append one bucket's own numbers, as a line, the moment it finishes.
+
+    Deliberately append-and-flush rather than the `os.replace` pattern the tasks
+    use: the runs worth diagnosing are the ones the OOM killer takes, and those
+    leave no sidecar at all, because the profile JSON is assembled in memory and
+    written once at the end. A partial final line is the accepted cost -- readers
+    must skip a line that does not parse.
+
+    Per-bucket because the fragment-wide counters sum across ~250 buckets, which
+    is what hid the straggler: `largest_bucket_*` names the bucket but times
+    nothing, and `stage1.edges` is a fragment total, so the per-bucket edge count
+    that actually sizes the neighbour graph was never recorded anywhere.
+    """
+    row = {"aa_key": bucket.key[1], "subset_size": bucket.size_subset,
+           "records": bucket.n, "split": bool(split), "blocks": blocks}
+    for name in ("perm_group", "stage1_wall_s", "stage1_clusters", "edges",
+                 "stage1_partition_s", "stage2_wall_s", "stage2_slot_orders",
+                 "stage2_largest_cluster", "stage2_largest_cluster_s", "write_s",
+                 "block_wall_max_s", "block_wall_sum_s", "stage2_blocks",
+                 "stage2_block_wall_max_s", "fp", "internal_lb", "bb_lb",
+                 "exact", "exact_rows", "scan_s", "exact_s"):
+        if name in stats:
+            row[name] = stats[name]
+    with open(path, "a") as handle:
+        handle.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def _occupancy(spans):
+    """Busy-slot histogram over task spans: {concurrency: seconds at it}.
+
+    Effective-worker ratios cannot distinguish "half the slots busy throughout"
+    from "all of them, then one straggler". The time spent at concurrency <= 1
+    is the straggler, measured rather than inferred.
+    """
+    events = sorted([(t, +1) for t, _ in spans] + [(t, -1) for _, t in spans])
+    hist, live, prev = {}, 0, None
+    for t, delta in events:
+        if prev is not None and t > prev:
+            hist[live] = hist.get(live, 0.0) + (t - prev)
+        live += delta
+        prev = t
+    return hist
+
+
 def _cluster_buckets(pool, num_procs, run, buckets, profile):
     """Drive every bucket through the pool; returns the labels that failed.
 
@@ -1314,6 +1616,8 @@ def _cluster_buckets(pool, num_procs, run, buckets, profile):
     profile.set("buckets_split", len(state))
 
     failed, done, inflight = set(), set(), {}
+    spans = []
+    rows_path = _buckets_jsonl_path(run) if profile.enabled else None
 
     def _fail(bucket, err_text):
         failed.add(bucket.key)
@@ -1338,7 +1642,8 @@ def _cluster_buckets(pool, num_procs, run, buckets, profile):
             inflight, return_when=concurrent.futures.FIRST_COMPLETED)
         for fut in finished:
             kind, bucket = inflight.pop(fut)
-            _kind, key, value, err_text = fut.result()
+            _kind, key, value, err_text, t_start, t_end = fut.result()
+            spans.append((t_start, t_end))
             if key in failed:
                 continue
             if err_text is not None:
@@ -1346,6 +1651,8 @@ def _cluster_buckets(pool, num_procs, run, buckets, profile):
                 continue
             if kind == "small":
                 total, stats = value
+                if rows_path:
+                    _append_bucket_row(rows_path, bucket, stats, False, 1)
                 _record_bucket_stats(profile, stats)
                 done.add(key)
                 continue
@@ -1354,6 +1661,14 @@ def _cluster_buckets(pool, num_procs, run, buckets, profile):
                 st["blocks_done"] += 1
                 for name, v in value.items():
                     st["stats"][name] = st["stats"].get(name, 0) + v
+                # Summing block wall is what makes _row_blocks' equal-triangle
+                # assumption unfalsifiable; the max against the sum is the
+                # imbalance, and the max is what the bucket actually waits for.
+                block_s = value.get("stage1_wall_s", 0.0)
+                st["stats"]["block_wall_sum_s"] = (
+                    st["stats"].get("block_wall_sum_s", 0.0) + block_s)
+                st["stats"]["block_wall_max_s"] = max(
+                    st["stats"].get("block_wall_max_s", 0.0), block_s)
                 if st["blocks_done"] == st["blocks"]:
                     _push_front([("stage1_partition", bucket, st["blocks"])])
             elif kind == "stage1_partition":
@@ -1376,18 +1691,38 @@ def _cluster_buckets(pool, num_procs, run, buckets, profile):
                     st["stats"]["stage2_largest_cluster"] = stats["stage2_largest_cluster"]
                     st["stats"]["stage2_largest_cluster_s"] = stats["stage2_largest_cluster_s"]
                 st["stats"]["stage2_slot_orders"] = stats["stage2_slot_orders"]
+                st["stats"]["stage2_block_wall_max_s"] = max(
+                    st["stats"].get("stage2_block_wall_max_s", 0.0),
+                    stats.get("stage2_wall_s", 0.0))
                 if st["stage2_done"] == st["stage2_blocks"]:
                     _push_front([("write", bucket, st["subgroups"])])
                     st["subgroups"] = []
             elif kind == "write":
                 total, stats = value
                 st["stats"].update(stats)
+                st["stats"]["stage2_blocks"] = st["stage2_blocks"]
+                if rows_path:
+                    _append_bucket_row(rows_path, bucket, st["stats"], True,
+                                       st["blocks"])
                 _record_bucket_stats(profile, st["stats"])
                 done.add(key)
         _fill()
     if profile.enabled:
         profile.set("stage1.buckets", len(done))
         profile.set("stage2.buckets", len(done))
+        hist = _occupancy(spans)
+        profile.set("sched.task_wall_s", round(sum(e - s0 for s0, e in spans), 3))
+        profile.set("sched.tasks", len(spans))
+        # The denominator for the histogram below; also lets a reader see
+        # how much of the span had no task running at all.
+        profile.set("sched.span_s", round(
+            max((e for _, e in spans), default=0.0)
+            - min((s0 for s0, _ in spans), default=0.0), 3))
+        profile.set("sched.max_concurrency", max(hist, default=0))
+        for k in (1, 2):
+            profile.set(f"sched.wall_s_at_most_{k}_busy",
+                        round(sum(v for c, v in hist.items() if 0 < c <= k), 3))
+        profile.set("sched.rows_jsonl", os.path.basename(_buckets_jsonl_path(run)))
     return sorted(key[1] for key in failed)
 
 

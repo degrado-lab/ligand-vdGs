@@ -71,6 +71,41 @@ _TERMINAL_RESONANCE_ELEMENTS = frozenset({7, 8, 16})  # N, O, S
 # The halogens cover perchlorate/periodate-style oxyanions; B covers boronates.
 _TERMINAL_RESONANCE_CENTERS = frozenset({5, 6, 7, 8, 15, 16, 17, 35, 53})
 
+# `D<n>` and `H0`/`!H0` are read back off the parsed query rather than off the
+# key string, which `_automorphism_graph` never sees.
+_QUERY_DEGREE_LINE = re.compile(r'^\s*AtomExplicitDegree (\d+) (!?)= val\s*$', re.M)
+_QUERY_HCOUNT_LINE = re.compile(r'^\s*AtomHCount (\d+) (!?)= val\s*$', re.M)
+
+
+def _query_primitive(atom, pattern):
+    """Values of one SMARTS primitive declared on a query atom, or None.
+
+    A sorted tuple of ``(value, negated)``, so ``[O;D1,D2]`` and ``!D1`` stay
+    distinguishable instead of collapsing onto the first match. Real atoms and
+    recursive SMARTS give None: a recursive query's description embeds the
+    primitives of its environment, which are not the atom's own.
+    """
+    if not atom.HasQuery():
+        return None
+    description = atom.DescribeQuery()
+    if 'RecursiveStructure' in description:
+        return None
+    found = pattern.findall(description)
+    if not found:
+        return None
+    return tuple(sorted((int(value), bool(negated)) for value, negated in found))
+
+
+def _query_allows_terminal(atom):
+    """Whether the key's own `D<n>` contradicts this atom being terminal.
+
+    A bridging heteroatom cut out of its parent has fragment-graph degree 1 but
+    carries `D2`. Without this, it joins the terminal set and a bridging O can
+    be mapped onto a terminal O.
+    """
+    degree = _query_primitive(atom, _QUERY_DEGREE_LINE)
+    return degree is None or degree == ((1, False),)
+
 
 def _has_deliberate_charge_assignment(mol, bond_indices):
     """True if a terminal set's drawn charges should be trusted as-is.
@@ -107,7 +142,9 @@ def _find_resonance_terminal_groups(mol):
     atom is a real ring position, not a resonance form of an exocyclic
     substituent, so the ring ``o`` and the hydroxyl ``O`` of ``cc(o)O`` stay
     distinct. Degree, not implicit H count, defines "terminal" here because
-    these fragments carry no hydrogens.
+    these fragments carry no hydrogens -- but fragment-graph degree alone is
+    not enough: a bridging heteroatom cut at the key's radius also has degree
+    1, so a declared ``D<n>`` other than ``D1`` excludes the atom.
 
     Substituted and bridging atoms represented in the fragment are untouched.
 
@@ -136,6 +173,8 @@ def _find_resonance_terminal_groups(mol):
             if atomic_num not in _TERMINAL_RESONANCE_ELEMENTS:
                 continue
             if other.GetIsAromatic() or other.GetDegree() != 1:
+                continue
+            if not _query_allows_terminal(other):
                 continue
             terminal_bonds_by_element.setdefault(atomic_num, []).append(bond.GetIdx())
 
@@ -354,41 +393,94 @@ def mol_from_fragment(fragment):
     return init_query_ring_info(Chem.MolFromSmarts(fragment))
 
 
-# Ring primitives encoded as isotopes so that mutual substructure matching can
-# see WHICH atom carries WHICH annotation. `!R`/`R`/`r<n>` are unsatisfiable on
-# the acyclic query graphs fragment keys parse to, so a direct match of two
-# annotated keys is always False; an isotope is an ordinary matchable atom
-# property and preserves the atom-to-annotation correspondence that a bare
-# skeleton comparison throws away.
-_RING_PRIMITIVE = re.compile(r'\[([^\];]*);(!R|R|r\d+)\]')
+# Annotations stored as isotopes (ring_code + 100*dh_code). D<n> and H0/!H0
+# are mutually exclusive per atom and share one field. RDKit silently truncates
+# isotope mod 65536, hence the bound check.
+_BRACKET_ATOM_INNER = re.compile(r'\[([^\]]+)\]')
+_RING_TOKEN = re.compile(r'\A(?:!R|R|r\d+)\Z')
+_DEGREE_TOKEN = re.compile(r'\AD(\d+)\Z')
+_H_TOKEN = re.compile(r'\A!?H0\Z')
 _RING_ISOTOPE = {'!R': 1, 'R': 2}
+_H_ISOTOPE = {'H0': 1, '!H0': 2}
+_MAX_ISOTOPE = 65535
 
 
-def _ring_annotation_as_isotope(fragment):
-    """A fragment key rewritten with its ring primitives as isotope labels."""
+def split_bracket_annotations(inner, fragment=None):
+    """Bracket content -> (atom_part, ring_token, degree, h_token).
+
+    Text-side reader of the annotation vocabulary; `_query_primitive` is the
+    parsed-query-side reader (different grammar, kept in sync by
+    tests/test_key_primitive_readers_agree.py). Runs pre-parse since the
+    isotope must be in the SMARTS string before MolFromSmarts sees it.
+
+    `degree` is the int of `D<n>` or None; `h_token` is 'H0'/'!H0' or None;
+    `ring_token` is '!R'/'R'/'r<n>' or None. Order-agnostic.
+    """
+    atom_part, *tokens = inner.split(';')
+    ring_token = degree = h_token = None
+    for token in tokens:
+        if _RING_TOKEN.match(token):
+            seen, name = ring_token, 'ring context'
+        elif _DEGREE_TOKEN.match(token):
+            seen, name = degree, 'heavy degree'
+        elif _H_TOKEN.match(token):
+            seen, name = h_token, 'hydrogen flag'
+        else:
+            # Closed grammar; anything else is a writer bug that would silently
+            # break dedup (a key stops matching itself) rather than fail loudly.
+            raise ValueError(
+                f'unrecognised annotation {token!r} in {inner!r} of '
+                f'{fragment!r}; key comparison cannot encode it')
+        if seen is not None:
+            # Encoding would keep only one and merge keys that differ.
+            raise ValueError(
+                f'conflicting annotations in {inner!r} of {fragment!r}: '
+                f'a second {name} token {token!r}')
+        if _RING_TOKEN.match(token):
+            ring_token = token
+        elif _DEGREE_TOKEN.match(token):
+            degree = int(_DEGREE_TOKEN.match(token).group(1))
+        else:
+            h_token = token
+    if degree is not None and h_token is not None:
+        # `D<n>` goes on non-carbon, `H0`/`!H0` on carbon (rebuild-notes 1), so
+        # they are exclusive per atom and share one isotope field.
+        raise ValueError(
+            f'{inner!r} of {fragment!r} carries both a degree and a hydrogen '
+            'flag; they share one isotope field and are exclusive by construction')
+    return atom_part, ring_token, degree, h_token
+
+
+def _annotations_as_isotope(fragment):
+    """A fragment key rewritten with its annotations as isotope labels.
+
+    Ring context, heavy-atom degree and the carbon H0 flag are removed from the
+    bracket and folded into the atom's isotope; the atom part (element, charge)
+    is left exactly as written.
+    """
     def _encode(match):
-        inner, annotation = match.group(1), match.group(2)
-        isotope = _RING_ISOTOPE.get(annotation)
-        if isotope is None:
-            isotope = 10 + int(annotation[1:])
-        return f'[{isotope}{inner}]'
-    return _RING_PRIMITIVE.sub(_encode, fragment)
+        inner = match.group(1)
+        atom_part, ring_token, degree, h_token = split_bracket_annotations(
+            inner, fragment)
+        ring_code = 0 if ring_token is None else _RING_ISOTOPE.get(
+            ring_token, 10 + int(ring_token[1:]) if ring_token[0] == 'r' else 0)
+        dh_code = (_H_ISOTOPE[h_token] if h_token is not None
+                   else 10 + degree if degree is not None else 0)
+        isotope = ring_code + 100 * dh_code
+        if isotope > _MAX_ISOTOPE:
+            raise ValueError(f'annotation isotope {isotope} for {inner!r} of '
+                             f'{fragment!r} exceeds RDKit\'s 16-bit isotope field')
+        return f'[{isotope or ""}{atom_part}]'
+    return _BRACKET_ATOM_INNER.sub(_encode, fragment)
 
 
 def fragment_keys_equivalent(key_a, key_b):
     """Whether two fragment keys describe the same annotated substructure.
 
-    Canonical SMILES alone does not settle this: fragments inherit the parent's
-    unsanitized perception flags (docs/pitfalls.md), so two isomorphic submols
-    can canonicalize to different strings -- `[C;!R][C;!R][O;!R][C;!R]` and
-    `[C;!R][O;!R][C;!R][C;!R]` are one fragment written two ways.
-
-    Matching the key against the *submol* it came from cannot answer it either:
-    the submol has no RingInfo (PathToSubmol output is never sanitized), so any
-    ring primitive raises, and PathToSubmol has cut the rings anyway, so an
-    `r5` key would not match its own fragment even with RingInfo supplied. Both
-    keys are therefore compared to each other, with the annotation carried as an
-    isotope so the correspondence survives.
+    Canonical SMILES and submol matching both fail here (unsanitized perception
+    flags mean isomorphic submols can canonicalize differently; submols lack
+    RingInfo and have their rings already cut). So keys are compared to each
+    other directly, with annotations carried as isotopes to survive the compare.
     """
     return fragment_query_mols_equivalent(fragment_key_query_mol(key_a),
                                           fragment_key_query_mol(key_b))
@@ -401,7 +493,7 @@ def fragment_key_query_mol(key):
     fragment_database_ligs) should cache this per key and use
     ``fragment_query_mols_equivalent`` rather than re-parsing both sides per pair.
     """
-    return init_query_ring_info(Chem.MolFromSmarts(_ring_annotation_as_isotope(key)))
+    return init_query_ring_info(Chem.MolFromSmarts(_annotations_as_isotope(key)))
 
 
 def fragment_query_mols_equivalent(mol_a, mol_b):
@@ -486,6 +578,10 @@ def _automorphism_graph(mol):
     same aromatic component. Other SMARTS query labels are preserved outside
     recognized groups. This makes alternate drawings of those groups equivalent
     without treating arbitrary same-element atoms as interchangeable.
+
+    ``D<n>`` and carbon ``H0``/``!H0`` are exempt from normalization: they
+    record the parent graph and keep a bridging heteroatom distinct from a
+    terminal one inside a resonance group.
     """
     num_atoms = mol.GetNumAtoms()
     resonance_bonds = _find_resonance_terminal_groups(mol)
@@ -512,6 +608,12 @@ def _automorphism_graph(mol):
             query_label = atom.GetSmarts()
         else:
             query_label = None
+        # Separate slots: `query_label` is nulled on resonance atoms, but
+        # `D<n>`/`H0`/`!H0` must survive (they're parent-graph properties, not
+        # the protonation drawing the normalization erases).
+        degree_label = _query_primitive(atom, _QUERY_DEGREE_LINE)
+        h_label = (_query_primitive(atom, _QUERY_HCOUNT_LINE)
+                   if atom.GetAtomicNum() == 6 else None)
         atom_labels.append((
             atom.GetAtomicNum(),
             atom.GetIsAromatic(),
@@ -520,7 +622,8 @@ def _automorphism_graph(mol):
             atom.GetNumRadicalElectrons(),
             int(atom.GetChiralTag()),
             query_label,
-        ))
+            degree_label,
+            h_label,))
 
     adjacency = [[None] * num_atoms for _ in range(num_atoms)]
     for bond in mol.GetBonds():

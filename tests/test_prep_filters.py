@@ -226,3 +226,300 @@ class ModifiedResidueTests(unittest.TestCase):
         self.assertEqual(new, lines)
         self.assertEqual(stats, {'renamed': 0, 'amino_acids_to_atom': 0,
                                  'modres_to_atom': 0, 'unknown_resnames': []})
+
+
+def _atom2(serial, name, resname, chain, resnum, xyz, element, het=False):
+    """_atom, but *chain* may be two characters (columns 21-22), as BioLiP writes the
+    chains of large assemblies. See _chain_ids."""
+    return (f"{'HETATM' if het else 'ATOM  '}{serial:5d} {name:<4s}{resname:>4s}"
+            f"{chain:>2s}{resnum:4d}    {xyz[0]:8.3f}{xyz[1]:8.3f}{xyz[2]:8.3f}"
+            f"  1.00  0.00{element:>12s}\n")
+
+
+class TextRepairOrderTests(unittest.TestCase):
+    """text_repairs is the single definition of the order s01 applies before parsing.
+
+    Order is the point: modified_residues_to_protein keys residues on column 21 alone,
+    so running it before the chain remap would merge a two-character chain's residue
+    with the single-character chain of the same second letter -- the collision
+    _chain_ids exists to prevent.
+    """
+
+    CCD = {'KCX': 'L-PEPTIDE LINKING', 'ATP': 'NON-POLYMER'}
+
+    def _structure(self):
+        """Chain AA: ALA-MSE(HETATM)-KCX(HETATM) peptide-bonded, 3.9 A apart along x.
+        Chain A: an unrelated ALA at the same residue numbers, 50 A away."""
+        bb = ['N', 'CA', 'C']
+        lines = []
+        for i, (resname, het, extra) in enumerate(
+                [('ALA', False, ()), ('MSE', True, (('SE', 'SE'),)),
+                 ('KCX', True, (('NZ', 'N'),))]):
+            x0 = 3.9 * i
+            for j, name in enumerate(bb):
+                lines.append(_atom2(1 + 10 * i + j, name, resname, 'AA', i + 1,
+                                    (x0 + 1.3 * j, 0.0, 0.0), name[0], het))
+            for k, (name, el) in enumerate(extra):
+                lines.append(_atom2(5 + 10 * i + k, name, resname, 'AA', i + 1,
+                                    (x0 + 1.3, 2.0, 0.0), el, het))
+        for i in range(3):
+            for j, name in enumerate(bb):
+                lines.append(_atom2(100 + 10 * i + j, name, 'ALA', 'A', i + 1,
+                                    (50.0 + 3.9 * i + 1.3 * j, 0.0, 0.0), name[0]))
+        return lines
+
+    def _repaired(self):
+        from ligand_vdgs.preprocessing._prep_filters import text_repairs
+        return text_repairs(self._structure(), self.CCD)
+
+    def test_all_three_rewrites_and_the_remap_land_together(self):
+        new, mapping, stats = self._repaired()
+        self.assertEqual(mapping, {'AA': 'B'})          # 'A' is taken
+        rec = {(l[20:22], l[22:26].strip()): (l[:6].strip(), l[17:20]) for l in new}
+        self.assertEqual(rec[(' B', '2')], ('ATOM', 'MET'))   # MSE renamed and made ATOM
+        self.assertEqual(rec[(' B', '3')], ('ATOM', 'KCX'))   # chain-bonded modres
+        self.assertEqual(rec[(' A', '1')], ('ATOM', 'ALA'))   # untouched chain
+        self.assertIn('SE', {l[12:16].strip() for l in new if l[20:22] == ' B'
+                             and l[22:26].strip() == '2'})    # SE kept, not renamed SD
+        self.assertEqual(stats, {'renamed': 1, 'amino_acids_to_atom': 1,
+                                 'modres_to_atom': 1, 'unknown_resnames': []})
+
+    def test_column_21_is_blank_everywhere_afterwards(self):
+        new, _, _ = self._repaired()
+        self.assertEqual({l[20] for l in new}, {' '})
+
+    def test_remap_runs_first_so_chains_do_not_merge(self):
+        """Chain AA residue 1 and chain A residue 1 must stay distinct residues. Run in
+        the wrong order they share the key ('A', '   1') and the bonded-ness of one
+        decides the record type of the other."""
+        new, _, _ = self._repaired()
+        keys = {(l[20:22], l[22:26]) for l in new}
+        self.assertIn((' B', '   1'), keys)
+        self.assertIn((' A', '   1'), keys)
+
+    def test_clean_structure_is_returned_unchanged(self):
+        from ligand_vdgs.preprocessing._prep_filters import text_repairs
+        lines = [_atom2(1 + i, n, 'ALA', 'A', 1, (1.3 * i, 0.0, 0.0), n[0])
+                 for i, n in enumerate(['N', 'CA', 'C'])]
+        new, mapping, stats = text_repairs(lines, self.CCD)
+        self.assertEqual(new, lines)
+        self.assertEqual(mapping, {})
+        self.assertEqual(stats['renamed'] + stats['modres_to_atom'], 0)
+
+
+def _repair_module():
+    """scripts/ is not a package, so the repair CLI is loaded by path. Needed because
+    these cases monkeypatch its internals, which a subprocess run cannot reach."""
+    import importlib.util
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(repo, 'scripts', 'remap_chain_ids.py')
+    spec = importlib.util.spec_from_file_location('_remap_chain_ids', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class RepairPassTests(unittest.TestCase):
+    """scripts/remap_chain_ids.py --all: the output must be a complete database whose
+    unchanged structures are byte-identical to their sources."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.src = os.path.join(self.tmp, 'src')
+        self.out = os.path.join(self.tmp, 'out')
+        bb = ['N', 'CA', 'C']
+        clean = [_atom2(1 + i, n, 'ALA', 'A', 1, (1.3 * i, 0.0, 0.0), n[0])
+                 for i, n in enumerate(bb)]
+        dirty = TextRepairOrderTests()._structure()
+        # parent_db mirror layout: <dir>/<stem[1:3].lower()>/<stem>.pdb
+        for stem, lines in (('1abc', clean), ('2abd', clean), ('3xya', dirty)):
+            d = os.path.join(self.src, stem[1:3].lower())
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, stem + '.pdb'), 'w') as f:
+                f.writelines(lines)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def _run(self, *extra):
+        import subprocess
+        import sys
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        cmd = [sys.executable, os.path.join(repo, 'scripts', 'remap_chain_ids.py'),
+               '--pdb-dir', self.src, '--out-dir', self.out, *extra]
+        return subprocess.run(cmd, capture_output=True, text=True, cwd=repo)
+
+    def _manifest(self):
+        path = os.path.join(self.tmp, 'm.tsv')
+        with open(path) as f:
+            rows = [l.rstrip('\n').split('\t') for l in f]
+        return {r[0]: r[1:] for r in rows[1:]}
+
+    def test_all_mode_writes_every_structure_and_copies_the_clean_ones_verbatim(self):
+        res = self._run('--all', '--manifest', os.path.join(self.tmp, 'm.tsv'))
+        self.assertEqual(res.returncode, 0, res.stderr)
+        written = {f for _, _, fs in os.walk(self.out) for f in fs}
+        self.assertEqual(written, {'1abc.pdb', '2abd.pdb', '3xya.pdb'})
+        for stem in ('1abc', '2abd'):
+            rel = os.path.join(stem[1:3].lower(), stem + '.pdb')
+            with open(os.path.join(self.src, rel)) as a, open(os.path.join(self.out, rel)) as b:
+                self.assertEqual(a.read(), b.read())
+        man = self._manifest()
+        self.assertEqual(man['1abc'][0], '0')
+        self.assertEqual(man['3xya'][0], '1')
+        self.assertEqual(man['3xya'][1], 'AA->B')
+
+    def test_repaired_file_carries_the_remap_remark(self):
+        self._run('--all')
+        with open(os.path.join(self.out, 'xy', '3xya.pdb')) as f:
+            head = f.readline()
+        self.assertTrue(head.startswith('REMARK 900 CHAIN ID REMAPPED AA -> B'), head)
+
+    def test_without_all_only_changed_structures_are_written(self):
+        self._run()
+        written = {f for _, _, fs in os.walk(self.out) for f in fs}
+        self.assertEqual(written, {'3xya.pdb'})
+
+    def test_shards_partition_the_database_exactly_once(self):
+        for shard in range(3):
+            self._run('--all', '--shard', str(shard), '--num-shards', '3',
+                      '--manifest', os.path.join(self.tmp, f'm{shard}.tsv'))
+        seen = []
+        for shard in range(3):
+            with open(os.path.join(self.tmp, f'm{shard}.tsv')) as f:
+                seen += [l.split('\t')[0] for l in f.read().splitlines()[1:]]
+        self.assertEqual(sorted(seen), ['1abc', '2abd', '3xya'])
+        written = {f for _, _, fs in os.walk(self.out) for f in fs}
+        self.assertEqual(written, {'1abc.pdb', '2abd.pdb', '3xya.pdb'})
+
+    def test_an_unrepairable_structure_is_skipped_but_still_accounted_for(self):
+        """> 62 distinct chains cannot be renamed to single characters (1bos, 8evs in the
+        real database). s01 skips those structures rather than writing a collision, so
+        this does too -- but the manifest still carries a row, or the verification cannot
+        reconcile the output count against the source count."""
+        import itertools
+        import string
+        from ligand_vdgs.preprocessing._chain_ids import CHAIN_POOL
+        # 63 distinct two-character chains: one more than CHAIN_POOL can name.
+        ids = [a + b for a, b in itertools.islice(
+            itertools.product(string.ascii_uppercase, repeat=2), len(CHAIN_POOL) + 1)]
+        self.assertEqual(len(set(ids)), len(CHAIN_POOL) + 1)
+        lines = [_atom2(i + 1, 'CA', 'ALA', cid, 1, (3.0 * i, 0.0, 0.0), 'C')
+                 for i, cid in enumerate(ids)]
+        d = os.path.join(self.src, 'ov')
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, '4ovf.pdb'), 'w') as f:
+            f.writelines(lines)
+
+        res = self._run('--all', '--manifest', os.path.join(self.tmp, 'm.tsv'))
+        self.assertEqual(res.returncode, 0, res.stderr)
+        written = {f for _, _, fs in os.walk(self.out) for f in fs}
+        self.assertNotIn('4ovf.pdb', written)
+        self.assertEqual(written, {'1abc.pdb', '2abd.pdb', '3xya.pdb'})
+        man = self._manifest()
+        self.assertEqual(set(man), {'1abc', '2abd', '3xya', '4ovf'})
+        self.assertEqual(man['4ovf'][0], 'skipped_overflow')
+        self.assertIn('single characters are available', man['4ovf'][5])
+        self.assertIn('4ovf', res.stderr)
+
+    def test_a_failed_write_costs_one_structure_not_the_whole_shard(self):
+        """The first full run lost three whole array tasks to one FileExistsError,
+        because only the read was inside the per-structure try. A write that fails must
+        record skipped_error for that structure and keep going."""
+        rci = _repair_module()
+        real = rci._copy_structure
+        def flaky(src, out):
+            if out.endswith('2abd.pdb'):
+                raise FileExistsError(17, 'File exists')
+            return real(src, out)
+        rci._copy_structure = flaky
+        try:
+            rci.main(['--pdb-dir', self.src, '--out-dir', self.out, '--all',
+                      '--manifest', os.path.join(self.tmp, 'm.tsv')])
+        finally:
+            rci._copy_structure = real
+
+        man = self._manifest()
+        self.assertEqual(set(man), {'1abc', '2abd', '3xya'})
+        self.assertEqual(man['2abd'][0], 'skipped_error')
+        self.assertIn('FileExistsError', man['2abd'][5])
+        # The structures either side of the failure were still written.
+        written = {f for _, _, fs in os.walk(self.out) for f in fs}
+        self.assertEqual(written, {'1abc.pdb', '3xya.pdb'})
+
+    def test_a_manifest_row_is_never_written_for_a_file_that_was_not(self):
+        """n_manifest (63835) > n_out (63830) is what made the first full run's
+        accounting unreconcilable: the row was written before the write was attempted.
+        The invariant only bites when a write fails, so one is made to."""
+        rci = _repair_module()
+        real = rci._write_repaired
+        def flaky(out, remarks, lines):
+            if out.endswith('3xya.pdb'):
+                raise OSError(28, 'No space left on device')
+            return real(out, remarks, lines)
+        rci._write_repaired = flaky
+        try:
+            rci.main(['--pdb-dir', self.src, '--out-dir', self.out, '--all',
+                      '--manifest', os.path.join(self.tmp, 'm.tsv')])
+        finally:
+            rci._write_repaired = real
+
+        man = self._manifest()
+        self.assertEqual(man['3xya'][0], 'skipped_error')
+        for stem, fields in man.items():
+            path = os.path.join(self.out, stem[1:3].lower(), stem + '.pdb')
+            if fields[0].startswith('skipped'):
+                self.assertFalse(os.path.isfile(path), f'{stem} skipped but written')
+            else:
+                self.assertTrue(os.path.isfile(path), f'{stem} has a row but no file')
+
+    def test_a_rerun_is_idempotent_and_leaves_no_scratch_files(self):
+        """Shards get resubmitted, so a second pass over the same stems must overwrite
+        cleanly rather than trip over what the first one wrote."""
+        self._run('--all', '--manifest', os.path.join(self.tmp, 'm1.tsv'))
+        first = {}
+        for root, _, fs in os.walk(self.out):
+            for f in fs:
+                with open(os.path.join(root, f)) as fh:
+                    first[f] = fh.read()
+        res = self._run('--all', '--manifest', os.path.join(self.tmp, 'm.tsv'))
+        self.assertEqual(res.returncode, 0, res.stderr)
+        second = {}
+        for root, _, fs in os.walk(self.out):
+            for f in fs:
+                with open(os.path.join(root, f)) as fh:
+                    second[f] = fh.read()
+        self.assertEqual(first, second)
+        self.assertFalse([f for f in second if f.endswith('.tmp')],
+                         'atomic writes must not leave .tmp files behind')
+
+    def test_a_racing_sibling_directory_creation_is_not_fatal(self):
+        """BeeGFS makes os.makedirs(exist_ok=True) non-atomic: the isdir re-check can
+        see a stale negative right after another node created the directory. Simulated
+        here, since the race itself is not reproducible on one node."""
+        rci = _repair_module()
+        real = os.makedirs
+        state = {'raised': False}
+        def racing(path, *a, **kw):
+            real(path, *a, **kw)
+            if not state['raised']:
+                state['raised'] = True
+                raise FileExistsError(17, 'File exists', path)
+        os.makedirs = racing
+        try:
+            rci._ensure_dir(os.path.join(self.out, 'zz'))
+        finally:
+            os.makedirs = real
+        self.assertTrue(state['raised'])
+        self.assertTrue(os.path.isdir(os.path.join(self.out, 'zz')))
+
+    def test_refuses_to_repair_in_place(self):
+        import subprocess
+        import sys
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        res = subprocess.run(
+            [sys.executable, os.path.join(repo, 'scripts', 'remap_chain_ids.py'),
+             '--pdb-dir', self.src, '--out-dir', self.src, '--all'],
+            capture_output=True, text=True, cwd=repo)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn('never repair in place', res.stderr)

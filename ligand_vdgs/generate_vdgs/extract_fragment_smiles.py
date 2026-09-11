@@ -25,7 +25,7 @@ Usage (--pdb-dir is required: the counts are sampled from the parent db):
 
 Consuming it (portable shell):
     while IFS= read -r smiles; do
-        args=(-s "$smiles" -c "$smiles" -p "$PDB_DIR" -b "$PROBE_DIR" \
+        args=(-s "$smiles" -c "$smiles" -p "$PDB_DIR" \
               -o "$OUT_DIR" --num-procs "$NPROCS" --subset-sizes 1 2)
         <your-submit-command> python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py "${args[@]}"
     done < fragment_work_list.txt

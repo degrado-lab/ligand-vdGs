@@ -46,6 +46,18 @@ DRUGLIKE_ROWS = [('CC(=O)Nc1ccc(O)cc1', 'TYL'),
                  ('CN1C=NC2=C1C(=O)N(C)C(=O)N2C', 'CFF')]
 
 
+# These tests exercise the SMILES path, so they run with the CCD template store
+# pointed at an empty directory. Every three-letter code below happens to be a
+# real CCD entry, and with a template available the SMILES column is ignored
+# entirely (rebuild-notes 6) -- the parse failures and metal reclassifications
+# under test would never occur.
+def _no_ccd_env(tmp):
+    env = dict(os.environ)
+    env['LIGAND_VDGS_CCD_DIR'] = os.path.join(tmp, 'no_ccd')
+    os.makedirs(env['LIGAND_VDGS_CCD_DIR'], exist_ok=True)
+    return env
+
+
 def run_script(rows, tmp):
     ccd = os.path.join(tmp, 'ccd.smi')
     with open(ccd, 'w') as fh:
@@ -53,7 +65,7 @@ def run_script(rows, tmp):
     logfile = os.path.join(tmp, 'log')
     proc = subprocess.run(
         [sys.executable, SCRIPT, '--ccd', ccd, '--outdir', tmp, '--logfile', logfile],
-        capture_output=True, text=True)
+        capture_output=True, text=True, env=_no_ccd_env(tmp))
     with open(logfile) as fh:
         return proc, fh.read()
 

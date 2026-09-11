@@ -15,7 +15,8 @@ from rdkit import Chem, RDLogger
 from ligand_vdgs.functions.Frags import get_fragments, ring_query_for_atom
 from ligand_vdgs.functions.utils import (identify_mol_automorphisms,
                                          mol_from_fragment,
-                                         fragment_keys_equivalent)
+                                         fragment_keys_equivalent,
+                                         _annotations_as_isotope)
 from ligand_vdgs.generate_vdgs.extract_fragment_smiles import (
     charge_normalized_fragment)
 
@@ -46,7 +47,7 @@ class RingQueryTests(unittest.TestCase):
 
     def test_macrocycle_gets_its_exact_ring_size_never_plain_R(self):
         # SMARTS `R` matches any ring atom, so a plain-R macrocycle key would mine
-        # every THF and sugar in the mirror (estimated 27,399 structures for 42
+        # every THF and sugar in the parent database (estimated 27,399 structures for 42
         # ligands' worth of key). `r12` mines macrocycles only.
         mol = Chem.MolFromSmiles('C1COCCOCCOCCO1')
         self.assertEqual({ring_query_for_atom(a) for a in mol.GetAtoms()}, {'r12'})
@@ -104,7 +105,7 @@ class FragmentKeyTests(unittest.TestCase):
         # deliberately left bare.
         keys = frag_keys('C1CCNCC1')
         self.assertTrue(keys)
-        self.assertTrue(all(';r6]' in k for k in keys), keys)
+        self.assertTrue(all(';r6;' in k or ';r6]' in k for k in keys), keys)
 
     def test_rdkit_and_openbabel_agree_on_smallest_ring_in_bridged_systems(self):
         # Query keys come from RDKit ring perception; mining matches with
@@ -133,7 +134,7 @@ class FragmentKeyTests(unittest.TestCase):
     def test_partially_cyclic_fragment_annotates_per_atom(self):
         # Benzoate: ring carbon plus an exocyclic carboxylate.
         keys = frag_keys('c1ccccc1C(=O)[O-]')
-        self.assertIn('c[C;!R](=[O;!R])[O-;!R]', keys)
+        self.assertIn('[c;H0][C;!R;H0](=[O;!R;D1])[O-;!R;D1]', keys)
 
     def test_keys_parse_as_smarts_in_both_toolkits(self):
         from openbabel import openbabel as ob
@@ -175,6 +176,76 @@ class KeyEquivalenceTests(unittest.TestCase):
                      ('[C;r5][C;r5]([C;r5])[O;!R]', '[C;r5][C;r5]([C;!R])[O;r5]'),
                      ('[C;!R][C;!R](=[O;!R])[O;!R]', '[C;!R][C;!R](=[O;!R])[O-;!R]')]:
             self.assertFalse(fragment_keys_equivalent(a, b), (a, b))
+
+
+class DegreeAndHydrogenAnnotationTests(unittest.TestCase):
+    """`D<n>` and `H0`/`!H0` in the key must behave like `r<n>` in comparison.
+
+    Both are unsatisfiable on the acyclic, hydrogen-free graph a key parses to,
+    so before they were encoded as isotopes a `D`-bearing key did not match
+    itself and an `H0`-bearing key raised outright
+    (``getNumImplicitHs() called without preceding call to calcImplicitValence``).
+    """
+
+    PHOS_FREE = '[O;D1;!R][P;D4;!R]([O;D1;!R])([O;D1;!R])[O;D1;!R]'
+    PHOS_MONO = '[O;D1;!R][P;D4;!R]([O;D1;!R])([O;D1;!R])[O;D2;!R]'
+    PHOS_DI = '[O;D2;!R][P;D4;!R]([O;D1;!R])([O;D1;!R])[O;D2;!R]'
+
+    def test_equivalence_is_reflexive_for_degree_and_h_keys(self):
+        for key in [self.PHOS_FREE, self.PHOS_MONO, self.PHOS_DI,
+                    '[c;H0][c;H0][c;H0]',
+                    '[C;r5;!H0][C;r5;!H0][O;r5;D2][C;r5;!H0][C;r5;!H0]']:
+            self.assertTrue(fragment_keys_equivalent(key, key), key)
+
+    def test_heavy_degree_separates_bridging_from_terminal(self):
+        # The correctness case the key split exists for: 47.1% of acyclic
+        # bridging heteroatoms were keyed as terminal.
+        for a, b in [('[c;H0][O;D1;!R]', '[c;H0][O;D2;!R]'),      # phenol/diaryl ether
+                     ('[c;H0][N;D1;!R]', '[c;H0][N;D2;!R]'),      # aniline/diarylamine
+                     (self.PHOS_FREE, self.PHOS_MONO),
+                     (self.PHOS_MONO, self.PHOS_DI)]:
+            self.assertFalse(fragment_keys_equivalent(a, b), (a, b))
+
+    def test_carbon_h0_flag_separates(self):
+        self.assertFalse(fragment_keys_equivalent('[C;r5;H0][O;r5;D2]',
+                                                  '[C;r5;!H0][O;r5;D2]'))
+
+    def test_token_order_within_a_bracket_does_not_matter(self):
+        # The writer's token order is not pinned; comparison must not depend on it.
+        self.assertTrue(fragment_keys_equivalent('[O;!R;D2][C;!R;H0]',
+                                                 '[O;D2;!R][C;H0;!R]'))
+
+    def test_degenerate_spellings_still_merge_when_annotated(self):
+        self.assertTrue(fragment_keys_equivalent(
+            '[C;!R;!H0][C;!R;!H0][O;!R;D2][C;!R;!H0]',
+            '[C;!R;!H0][O;!R;D2][C;!R;!H0][C;!R;!H0]'))
+
+    def test_charge_survives_the_encoding(self):
+        # Charge is the only other matchable channel and is deliberately NOT
+        # used: keys still carry real charge where they are compared (dedup in
+        # fragment_database_ligs runs before charge_normalized_fragment).
+        self.assertTrue(fragment_keys_equivalent('[O-;D1;!R][P;D4;!R]',
+                                                 '[O-;D1;!R][P;D4;!R]'))
+        self.assertFalse(fragment_keys_equivalent('[O-;D1;!R][P;D4;!R]',
+                                                  '[O;D1;!R][P;D4;!R]'))
+
+    def test_largest_ring_code_still_encodes_beside_a_degree(self):
+        # r<n> is uncapped (r12/r72 occur), so the ring field must stay under
+        # the x100 degree field and the sum under RDKit's 16-bit isotope.
+        self.assertFalse(fragment_keys_equivalent('[O;r72;D9]', '[O;r72;D1]'))
+        self.assertTrue(fragment_keys_equivalent('[O;r72;D9]', '[O;D9;r72]'))
+
+    def test_conflicting_annotations_on_one_atom_raise(self):
+        for bad in ['[O;D1;D2]', '[C;H0;!H0]', '[C;r5;!R]']:
+            with self.assertRaises(ValueError, msg=bad):
+                _annotations_as_isotope(bad)
+
+    def test_unrecognised_primitive_raises(self):
+        # Neither dropping it (silently loosens the key) nor keeping it (it is
+        # unsatisfiable, so the key stops matching itself and dedup records a
+        # duplicate as new) is safe.
+        with self.assertRaises(ValueError):
+            _annotations_as_isotope('[C;$(C=O);!R]')
 
 
 class ChargeNormalizationTests(unittest.TestCase):

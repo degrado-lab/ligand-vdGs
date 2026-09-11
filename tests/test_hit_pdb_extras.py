@@ -1,5 +1,5 @@
 """write_vdg_hit_pdbs adds the same parent-derived display atoms as the library
-writer, and degrades the same way when no parent PDB mirror is reachable.
+writer, and degrades the same way when no parent database is reachable.
 
 The hit's superposition is the hit finder's, over CG + vdM N/CA/C; the extras
 ride the stored rigid transform like every other atom.
@@ -93,8 +93,8 @@ class HitPdbExtrasTests(unittest.TestCase):
         self.mirror = os.path.join(self.tmp.name, "mirror")
         self.out = os.path.join(self.tmp.name, "out")
         self.tsv = _write_tsv(os.path.join(self.tmp.name, "hits.tsv"))
-        # The mirror check is memoised process-wide; a stale entry would let a
-        # deliberately-missing mirror pass.
+        # The parent-database check is memoised process-wide; a stale entry would
+        # let a deliberately-missing parent database pass.
         vdg_npz._checked_pdb_dirs.clear()
         vdg_npz._warned_missing_parent_db.clear()
         self.env = mock.patch.dict(os.environ, {}, clear=False)
@@ -132,7 +132,7 @@ class HitPdbExtrasTests(unittest.TestCase):
                                    RES_COORDS[3] @ R_HIT + T_HIT, atol=1e-2)
 
     def test_no_mirror_still_writes_backbone_only_hits(self):
-        """The case most users are in: the library's recorded mirror is not here."""
+        """The case most users are in: the library's recorded parent database is not here."""
         _write_bucket(self.lib, os.path.join(self.tmp.name, "not_a_mirror"))
         ag, said = self._run("--carbonyl")
         self.assertEqual(list(ag.getNames()), ["C1", "C2", "O1", "N", "CA", "C"])

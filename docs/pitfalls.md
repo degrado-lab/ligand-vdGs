@@ -76,7 +76,7 @@ different buckets and clusters, but `cluster_num_parents` and per-key totals are
 normalized over the mixed pool. Options, safest first: (1) degree in the key
 (`[n;D2]` vs `[n;D3]`) is graph-only and needs no H trust, but touches every `n`
 key (rebuild + `fragment_keys_equivalent`); (2) record each CG atom's H count
-per observation from the protonated mirror at mining time (cf. `nr_slot_flag`)
+per observation from the protonated parent database at mining time (cf. `nr_slot_flag`)
 and filter at read time — reversible, no library split; (3) `[nH]`/`[n;H0]` in
 the key — splits genuine tautomers (imidazole N1/N3) and inherits prepwizard's
 and the CCD's H placement, which the pipeline otherwise refuses to trust.
@@ -90,7 +90,7 @@ carboxylic acid vs. ester `[C;!R][C;!R](=[O;!R])[O;!R]` (21%), primary vs.
 higher amine `[C;!R][C;!R]([C;!R])[N;!R]` (70%), sulfonamide N
 `c[S;!R]([N;!R])(=[O;!R])=[O;!R]` (68%). Option (1) generalizes to `D<n>` on
 every heteroatom. Caveat: SMARTS `D` counts *explicit* connections, so both
-matchers must see H-free graphs — the miner reads the protonated mirror through
+matchers must see H-free graphs — the miner reads the protonated parent database through
 OpenBabel, where H's are real atoms (cf. the `r<n>` disagreement below). Unlike `r<n>`, the two toolkits agree on what
 `D` means; only the input differs, so `DeleteHydrogens()` before `Match` is a
 complete fix (it renumbers atoms — check anything mapping match indices back to
@@ -131,15 +131,15 @@ same way and nothing checks the two agree.
 
 ### Fragment cost estimates are counted from `--pdb-dir`, not from the CCD
 
-`estimate_frag_cost.py` samples the **parent PDB mirror** given as `--pdb-dir`
+`estimate_frag_cost.py` samples the **parent database** given as `--pdb-dir`
 and matches fragment keys against the ligands found there. It never reads the CCD
-or a previous build. A fragment whose ligands are absent from the mirror
+or a previous build. A fragment whose ligands are absent from the database
 estimates 0 structures / 0 occurrences, falls below `--min-instances` in
 `make_sge_scripts_for_frags.py`, and gets no job — silently, since 0 is also what
 a genuinely rare fragment gets.
 
 Check this when **adding novel ligands** beyond the CCD: their structures must be
-in the mirror these scripts are pointed at, and the estimate regenerated, or
+in the parent database these scripts are pointed at, and the estimate regenerated, or
 their fragments count as if the ligands didn't exist. A fragment known to be
 wanted but scoring 0 goes in via `--include`/`--include-file`, which bypasses the
 occurrence threshold and applies a resource-tier floor instead.
@@ -232,15 +232,14 @@ match lists of **every copy** of a resname.
   per-copy lookup keyed on `(struct, seg, chain, resnum, resname)` is in the
   `cg_idxs` loop below. The proteinaceous branch builds a genuinely indexable
   dict — same variable, two shapes.
-- **The union is required for correctness** — it feeds `preprocess_lines`'s probe
-  prefilter, which ORs over `(resname, atomname)`. A last-wins dict drops probe
-  lines for atoms the last copy lacks (disorder/obabel perception differ by
-  chain). In 4a05, `BGC`'s last-wins copy covered 11 of 12 atoms across 5 copies,
-  masking every probe line for `O1`. Across 15 fragments, 2.4% of multi-copy
-  groups had an under-covering copy.
-
-Over-inclusion is safe: the prefilter only decides which probe lines are
-*considered*; the per-copy lookup still assigns each contact to a site.
+- **It is a residue selector, nothing more** — it supplies the resnames
+  `mine_environments` selects CG-bearing residues by. It was load-bearing when
+  Probe lines were prefiltered through it (a last-wins dict masked every probe
+  line for an atom the last copy lacked: in 4a05 `BGC`'s copy covered 11 of 12
+  atoms across 5 copies). The buried-SASA gate takes the CG atoms per copy from
+  `VDG._cg_copies` instead, so a shortfall here can no longer silently drop
+  contacts. Keep the union anyway: a selector that misses a resname still loses
+  the whole copy.
 
 #### The occupancy protocol is duplicated in the vdG-miner submodule
 
@@ -259,14 +258,16 @@ Over-inclusion is safe: the prefilter only decides which probe lines are
 #### Chain IDs are one column; two-character chains are remapped, never read as-is
 
 Every reader in the pipeline takes the chain from PDB column 22 alone (ProDy,
-probe, vdG-miner's `line[12:26]` hash and its HETATM ligand scan). Source files
+vdG-miner's HETATM ligand scan, and Probe when it was still in the pipeline). Source files
 for large assemblies write two-character chain IDs across columns 21-22
 (`ASPA4  66` = chain `A4`), so chain `A4` reads as chain `4` and residue 66 of
 both chains merges into one residue. ProDy 2.6 gives the merged atoms a single
 resindex, and `writePDB` round-trips the collision with column 21 blanked, so
 parsing before fixing hides it. In the 2026-09 database 670 of 65,600 structures
-had such chains and vdG-miner dropped all of them whole (probe and PDB lines
-hash differently). s01 fixes the text before parsing
+had such chains. vdG-miner used to drop all of them whole, because its
+`line[12:26]` hash included column 21 and so never matched the Probe line; with
+Probe gone those structures are mined, but the residue *merge* remains and only
+the remap fixes it. s01 fixes the text before parsing
 (`preprocessing/_chain_ids.remap_chain_ids`: first free character from
 `CHAIN_POOL`, mapping recorded as `REMARK 900 CHAIN ID REMAPPED` lines) and
 skips structures with more chains than characters. The same source segments are
@@ -716,7 +717,7 @@ Fragment selection pools protonation-state variants onto one representative
 before thresholding (`group_protonation_variants` in
 `extract_fragment_smiles.py`), and only that representative is mined — the
 charge-loose SMARTS `cC(=O)O` matches both benzoate and benzoic acid in the
-prepwizard-protonated mirror, so the anion's library would be a strict subset.
+prepwizard-protonated parent database, so the anion's library would be a strict subset.
 The alias map goes to `fragment_aliases.tsv` (library root) or
 `<work list stem>_aliases.tsv`.
 

@@ -20,7 +20,7 @@ hostname
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate lig_vdgs
 
-python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py -s $SMILES -c $CG -p $PDB_DIR -b $PROBE_DIR -o $OUTPUT_DIR -m $MAX_NUM_CLUS --subset-sizes $SUBSET_SIZES --num-procs $NUM_PROCS
+python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py -s $SMILES -c $CG -p $PDB_DIR -o $OUTPUT_DIR -m $MAX_NUM_CLUS --subset-sizes $SUBSET_SIZES --num-procs $NUM_PROCS
 # Captured before anything else runs, and used as this script's exit status
 # below. Without it the trailing commands make the job exit 0 whatever the
 # wrapper did, so a crashed fragment is indistinguishable from a finished one in

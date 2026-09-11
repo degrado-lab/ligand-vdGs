@@ -391,3 +391,20 @@ def modified_residues_to_protein(lines, ccd_types):
                  else line for line in lines]
     return lines, {'renamed': len(renamed), 'amino_acids_to_atom': n_aa,
                    'modres_to_atom': len(convert), 'unknown_resnames': sorted(unknown)}
+
+
+def text_repairs(lines, ccd_types):
+    '''Every fix that must be applied to a parent PDB's *text*, in the order s01 applies
+    them before ProDy parses: chain-ID remap, then modified_residues_to_protein (isosteric
+    renames -> HETATM amino acids to ATOM -> chain-bonded peptide-linking residues to
+    ATOM). Returns (lines, {old: new} chain mapping, stats from
+    modified_residues_to_protein). Raises ChainIdOverflow.
+
+    The one definition of that order: s01 (which parses afterwards) and the standalone
+    repair pass over an already-trimmed database (scripts/remap_chain_ids.py) both call
+    this, so a database repaired after the fact is text-identical to one trimmed with it.
+    '''
+    from ligand_vdgs.preprocessing._chain_ids import remap_chain_ids
+    lines, mapping = remap_chain_ids(lines)
+    lines, stats = modified_residues_to_protein(lines, ccd_types)
+    return lines, mapping, stats

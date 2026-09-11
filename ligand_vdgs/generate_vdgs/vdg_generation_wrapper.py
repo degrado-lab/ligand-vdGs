@@ -9,6 +9,7 @@ import uuid
 import concurrent.futures
 from ligand_vdgs.generate_vdgs.clus_and_deduplicate_vdgs import EXIT_NO_VDGS
 from ligand_vdgs.functions.compute_profile import ComputeProfile
+from ligand_vdgs.functions import sasa
 from ligand_vdgs.functions.utils import (convert_time_elapsed, identify_mol_automorphisms,
                    mol_from_fragment, set_up_outdir, _int_or_none, smiles_to_filename,
                    aromatic_h_constrained_atoms)
@@ -21,7 +22,6 @@ def parse_args():
     parser.add_argument('-s', '--smarts', type=str, required=True, help="SMARTS pattern.")
     parser.add_argument('-c', '--cg', type=str, help="CG label; defaults to SMARTS.")
     parser.add_argument('-p', "--pdb-dir", type=str, required=True, help="PDB database directory.")
-    parser.add_argument('-b', "--probe-dir", type=str, required=True, help="Probe output directory.")
     parser.add_argument('-o', "--out-dir", type=str, required=True, help="Output directory.")
     parser.add_argument('-m', "--max-num-vdgs-to-clus", default=None, type=_int_or_none,
                         help="Max PDBs to cluster per AA composition.")
@@ -45,7 +45,6 @@ def main():
     args = parse_args()
     smarts_raw = args.smarts.strip('"')
     pdb_dir = args.pdb_dir
-    probe_dir = args.probe_dir
     out_dir = args.out_dir
 
     smarts_mol = mol_from_fragment(smarts_raw)
@@ -84,7 +83,7 @@ def main():
     # --pdb-dir or a missing submodule otherwise surfaces as a CalledProcessError from
     # smarts_to_cgs.py, and the obvious response -- fix the flag and rerun -- then
     # fails a second time because the directory is no longer empty.
-    for path, flag in [(pdb_dir, '--pdb-dir'), (probe_dir, '--probe-dir')]:
+    for path, flag in [(pdb_dir, '--pdb-dir')]:
         if not os.path.isdir(path):
             raise NotADirectoryError(f"{flag} directory does not exist: {path}")
     for path, what in [(smarts_to_cg_script, 'smarts_to_cgs.py'),
@@ -99,7 +98,7 @@ def main():
     # Set logfile directly in cg outdir
     logfile = os.path.join(out_dir, f"{cg}_log")
 
-    write_out_commandline_params(logfile, smarts_raw, cg, pdb_dir, probe_dir, out_dir,
+    write_out_commandline_params(logfile, smarts_raw, cg, pdb_dir, out_dir,
                                  num_automorphisms, max_num_to_clus=max_num_to_clus,
                                  num_procs=num_procs, subset_sizes=subset_sizes)
 
@@ -158,7 +157,7 @@ def main():
         environments_cmd = (
             f'python {shlex.quote(gen_environments_script)} '
             f'-c {shlex.quote(cg)} -m {shlex.quote(match_pkl)} '
-            f'-p {shlex.quote(pdb_dir)} -b {shlex.quote(probe_dir)} -o {shlex.quote(environments_out_root)}')
+            f'-p {shlex.quote(pdb_dir)} -o {shlex.quote(environments_out_root)}')
         gen_environments_start = time.time()
 
         with profile.phase('mine_environments'):
@@ -307,14 +306,16 @@ def run_gen_environments(job_index, num_procs, environments_cmd):
     environments_cmd = f'{environments_cmd} -j {job_index} -n {num_procs}'
     subprocess.run(environments_cmd, shell=True, check=True)
 
-def write_out_commandline_params(logfile, smarts, cg, pdb_dir, probe_dir, out_dir,
+def write_out_commandline_params(logfile, smarts, cg, pdb_dir, out_dir,
                                  num_automorphisms, max_num_to_clus, num_procs,
                                  subset_sizes):
     with open(logfile, 'w') as _log:
         _log.write(f'SMARTS: {smarts}\nCG: {cg}\n'
                    f'Number of exact CG automorphisms: {num_automorphisms}\n'
                    f'Max num vdgs to cluster: {max_num_to_clus}\nParent PDB dir: {pdb_dir}\n'
-                   f'Probe dir: {probe_dir}\nOutput dir: {out_dir}\nNumber of processes: {num_procs}\n'
+                   f'Contact-area threshold: {sasa.MIN_CONTACT_AREA} A^2 on '
+                   f'buried+shared ({sasa.N_SPHERE_POINTS} SASA points)\n'
+                   f'Output dir: {out_dir}\nNumber of processes: {num_procs}\n'
                    f'Subset sizes: {subset_sizes}\n')
 
 if __name__ == '__main__':

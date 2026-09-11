@@ -16,14 +16,17 @@ nothing downstream can detect the failure.
    can pick the wrong atom and write coordinates that contradict the record's own
    recorded identity.
 
-2. A vdM that contacts the ligand but not the CG. The environment comes from probe
-   contacts against the whole ligand residue, so without a check a residue touching
-   one end of a large cofactor becomes a vdM of a CG matched at the other end.
+2. A vdM with no heavy atoms at all, which the gate cannot have measured. There is
+   deliberately no distance test here any more: membership is decided upstream by
+   buried SASA of the CG atoms, under which a residue legitimately buries CG surface
+   out to ~6.5 A. The 4.5 A heavy-atom guard that used to live here re-dropped
+   exactly those members, and it discarded the whole environment when any one slot
+   failed.
 
-   The heavy-atom side of that check reads the element *and* the atom name, because
-   a blank element column (common in older and hand-edited PDBs) makes a plain
-   `not element H D` selection keep every hydrogen, and an H-only near approach then
-   passes a cutoff meant for heavy atoms.
+   The heavy-atom side still reads the element *and* the atom name, because a blank
+   element column (common in older and hand-edited PDBs) makes a plain
+   `not element H D` selection keep every hydrogen, so an all-hydrogen residue would
+   look like it had heavy atoms.
 
 3. A CG whose atoms are not one bonded component. The atom set comes from
    OpenBabel's perception of the parent, which nothing else checks against geometry;
@@ -45,7 +48,8 @@ CG_ATOM_NAMES = ["C1", "C2", "C3"]
 
 
 def _atomgroup(duplicate_name=None, vdm_offset=3.0, tail_atom=False,
-               split_cg=False, blank_element_h=False, second_vdm=False):
+               split_cg=False, blank_element_h=False, second_vdm=False,
+               only_blank_element_h=False):
     """Ligand LIG A:900 (3 CG atoms) beside protein ALA A:10, close enough to pair.
 
     With duplicate_name set, a fourth ligand atom is added carrying that name, so
@@ -58,8 +62,9 @@ def _atomgroup(duplicate_name=None, vdm_offset=3.0, tail_atom=False,
 
     split_cg moves the third CG atom out of bonding range of the other two, the
     shape a CG atom resolved onto the wrong atom produces. blank_element_h gives
-    ALA a hydrogen close to the CG whose element column is empty, so a
-    name-blind heavy-atom filter would count it as a contact.
+    ALA a hydrogen close to the CG whose element column is empty;
+    only_blank_element_h makes that hydrogen ALA's *only* atom, so the residue
+    has no heavy atom at all and a name-blind filter would still admit it.
     """
     # Kept off the origin: align_coords_sanity_check rejects a zero-norm row, so a
     # CG atom at (0, 0, 0) would fail the frame check for reasons unrelated to this
@@ -82,12 +87,14 @@ def _atomgroup(duplicate_name=None, vdm_offset=3.0, tail_atom=False,
 
     # Protein residue within 5 A of the ligand, so the environment selection keeps it.
     x = 10.0 + vdm_offset
-    names += ["N", "CA", "C"]
-    coords += [(x, 10.5, 10.0), (x + 1.0, 11.2, 10.0), (x + 2.0, 10.8, 10.0)]
-    resnames += ["ALA"] * 3; resnums += [10] * 3; elements += ["N", "C", "C"]
+    if not only_blank_element_h:
+        names += ["N", "CA", "C"]
+        coords += [(x, 10.5, 10.0), (x + 1.0, 11.2, 10.0), (x + 2.0, 10.8, 10.0)]
+        resnames += ["ALA"] * 3; resnums += [10] * 3; elements += ["N", "C", "C"]
 
-    if blank_element_h:
-        # 2 A from CG atom C1, well inside the 4.5 A cutoff, but a hydrogen.
+    if blank_element_h or only_blank_element_h:
+        # 2 A from CG atom C1 -- close enough that a name-blind filter would
+        # treat it as a heavy contact -- but a hydrogen.
         names.append("HB1")
         coords.append((10.0, 12.0, 10.0))
         resnames.append("ALA"); resnums.append(10); elements.append("")
@@ -169,36 +176,50 @@ class CgBondPlausibilityTests(unittest.TestCase):
         self.assertIsNone(_run(split_cg=True))
 
 
-class CgContactCutoffTests(unittest.TestCase):
-    """A vdM must contact the CG, not merely the ligand it was cut from."""
+class NoWriterSideDistanceGateTests(unittest.TestCase):
+    """Membership is the SASA gate's decision; the writer must not re-litigate it.
+
+    The removed guard was a 4.5 A heavy-atom cutoff. Under buried SASA a residue
+    can bury CG surface out to ~6.5 A, and real members sit in the 4.5-6.5 A band
+    (Met-SD off a ring face, ~15% of members in a 12-structure sweep), so every
+    case below that used to be dropped must now survive.
+    """
 
     def test_contacting_vdm_is_accepted(self):
         ag = _run(vdm_offset=3.0)
         self.assertIsNotNone(ag)
         self.assertEqual(_vdm_resnums(ag), {10})
 
-    def test_vdm_far_from_cg_is_not_a_slot(self):
-        # The ligand still reaches ALA through its C9 tail, so the residue passes
-        # the 5 A environment selection, but no CG atom is within the cutoff --
-        # the large-cofactor case this guard exists for. The residue is dropped
-        # from the vdG, which for this single-vdM environment leaves no slots.
+    def test_vdm_beyond_the_old_cutoff_is_kept(self):
+        # The discriminating case: 5.5 A from the CG is past the deleted 4.5 A
+        # cutoff and inside the SASA gate's reach. This assertion is the inverse
+        # of the one it replaces.
+        ag = _run(vdm_offset=5.5, tail_atom=True)
+        self.assertIsNotNone(ag)
+        self.assertEqual(_vdm_resnums(ag), {10})
+
+    def test_vdm_far_from_the_cg_is_still_kept(self):
+        # Even a residue the gate would never admit is kept here: the writer has
+        # no contact information, and inventing one would re-create the guard.
+        # Whether this residue is a member was settled upstream.
         ag = _run(vdm_offset=8.0, tail_atom=True)
+        self.assertIsNotNone(ag)
+        self.assertEqual(_vdm_resnums(ag), {10})
+
+    def test_an_all_hydrogen_residue_is_still_dropped(self):
+        # The one residue-level check that survives, and the reason it reads the
+        # atom name as well as the element: with a blank element column a plain
+        # `not element H D` keeps every hydrogen, so this residue would look as
+        # though it had heavy atoms for the gate to have measured.
+        ag = _run(vdm_offset=8.0, tail_atom=True, only_blank_element_h=True)
         self.assertEqual(_vdm_resnums(ag) if ag is not None else set(), set())
 
-    def test_hydrogen_with_blank_element_does_not_count_as_contact(self):
-        # Same rejected geometry, plus an ALA hydrogen 2 A from the CG carrying an
-        # empty element column. `not element H D` keeps that atom, which would turn
-        # a non-contact into a 2 A "contact" and admit the slot.
-        ag = _run(vdm_offset=8.0, tail_atom=True, blank_element_h=True)
-        self.assertEqual(_vdm_resnums(ag) if ag is not None else set(), set())
-
-    def test_far_vdm_does_not_take_a_contacting_one_with_it(self):
-        # The reason the cutoff drops a residue rather than the environment.
+    def test_dropping_a_residue_does_not_drop_the_environment(self):
         # Subset sizes 1 and 2 are materialized from one shared reconstruction,
-        # so discarding the environment here would destroy GLY 11's size-1 vdG
-        # as well -- a slot that is genuinely in contact and belongs in the
-        # library.
-        ag = _run(vdm_offset=8.0, tail_atom=True, second_vdm=True)
+        # so discarding the environment over one bad residue would destroy
+        # GLY 11's size-1 vdG as well.
+        ag = _run(vdm_offset=8.0, tail_atom=True, second_vdm=True,
+                  only_blank_element_h=True)
         self.assertIsNotNone(ag)
         self.assertEqual(_vdm_resnums(ag), {11})
 

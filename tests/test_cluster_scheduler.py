@@ -1,6 +1,7 @@
 """A bucket clustered as phased tasks must write exactly what the one-task path
 writes, and one failing bucket must not take the others down with it."""
 import concurrent.futures
+import json
 import multiprocessing as mp
 import os
 import tempfile
@@ -43,10 +44,25 @@ def _bucket_columns(rng, n, n_cg=4, n_res=1, flank=2, n_centers=6):
         "slot_flags": np.zeros((n, n_res), dtype=np.int8),
         "quality": np.ones((n, 4), dtype=np.float32),
         "vdm_o": np.full((n, n_res, 3), np.nan, dtype=np.float32),
+        # Per-CG-atom chemistry and per-slot contact strength. The writer
+        # requires both row sets, and rejects cg_heavy_degree == 0 outright, so
+        # these cannot be zeros.
+        "cg_heavy_degree": np.full((n, n_cg), 2, dtype=np.int8),
+        "cg_num_h": np.full((n, n_cg), 1, dtype=np.int8),
+        "cg_formal_charge": np.zeros((n, n_cg), dtype=np.int8),
+        "cg_nbr_elems": np.full((n, n_cg), 1, dtype=np.uint32),  # one C
+        # OpenBabel, the perception these records would actually have come
+        # from today; 0 is the CCD template, which is not reachable yet.
+        "perception": np.ones(n, dtype=np.int8),
+        "vdm_buried_area": np.full((n, n_res), 12.5, dtype=np.float32),
+        "vdm_shared_area": np.full((n, n_res), 1.5, dtype=np.float32),
+        "vdm_n_atom_pairs": np.full((n, n_res), 3, dtype=np.int16),
+        "vdm_min_heavy_dist": np.full((n, n_res), 3.4, dtype=np.float32),
     }
 
 
-def _run(tmp, tag, split_min, buckets_spec, break_bucket=None):
+def _run(tmp, tag, split_min, buckets_spec, break_bucket=None,
+         profile_enabled=True):
     """Cluster `buckets_spec` ({aa_label: columns}) into <tmp>/<tag>; returns
     (failed labels, profile counters, library dir)."""
     lib = os.path.join(tmp, tag)
@@ -64,7 +80,7 @@ def _run(tmp, tag, split_min, buckets_spec, break_bucket=None):
     run = C.Run(cg_automorphisms=((0, 1, 2, 3), (0, 2, 1, 3)), seq_sim_thresh=0.4,
                 vdglib_dir=lib, logfile=os.path.join(tmp, f"log_{tag}"),
                 parent_pdb_dir="/db")
-    profile = ComputeProfile(enabled=True)
+    profile = ComputeProfile(enabled=profile_enabled)
     pool = concurrent.futures.ProcessPoolExecutor(
         max_workers=2, mp_context=mp.get_context("spawn"))
     try:
@@ -99,12 +115,70 @@ class PhasedBucketTests(unittest.TestCase):
                 a, b = _load(lib_a, label), _load(lib_b, label)
                 self.assertEqual(sorted(a), sorted(b))
                 for key in a:
+                    if key == "schema":
+                        # Provenance, not data: build_date differs by however
+                        # long the first run took. Everything else must match.
+                        sa, sb = (json.loads(str(x[key])) for x in (a, b))
+                        sa.pop("build_date"), sb.pop("build_date")
+                        self.assertEqual(sa, sb, label)
+                        continue
                     np.testing.assert_array_equal(a[key], b[key], err_msg=f"{label}:{key}")
                 self.assertEqual(int(a["cluster_size"].sum()), len(spec[label]["biounit"]))
                 self.assertGreater(len(a["cluster_id"]), 1)
             # The scratch intermediates of the split bucket are gone.
             self.assertEqual(sorted(os.listdir(os.path.join(tmp, "stream_split", "1", "ALA"))),
                              ["cgvdmbb.npy", "columns.npz"])
+
+    def test_per_bucket_rows_reconcile_with_the_fragment_wide_counters(self):
+        """The rows exist so the fragment-wide sums stop hiding the straggler,
+        so the two must agree -- and agree across both scheduling paths."""
+        rng = np.random.default_rng(3)
+        spec = {"ALA": _bucket_columns(rng, 150), "GLY": _bucket_columns(rng, 20)}
+        with tempfile.TemporaryDirectory() as tmp:
+            _, counters_a, _ = _run(tmp, "split", 40, spec)
+            _, counters_b, _ = _run(tmp, "single", 10_000, spec)
+            rows = {}
+            for tag, counters in (("split", counters_a), ("single", counters_b)):
+                path = os.path.join(tmp, f"log_{tag}_buckets.jsonl")
+                with open(path) as handle:
+                    parsed = [json.loads(line) for line in handle if line.strip()]
+                self.assertEqual(len(parsed), len(spec), tag)
+                by_key = {r["aa_key"]: r for r in parsed}
+                self.assertEqual(sorted(by_key), sorted(spec), tag)
+                rows[tag] = by_key
+                # Every bucket's own number sums back to the counter it was
+                # folded into; a per-block accumulation that double-counted or
+                # dropped a block would break exactly here.
+                self.assertEqual(sum(r["edges"] for r in parsed),
+                                 counters["stage1.edges"], tag)
+                self.assertEqual(sum(r["stage1_clusters"] for r in parsed),
+                                 counters["stage1.stage1_clusters"], tag)
+                self.assertEqual(sum(r["records"] for r in parsed),
+                                 counters["stage1.records"], tag)
+                self.assertGreater(counters["sched.tasks"], 0, tag)
+                self.assertGreaterEqual(counters["sched.max_concurrency"], 1, tag)
+            # The split path must not change what is counted, only how it is
+            # scheduled: ALA is split at 40, single at 10,000.
+            self.assertTrue(rows["split"]["ALA"]["split"])
+            self.assertFalse(rows["single"]["ALA"]["split"])
+            for label in spec:
+                for field in ("edges", "stage1_clusters", "records"):
+                    self.assertEqual(rows["split"][label][field],
+                                     rows["single"][label][field], f"{label}:{field}")
+            # Block-level detail exists only where a bucket was actually split,
+            # and the max of the blocks cannot exceed their sum.
+            ala = rows["split"]["ALA"]
+            self.assertGreater(ala["blocks"], 1)
+            self.assertLessEqual(ala["block_wall_max_s"], ala["block_wall_sum_s"])
+            self.assertNotIn("block_wall_max_s", rows["single"]["ALA"])
+
+    def test_rows_are_not_written_when_profiling_is_disabled(self):
+        rng = np.random.default_rng(5)
+        spec = {"ALA": _bucket_columns(rng, 30)}
+        with tempfile.TemporaryDirectory() as tmp:
+            _run(tmp, "off", 10_000, spec, profile_enabled=False)
+            self.assertFalse(os.path.exists(
+                os.path.join(tmp, "log_off_buckets.jsonl")))
 
     def test_one_failing_bucket_is_marked_and_the_rest_still_finish(self):
         rng = np.random.default_rng(4)

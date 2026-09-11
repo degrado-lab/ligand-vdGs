@@ -27,15 +27,15 @@ This guide explains how to generate a van der Graph (vdG) database for small mol
 
 Before running any pipeline steps, you need a preprocessed PDB database to extract vdGs from. You can use any collection of PDB structures — your own custom set or a mirror of the RCSB PDB.
 
-**Directory layout.** Structures must be organized in RCSB mirror format: each file is named `XXXX.pdb` (4-character code) or `XXXX_N.pdb` (biounit assembly N) and placed in a subdirectory named after the inner 2 characters of the code, **lowercased**: `1ABC.pdb` → `ab/1ABC.pdb`. Every reader (mining and Probe output alike) lowercases those two characters when it looks a structure up. Use [`ligand-vdGs/scripts/format_parent_database.py`](../scripts/format_parent_database.py) to reformat an existing directory; it copies (the source is left intact) and validates every file name before touching anything.
+**Directory layout.** Structures must be organized in RCSB mirror format: each file is named `XXXX.pdb` (4-character code) or `XXXX_N.pdb` (biounit assembly N) and placed in a subdirectory named after the inner 2 characters of the code, **lowercased**: `1ABC.pdb` → `ab/1ABC.pdb`. Every reader lowercases those two characters when it looks a structure up. Use [`ligand-vdGs/scripts/format_parent_database.py`](../scripts/format_parent_database.py) to reformat an existing directory; it copies (the source is left intact) and validates every file name before touching anything.
 
-> **Biounits:** the pipeline reads `XXXX_N.pdb` fine — `_pdb_id_from_path` splits the assembly suffix off, the npz stores the biounit stem, and Probe output is named by the full stem. Only `format_parent_database.py` is stricter (4 characters exactly), so lay biounit mirrors out by hand.
+> **Biounits:** the pipeline reads `XXXX_N.pdb` fine — `_pdb_id_from_path` splits the assembly suffix off, and the npz stores the biounit stem. Only `format_parent_database.py` is stricter (4 characters exactly), so lay biounit mirrors out by hand.
 
 Once your source PDBs are in the right layout, complete Steps 1–3 in order before moving on to Steps 4–5.
 
 - **Step 1 (`s01_trim_database.py`) — Prune the database (optional, recommended).** Run [`ligand-vdGs/ligand_vdgs/preprocessing/s01_trim_database.py`](../ligand_vdgs/preprocessing/s01_trim_database.py) to filter by ligand b-factor and extract 20 Å binding-site regions (the `radius` constant; 20 Å is the smallest sphere that keeps a ligand's *third* coordination shell, which is what Step 2's protonation needs — 10 Å kept only 8% of it), reducing database size and removing redundant structures. It has no CLI: the input/output directories, b-factor cutoff and `skip_to_output_pdbs` switch are module-level constants at the top of the script. The dedup pass writes a database JSON that the trimming pass then reads, so a fresh database needs `skip_to_output_pdbs = False` on the first run. The pipeline works without this step, but skipping it means running on full PDB files (slower, larger, and noisier). If you run it, use the output as `-p` in Step 5 below; otherwise use the formatted database from above.
 
-  Before parsing each file, this step rewrites two-character chain IDs (columns 21-22) to unique single characters and turns peptide-bonded HETATM amino acids into ATOM records (`_chain_ids.remap_chain_ids`, `_prep_filters.embedded_amino_acid_hetatm_to_atom`); the chain mapping is kept as `REMARK 900` lines in the output. Both must happen on the text, before ProDy sees it -- see "Chain IDs are one column" in [`pitfalls.md`](pitfalls.md). A database trimmed before this fix can be repaired with `scripts/remap_chain_ids.py` (into a new directory; re-run Step 3 on the repaired files).
+  Before parsing each file, this step rewrites two-character chain IDs (columns 21-22) to unique single characters and turns peptide-bonded HETATM amino acids into ATOM records (`_chain_ids.remap_chain_ids`, `_prep_filters.embedded_amino_acid_hetatm_to_atom`); the chain mapping is kept as `REMARK 900` lines in the output. Both must happen on the text, before ProDy sees it -- see "Chain IDs are one column" in [`pitfalls.md`](pitfalls.md). A database trimmed before this fix can be repaired with `scripts/remap_chain_ids.py` (into a new directory; mine from the repaired files).
 
   It also handles modified residues, which prepwizard used to rename to their parent amino acid (`_prep_filters.modified_residues_to_protein`): MSE/SEC become MET/CYS (keeping `SE`), and every other chain-bonded HETATM residue whose CCD type is `*PEPTIDE LINKING` (KCX, SEP, LLP, ...) becomes an ATOM record under its own resname, so it is neither mined as a ligand nor accepted as a slot; covalent cofactors (`NON-POLYMER`: PLP, HEM, SAM) stay HETATM ligands. This needs `resources/ccd_polymer_types.tsv`; regenerate it on a login node with `python scripts/fetch_ccd_polymer_types.py` if your database uses CCD entries newer than the table (s01 prints the resnames it did not find). Without the table s01 warns and only the renames happen. See "Modified residues" in [`pitfalls.md`](pitfalls.md).
 
@@ -47,17 +47,6 @@ Once your source PDBs are in the right layout, complete Steps 1–3 in order bef
 qsub -t 1-15 ligand_vdgs/preprocessing/s02_run_prepwizard.sh 15
 ```
  Run this on the output of Step 1, or the formatted database above if you skipped trimming.
-
-- **Step 3 (`s03_run_probe.sh`) — Run Probe.** Probe must be installed separately; it is available from the [Richardson lab / MolProbity project](https://github.com/rlabduke/probe). Submit all PDBs as an SGE array job with [`ligand-vdGs/ligand_vdgs/preprocessing/s03_run_probe.sh`](../ligand_vdgs/preprocessing/s03_run_probe.sh), which is the entry point; it invokes the private helper `_run_probe.py` per structure, resolved next to the script, so submit from anywhere. Output lands in `<probe_dir>/<xx>/<stem>.probe.gz` in the same lowercased mirror layout as the PDBs, and that directory is `-b` in Step 5 below. It takes four positionals and one task per PDB, so size `-t` to the file count (`$3`, the package path, is accepted but unused):
-
-```bash
-N=$(find <path/to/pdb_database/> -type f -name '*.pdb' | wc -l)
-qsub -t 1-$N -o <path/to/logs/> -e <path/to/logs/> \
-    ligand_vdgs/preprocessing/s03_run_probe.sh \
-    <path/to/pdb_database/> <path/to/probe_output/> \
-    <path/to/SMARTS-vdg_package/> <path/to/probe_binary>
-```
-
 
 ## Step 4: Build the Fragment Dictionary
 
@@ -97,14 +86,14 @@ The output `<output_dir>/database_frags_dict.pkl` is used in the next step.
 
 ## Step 5: Generate the vdG Database
 
-This step requires your protonated PDB database from Step 2 (use the trimmed version from Step 1 if you ran it) and the Probe output directory from Step 3. `database_frags_dict.pkl` from Step 4 is read only by the job schedulers below, which decide *which* fragments to run.
+This step requires your protonated PDB database from Step 2 (use the trimmed version from Step 1 if you ran it). `database_frags_dict.pkl` from Step 4 is read only by the job schedulers below, which decide *which* fragments to run.
 
 A qualifying fragment is one that:
 
 - carries no element from `UNDESIRED_ELEMENTS` (`fragment_database_ligs.py`: metals, lanthanides, noble gases, plus Si/Se/As/Te) and passes `Frags.is_organic` — this is applied at Step 4, so a disqualified element never reaches the fragment dict. **Boron is deliberately not excluded**: boronic acids and boronate esters are real covalent warheads and worth mining.
 - has at most 5 heavy atoms,
 - is not a halogen oxyanion (a crystallization salt, not a binding moiety), and
-- has at least `--min-instances` (default 250) estimated CG occurrences in the parent database — SMARTS matches summed over every ligand copy in the mirror, i.e. candidate vdG sites, not CCD ligand counts and not structure counts — after protonation-state variants are pooled onto one representative (`select_fragments` in `extract_fragment_smiles.py`).
+- has at least `--min-instances` (default 250) estimated CG occurrences in the parent database — SMARTS matches summed over every ligand copy in the database, i.e. candidate vdG sites, not CCD ligand counts and not structure counts — after protonation-state variants are pooled onto one representative (`select_fragments` in `extract_fragment_smiles.py`).
 
 The occurrence count comes from the same sampling pass as the per-fragment cost estimate (`estimate_frag_cost.estimate_fragment_counts`), which also returns the structure count that sizes each job's SGE slots. The core operation is running [`ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py`](../ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py) once per qualifying fragment SMILES. This calls the `vdG-miner` package to extract and cluster vdGs for that fragment; full usage is in the script header.
 
@@ -112,7 +101,6 @@ The occurrence count comes from the same sampling pass as the per-fragment cost 
 python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py \
     -s "<SMILES>" \
     -p <path/to/pdb_database/> \
-    -b <path/to/probe_output/> \
     -o <path/to/vdg_library/> \
     --num-procs <n>
 ```
@@ -124,7 +112,6 @@ python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py \
 | `-s` | Fragment SMILES, interpreted as a SMARTS pattern for substructure matching |
 | `-c` | Chemical group label. Encoded with `utils.smiles_to_filename` and used as the output subdirectory name under `-o`; `/` and `\` are handled for you. Defaults to `-s` if omitted. |
 | `-p` | Path to your protonated PDB database (Step 2). Use the trimmed version from Step 1 if you ran that optional step. |
-| `-b` | Path to the Probe output directory (output of Step 3) |
 | `-o` | Root output directory for the vdG library |
 | `--num-procs` | Number of parallel processes per job |
 | `--subset-sizes` | Which vdG subset sizes to generate; only `1` and `2` are accepted (default: `1 2`) |
@@ -149,8 +136,8 @@ exact pose radius of that choice is recorded in `cluster_pose_radius`.
 Fragment strings are substructure queries, not standalone molecules. They are
 parsed directly with RDKit `MolFromSmarts`, without SMILES sanitization, valence
 checking, or hydrogen inference. Keep fragment definitions free of explicit H
-atom nodes; hydrogens in the prepared PDB database for Probe are a separate
-concern.
+atom nodes. Hydrogens in the prepared PDB database are a separate concern, and
+no longer affect contact membership at all.
 
 Exact automorphisms cover ordinary graph symmetry for every atom type. On top of
 that, resonance groups are normalized so that their drawn bond order and charge do
@@ -187,14 +174,13 @@ Since the wrapper must be run once per qualifying fragment, use your cluster's s
 
 ### SGE (e.g., Wynton)
 
-[`make_sge_scripts_for_frags.py`](../ligand_vdgs/generate_vdgs/make_sge_scripts_for_frags.py) extracts qualifying fragments from `database_frags_dict.pkl` and writes one ready-to-submit SGE script per fragment. It samples `--pdb-dir` to estimate each fragment's cost (or reads `--frag-cost-estimate`) and tiers slots and `h_rt` per fragment, clamped by `--max-h-rt`, which is required. It also writes `<--vdg-lib-dir>/fragment_aliases.tsv`, the map from each collapsed protonation variant to the representative that was mined. The cheapest tier (< 750 estimated structures) requests `h_rt 0:29:00` so the job qualifies for Wynton's short queue and starts far sooner; `--no-short-queue` turns that off. A short-tier job that overruns is killed with a partial fragment directory, so after a build re-run any fragment whose `<cg_label>/<cg_label>_log` lacks `Job completed.` — `rm -rf` that fragment directory first, since the wrapper refuses a non-empty one and has no resume flag (see "Expected output" below). It refuses to run if `--sge-out-dir` already has files. Default paths are set for Wynton. Non-Wynton users must pass `--vdg-lib-dir`, `--pdb-dir`, `--probe-dir`, and `--log-dir` explicitly:
+[`make_sge_scripts_for_frags.py`](../ligand_vdgs/generate_vdgs/make_sge_scripts_for_frags.py) extracts qualifying fragments from `database_frags_dict.pkl` and writes one ready-to-submit SGE script per fragment. It samples `--pdb-dir` to estimate each fragment's cost (or reads `--frag-cost-estimate`) and tiers slots and `h_rt` per fragment, clamped by `--max-h-rt`, which is required. It also writes `<--vdg-lib-dir>/fragment_aliases.tsv`, the map from each collapsed protonation variant to the representative that was mined. Default paths are set for Wynton. Non-Wynton users must pass `--vdg-lib-dir`, `--pdb-dir`, and `--log-dir` explicitly:
 
 ```bash
 python ligand_vdgs/generate_vdgs/make_sge_scripts_for_frags.py \
     --max-h-rt <HH:MM:SS> \
     --vdg-lib-dir  <path/to/vdg_library/> \
     --pdb-dir      <path/to/pdb_database/> \
-    --probe-dir    <path/to/probe_output/> \
     --log-dir      <path/to/logs/> \
     --sge-out-dir  <path/to/empty/script_dir/>
 ```
@@ -223,12 +209,12 @@ python ligand_vdgs/generate_vdgs/estimate_frag_cost.py \
 ```
 
 > **Counts come from `--pdb-dir`, not from the CCD.** The estimate is a SMARTS
-> pass over a sample of the parent PDB mirror, so a fragment whose ligands are
-> not in that mirror estimates 0 occurrences and is dropped by
+> pass over a sample of the parent database, so a fragment whose ligands are
+> not in that database estimates 0 occurrences and is dropped by
 > `--min-instances` with no job written. When adding novel ligands beyond the
-> CCD, get their structures into the mirror you pass as `--pdb-dir` and
-> regenerate the TSV before generating the fleet; force in a wanted fragment
-> that still scores low with `--include`/`--include-file`.
+> CCD, get their structures into the parent database you pass as `--pdb-dir`
+> and regenerate the TSV before generating the fleet; force in a wanted
+> fragment that still scores low with `--include`/`--include-file`.
 
 ### SLURM and other schedulers
 
@@ -260,7 +246,7 @@ containing `/` (e.g. `C/C=C/O`):
 ```bash
 while IFS= read -r smarts; do
     args=(-s "$smarts" \
-          -p "$PDB_DIR" -b "$PROBE_DIR" -o "$OUT_DIR" \
+          -p "$PDB_DIR" -o "$OUT_DIR" \
           --num-procs "$NPROCS" --subset-sizes 1 2)
     # replace with sbatch/qsub/srun or a bare call
     your-submit-command python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py "${args[@]}"
@@ -326,7 +312,7 @@ Member rows carry no coordinates by design: they are re-derived from the parent
 PDB on demand (`vdg_npz_utils.rederive_member_coords`). Parent structures are
 stored as a biounit stem plus one directory scalar, and
 `resolve_parent_pdb_path` rebuilds the path — pass `pdb_dir=` to point a copied
-library at a different PDB mirror.
+library at a different parent database.
 
 Quality is recorded per row rather than only filtered on: `nr_cg_max_b`,
 `nr_cg_min_occ`, `nr_vdm_max_b`, `nr_vdm_min_occ` (and the `mem_` equivalents)

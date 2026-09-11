@@ -73,6 +73,14 @@ class SmartSlotOrderSurvivesRecordUnpacking(unittest.TestCase):
             "slot_flags": [0, 1],
             "quality": (18.4, 1.0, 22.7, 1.0),
             "bbo": [np.zeros(3, dtype=np.float32), np.full(3, np.nan, dtype=np.float32)],
+            # Synthetic until session 3's gate lands. Required fields: the
+            # writer refuses a record without them rather than filling in.
+            "cg_heavy_degree": [1, 4, 1], "cg_num_h": [0, 0, 1],
+            "cg_formal_charge": [-1, 0, 0], "cg_nbr_elems": ["", "OC", ""],
+            "perception": 1,
+            "buried_area": [12.5, 4.0], "shared_area": [1.5, 0.0],
+            "n_atom_pairs": [6, 2],
+            "min_heavy_dist": [3.1, 4.8],
         }
 
     def test_cg_fields_are_copied_without_relabeling(self):

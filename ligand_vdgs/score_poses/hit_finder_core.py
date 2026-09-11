@@ -397,6 +397,17 @@ def match_library_frags_to_query(lig_mol, vdg_lib_dir, vdg_lib_entries,
     # `r<n>` means *smallest* ring: GetSymmSSSR guarantees it, FastFindRings does
     # not. Idempotent, so free if get_query_ligand_mol already did it.
     Chem.GetSymmSSSR(lig_mol)
+    # Keys carry heavy-atom degree, and RDKit counts graph H atoms in `D`: one
+    # leftover explicit H makes a hydroxyl O read D2, so every `[O;D1]` key
+    # misses and hit finding returns an empty result with no error.
+    # get_query_ligand_mol already strips them; this catches a caller that
+    # built lig_mol some other way.
+    n_graph_h = sum(1 for a in lig_mol.GetAtoms() if a.GetAtomicNum() == 1)
+    if n_graph_h:
+        raise ValueError(
+            f'query ligand mol has {n_graph_h} hydrogen atoms in the graph; the '
+            'library\'s keys carry heavy-atom degree (`D<n>`), which counts them, '
+            'so matching must run on an H-free mol (see Frags.get_query_ligand_mol).')
     lig_elements = Counter(a.GetAtomicNum() for a in lig_mol.GetAtoms())
     n_lig_atoms = lig_mol.GetNumAtoms()
 

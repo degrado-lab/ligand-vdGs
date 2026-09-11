@@ -3,13 +3,12 @@
 import time
 import numpy as np
 from collections import OrderedDict, namedtuple
-from scipy import sparse
 from functools import lru_cache
 from ligand_vdgs.functions.clus_helpers import calc_seq_similarity
 from ligand_vdgs.functions import vdg_struct_utils as struct_utils
 from ligand_vdgs.functions.vdg_struct_utils import (get_res_iden, found_chain_break,
     get_AA_and_CA_coords, get_bb_coords, get_bb_o_coords, build_flank_lookup_index)
-from ligand_vdgs.functions.utils import kabsch_ssd
+from ligand_vdgs.functions.utils import _det3, kabsch_ssd
 from ligand_vdgs.functions.vdg_fp_utils import (
     INTERNAL_DISTANCE_EPS, fp_tolerances,
     full_row_permutations, internal_distance_bound_matrix,
@@ -23,13 +22,9 @@ _SEQ_CACHE_MAXSIZE  = 100_000   # sequence similarity (Stage 2 sub-clusters only
 _EXACT_MEDOID_MAX = 1_000       # above this, the medoid is picked from a subsample
 _MEDOID_SUBSAMPLE = 512
 
-# Sized so a cluster clustered exactly (m <= _EXACT_MEDOID_MAX) has all m(m-1)/2
-# of its pairs resident at once. Below that the repeated medoid refreshes of one
-# growing cluster evict each other's pairs and every refresh recomputes a fresh
-# Kabsch per pair, which turns the leader pass from quadratic-with-reuse into
-# cubic. The bound still matters -- an unbounded dict is an OOM on a big bucket --
-# so it is tied to the exact-path cap rather than raised freely.
-_RMSD_CACHE_MAXSIZE = _EXACT_MEDOID_MAX * (_EXACT_MEDOID_MAX - 1) // 2
+# Pairs per batched flank-fit block: caps the coordinate gather (~120 B/pair at
+# ten flank rows) while staying far above numpy's dispatch overhead.
+_PAIR_BLOCK = 200_000
 
 # pose_minimax_prototype: candidate cap, and the pair budget per Kabsch block.
 _MINIMAX_CANDIDATE_CAP = 4_096
@@ -37,62 +32,6 @@ _MINIMAX_BLOCK_PAIRS   = 200_000
 
 EPS = 1e-9   # strict-improvement epsilon for reassignment; tune to 1e-8 if needed
 
-_CacheInfo = namedtuple('_CacheInfo', 'hits misses evictions maxsize currsize')
-
-
-
-class _BoundedRmsdCache:
-   """Bounded LRU for pair RMSDs, with the membership test ``lru_cache`` lacks.
-
-   Batching only pays if it computes *just* the misses, which means asking what
-   is already known -- ``functools.lru_cache`` exposes no such query. The bound
-   is kept because it is load-bearing: a bucket of n vdGs has n(n-1)/2 pairs
-   (367k for one guanidine bucket alone, far more for a large high-symmetry
-   fragment), so an unbounded dict is an out-of-memory waiting to happen.
-
-   Keys are ``(i, j, p)``: an ordered index pair plus the slot ordering applied
-   to the lower-indexed record. The stored value is the flank RMSD only, so the
-   metric is not part of the key. Indices are relative to the *current* call's
-   datasets and collide across calls, so the ``cache_clear`` on every
-   ``get_leader_clusters`` entry is what keeps this correct.
-   """
-
-   __slots__ = ("_d", "_maxsize", "hits", "misses", "evictions")
-
-   def __init__(self, maxsize):
-      self._d = OrderedDict()
-      self._maxsize = maxsize
-      self.hits = self.misses = self.evictions = 0
-
-   def __contains__(self, key):
-      return key in self._d
-
-   def get(self, key):
-      d = self._d
-      if key in d:
-         d.move_to_end(key)
-         self.hits += 1
-         return d[key]
-      self.misses += 1
-      return None
-
-   def put(self, key, value):
-      d = self._d
-      if key in d:
-         d.move_to_end(key)
-      d[key] = value
-      if len(d) > self._maxsize:
-         d.popitem(last=False)
-         # Nonzero means pairs are being recomputed; the bound needs revisiting.
-         self.evictions += 1
-
-   def cache_clear(self):
-      self._d.clear()
-      self.hits = self.misses = self.evictions = 0
-
-   def cache_info(self):
-      return _CacheInfo(self.hits, self.misses, self.evictions,
-                        self._maxsize, len(self._d))
 
 
 # Rows (pair x group element) per batched Kabsch call. Kabsch is ~99% of
@@ -284,22 +223,79 @@ def stage1_edges(data, threshold, n_cg, perm_group, row_range=None,
    return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32)
 
 
-def neighbor_csr(n, qi, qj):
-   """Symmetric CSR neighbour lists from lexicographically sorted edges (qi < qj).
+# Edges per scatter pass. The pass allocates ~20 B per edge in it, so this
+# caps that working set near 20 MB regardless of how big the bucket is.
+_CSR_CHUNK_EDGES = 1 << 20
+
+
+def _scatter_by_row(indices, cursor, rows, values):
+   """Write `values` at each row's cursor, keeping input order within a row.
+
+   `cursor` advances, so consecutive calls append: that is what lets the
+   neighbour list be filled chunk by chunk without holding every edge.
+   """
+   order = np.argsort(rows, kind='stable')
+   rows_sorted = rows[order]
+   counts = np.bincount(rows_sorted, minlength=cursor.size)
+   starts = np.zeros(counts.size + 1, dtype=np.int64)
+   np.cumsum(counts, out=starts[1:])
+   rank = np.arange(rows_sorted.size, dtype=np.int64) - starts[rows_sorted]
+   indices[cursor[rows_sorted] + rank] = values[order]
+   cursor += counts
+
+
+def neighbor_csr_from_chunks(n, load_chunks):
+   """Symmetric CSR neighbour lists built from edge chunks, never concatenated.
+
+   `load_chunks` is a zero-argument callable returning a fresh iterator of
+   `(qi, qj)` int32 pairs, each lexicographically sorted with qi < qj; it is
+   called twice, once to count degrees and once to fill. Streaming is the point:
+   graph assembly is a single serial task over a whole bucket's edges, so at
+   ~1e8 edges materializing them all cost more than the neighbour lists
+   themselves.
 
    Returns int32 ``(indptr, indices)``. Each row's neighbours come out
-   ascending: the reverse edges are listed first, then the forward ones, and
-   scipy's coo->csr is a counting sort by row that keeps input order within a
-   row. That order is load-bearing -- Stage 2 walks a cluster's members in the
-   order Butina emits them -- and is pinned in tests/test_butina_clustering.py.
+   ascending -- every reverse edge is written before every forward one, across
+   all chunks, and both halves keep input order -- which is load-bearing: Stage
+   2 walks a cluster's members in the order Butina emits them. Pinned in
+   tests/test_butina_clustering.py.
+   """
+   deg_rev = np.zeros(n, dtype=np.int64)
+   deg_fwd = np.zeros(n, dtype=np.int64)
+   total = 0
+   for qi, qj in load_chunks():
+      deg_rev += np.bincount(np.asarray(qj), minlength=n)
+      deg_fwd += np.bincount(np.asarray(qi), minlength=n)
+      total += len(qi)
+
+   indptr = np.zeros(n + 1, dtype=np.int64)
+   np.cumsum(deg_rev + deg_fwd, out=indptr[1:])
+   indices = np.empty(2 * total, dtype=np.int32)
+   rev_at = indptr[:-1].copy()
+   fwd_at = indptr[:-1] + deg_rev
+   for qi, qj in load_chunks():
+      qi = np.asarray(qi, dtype=np.int32)
+      qj = np.asarray(qj, dtype=np.int32)
+      _scatter_by_row(indices, rev_at, qj, qi)
+      _scatter_by_row(indices, fwd_at, qi, qj)
+   return indptr.astype(np.int32, copy=False), indices
+
+
+def neighbor_csr(n, qi, qj, chunk=_CSR_CHUNK_EDGES):
+   """`neighbor_csr_from_chunks` for edges already held as one pair of arrays.
+
+   Slices them into views rather than passing one chunk: the scatter's working
+   set is per chunk, so this costs nothing and keeps the one-shot path's peak
+   near the neighbour lists themselves.
    """
    qi = np.asarray(qi, dtype=np.int32)
    qj = np.asarray(qj, dtype=np.int32)
-   rows = np.concatenate([qj, qi])
-   cols = np.concatenate([qi, qj])
-   graph = sparse.coo_matrix(
-      (np.ones(rows.size, dtype=np.int8), (rows, cols)), shape=(n, n)).tocsr()
-   return graph.indptr.astype(np.int32), graph.indices.astype(np.int32)
+
+   def _chunks():
+      return ((qi[a:a + chunk], qj[a:a + chunk])
+              for a in range(0, qi.size, chunk))
+
+   return neighbor_csr_from_chunks(n, _chunks)
 
 
 def butina_partition(indptr, indices):
@@ -367,6 +363,41 @@ def get_butina_clusters(cgvdmbb_data, threshold, n_cg_atoms, perm_group,
       return [np.zeros(1, dtype=np.int32)]
    qi, qj = stage1_edges(data, threshold, n_cg_atoms, perm_group, counters=counters)
    return butina_partition(*neighbor_csr(n, qi, qj))
+
+
+def batched_pair_row_sums(members, n_orders, flankbb_arr, seq_terms):
+   """Stage-2 distance row sums over every pair of `members`, flank fit batched.
+
+   Returns one sum per member, so the medoid is its `argmin`. `flankbb_arr[p]`
+   is the flank coordinates under slot ordering `p` (index 0 the identity);
+   `seq_terms(a, b, p)` supplies the sequence half for a block of ordered pairs.
+
+   Same numbers `_dist_idx_idx(..., early_stop=False)` returns: ordered pairs,
+   the slot-ordering permutation applied to the lower-indexed record, and the
+   minimum taken over orderings *of the summed distance*, not of either term
+   alone. The medoid passes are the only ones with no early exit, which is why
+   they are the ones that batch cleanly -- there is no shortcut to preserve.
+
+   Worth batching because the flank fit is ~129 us/pair called scalar and flat
+   from 5 to 25 coordinate rows, i.e. almost entirely per-call overhead.
+   """
+   k = len(members)
+   idx = np.asarray(members, dtype=np.intp)
+   ii, jj = np.triu_indices(k, 1)
+   row_sums = np.zeros(k, dtype=np.float64)
+   for start in range(0, ii.size, _PAIR_BLOCK):
+      sl = slice(start, start + _PAIR_BLOCK)
+      x, y = idx[ii[sl]], idx[jj[sl]]
+      a, b = np.minimum(x, y), np.maximum(x, y)
+      best = None
+      for p in range(n_orders):
+         d = np.zeros(a.size, dtype=np.float64) + seq_terms(a, b, p)
+         if flankbb_arr is not None:
+            d += _rmsd_rows(flankbb_arr[p][a], flankbb_arr[0][b])
+         best = d if best is None else np.minimum(best, d)
+      np.add.at(row_sums, ii[sl], best)
+      np.add.at(row_sums, jj[sl], best)
+   return row_sums
 
 
 def pose_minimax_prototype(cgvdmbb_data, member_indices, n_cg_atoms,
@@ -438,6 +469,7 @@ def get_leader_clusters(
    final_exact_medoid_pass=True,             # polish small clusters cheaply
    final_reassign_once=True,                 # one refinement pass
    slot_orders=None,                         # interchangeable vdM slot orderings
+   _batched=True,                            # False = scalar reference, tests only
 ):
    """Partition one pose cluster by flanking context. Returns the partition only.
 
@@ -510,28 +542,10 @@ def get_leader_clusters(
              seq[i], get_leader_clusters._SEQ_DATA[j],
              missing_similarity=missing_similarity * 100.0)
 
-      _rmsd_store = _BoundedRmsdCache(_RMSD_CACHE_MAXSIZE)
-
-      def _rmsd_cached(a, b, p):
-          # Callers pass an already-ordered pair, so (i, j) and (j, i) hit the
-          # same entry.
-          key = (a, b, p)
-          hit = _rmsd_store.get(key)
-          if hit is not None:
-             return hit
-          val = _rmsd_pair(get_leader_clusters._FLANKBB_DATA_PERMS[p][a],
-                           get_leader_clusters._FLANKBB_DATA[b])
-          _rmsd_store.put(key, val)
-          return val
-      _rmsd_cached.cache_clear = _rmsd_store.cache_clear
-      _rmsd_cached.cache_info = _rmsd_store.cache_info
-      _rmsd_cached.store = _rmsd_store
       get_leader_clusters._seqsim_cached = _seqsim_cached
-      get_leader_clusters._rmsd_cached   = _rmsd_cached
 
    # Indices are call-local, so clear on entry to every call.
    get_leader_clusters._seqsim_cached.cache_clear()
-   get_leader_clusters._rmsd_cached.cache_clear()
 
    get_leader_clusters._SEQ_DATA = metric_to_data.get('flankseq')
    get_leader_clusters._FLANKBB_DATA = metric_to_data.get('flankbb')
@@ -561,9 +575,40 @@ def get_leader_clusters(
       get_leader_clusters._SEQ_DATA_PERMS = [get_leader_clusters._SEQ_DATA]
       get_leader_clusters._FLANKBB_DATA_PERMS = [get_leader_clusters._FLANKBB_DATA]
    n_orders = len(orders)
+   # Array form of the same data, for the batched medoid pass. Built once per
+   # call alongside the permutations, for the same reason they are.
+   flankbb_arr = ([np.asarray(d, dtype=np.float32)
+                   for d in get_leader_clusters._FLANKBB_DATA_PERMS]
+                  if has_flankbb else None)
 
    _seqsim_cached = get_leader_clusters._seqsim_cached
-   _rmsd_cached   = get_leader_clusters._rmsd_cached
+
+   # Flank fits for one record against every leader, computed in one batched
+   # call and then read back scalar-by-scalar. Precompute-then-replay rather
+   # than a batched decision: the leader and reassignment passes early-exit on a
+   # running bound, so their control flow stays exactly as it was and only the
+   # arithmetic moves. The cost is fits the early exit would have skipped, at
+   # 5.5 us each instead of 129.
+   _primed = {}
+
+   def _prime(i, targets):
+      _primed.clear()
+      if not (_batched and has_flankbb and targets):
+         return
+      t = np.asarray(targets, dtype=np.intp)
+      a, b = np.minimum(t, i), np.maximum(t, i)
+      for q in range(n_orders):
+         for key, val in zip(zip(a.tolist(), b.tolist(), [q] * t.size),
+                             _rmsd_rows(flankbb_arr[q][a], flankbb_arr[0][b]).tolist()):
+            _primed[key] = val
+
+   def _rmsd_lookup(a, b, p):
+      """A primed flank fit, or a scalar one if `_prime` did not cover the pair."""
+      val = _primed.get((a, b, p))
+      if val is None:
+         val = _rmsd_pair(get_leader_clusters._FLANKBB_DATA_PERMS[p][a],
+                          get_leader_clusters._FLANKBB_DATA[b])
+      return val
 
    if has_seq and not 0.0 <= missing_seq_similarity <= 1.0:
       raise ValueError("missing_seq_similarity must be between 0 and 1")
@@ -576,7 +621,7 @@ def get_leader_clusters(
          if early_stop and total > cutoff:
             return total
       if has_flankbb:
-         total += _rmsd_cached(a, b, p)
+         total += _rmsd_lookup(a, b, p)
       return total
 
    def _dist_idx_idx(i, j, early_stop=True, cap=None):
@@ -592,8 +637,32 @@ def get_leader_clusters(
          best = min(best, _dist_one(a, b, p, early_stop, min(cutoff, best)))
       return best
 
+   def _row_sums(members):
+      if _batched:
+         return batched_pair_row_sums(members, n_orders, flankbb_arr, _seq_terms)
+      k = len(members)
+      sums = np.zeros(k, dtype=np.float64)
+      for ii in range(k):
+         for jj in range(ii + 1, k):
+            d = _dist_idx_idx(members[ii], members[jj], early_stop=False)
+            sums[ii] += d
+            sums[jj] += d
+      return sums
+
+   def _seq_terms(a, b, p):
+      """Sequence half of the pair distance, scalar and cached on purpose: at
+      2.6 us/pair against the flank fit's 129 it is not what costs."""
+      if not has_seq:
+         return 0.0
+      scale = seq_weight / 100.0
+      missing = float(missing_seq_similarity)
+      return np.fromiter(
+         ((100.0 - _seqsim_cached(u, v, missing, p)) * scale
+          for u, v in zip(a.tolist(), b.tolist())),
+         dtype=np.float64, count=a.size)
+
    def _exact_medoid(members):
-      # Full pairwise: no early-exit, warms cache for the reassignment step
+      # Full pairwise, no early exit.
       m = len(members)
       if m <= 2:
          # m == 2: the two members have identical row sums, so there is no medoid
@@ -601,13 +670,7 @@ def get_leader_clusters(
          return members[0]
       if m > _EXACT_MEDOID_MAX:
          return _sampled_medoid(members)
-      row_sums = np.zeros(m, dtype=np.float64)
-      for ii in range(m):
-         for jj in range(ii + 1, m):
-            d = _dist_idx_idx(members[ii], members[jj], early_stop=False)
-            row_sums[ii] += d
-            row_sums[jj] += d
-      return members[int(np.argmin(row_sums))]
+      return members[int(np.argmin(_row_sums(members)))]
 
    def _sampled_medoid(members):
       """Medoid of a deterministic subsample, for clusters too large to do exactly.
@@ -618,21 +681,15 @@ def get_leader_clusters(
       re-measured there, so an approximate centre costs assignment quality at the
       margin and nothing in the recorded data.
 
-      Exact is O(m^2) *Python-level* pair distances (measured: n=200 9 s, n=400
-      36 s, n=800 158 s), which is cubic overall once the leader pass refreshes a
-      growing cluster, and does not finish for the largest bb_bb/ARG buckets.
+      Still O(m^2) pair distances, but batched now (`batched_pair_row_sums`):
+      5.5 us/pair against 168 scalar, so the k=512 subsample costs ~0.7 s where
+      the same loop took ~22 s. The quadratic is unchanged and the leader pass
+      still refreshes a growing cluster, so the subsample stays.
       """
       m = len(members)
       pos = np.unique(np.linspace(0, m - 1, _MEDOID_SUBSAMPLE).astype(np.intp))
       sample = [members[int(p)] for p in pos]
-      k = len(sample)
-      row_sums = np.zeros(k, dtype=np.float64)
-      for ii in range(k):
-         for jj in range(ii + 1, k):
-            d = _dist_idx_idx(sample[ii], sample[jj], early_stop=False)
-            row_sums[ii] += d
-            row_sums[jj] += d
-      return sample[int(np.argmin(row_sums))]
+      return sample[int(np.argmin(_row_sums(sample)))]
 
    def _should_refresh(size_now):
       """Whether a cluster that just grew to `size_now` should re-pick its centre.
@@ -656,6 +713,7 @@ def get_leader_clusters(
    reps = [0]
    members = [[0]]
    for i in range(1, n):
+      _prime(i, reps)
       best_j, best_d = -1, float('inf')
       for j, r in enumerate(reps):
          d = _dist_idx_idx(i, r, early_stop=True, cap=best_d)
@@ -680,6 +738,7 @@ def get_leader_clusters(
          item2clus = {idx: j for j, mem in enumerate(members) for idx in mem}
          moved_any = False
          for i in range(n):
+            _prime(i, reps)
             cur_j = item2clus[i]
             d_cur = _dist_idx_idx(i, reps[cur_j], early_stop=False)
             best_j, best_d = cur_j, d_cur
@@ -717,12 +776,81 @@ def get_leader_clusters(
 
    return {cnum + 1: mem for cnum, mem in enumerate(members)}
 
+def masked_kabsch_ssd(X, Y, chunk_size=30000):
+   """Batched `kabsch_ssd` over the rows finite in both structures of each pair.
+
+   `X` and `Y` are `(M, n, 3)`. Returns `(ssd, n_eff)`, both length M, with the
+   count of rows each pair was actually fitted over -- the caller needs it to
+   divide, since it varies per pair.
+
+   `kabsch_ssd` itself cannot do this: it rejects non-finite input outright and
+   centres over a single fixed point count. Stage 2's flanking residues are
+   routinely missing (chain breaks, unreadable residues), so its mask is
+   per *pair*, not per bucket -- which is why the scalar `_rmsd_pair` dropped
+   rows and called `kabsch_ssd` one pair at a time, at ~129 us of pure call
+   overhead per pair regardless of size.
+
+   Same closed form as `kabsch_ssd` -- `ssd = |Xc|^2 + |Yc|^2 - 2(s1 + s2 + d*s3)`
+   from the singular values alone -- with the weighted centroid `sum(w x)/sum(w)`
+   and masked rows zeroed after centring, so they contribute to neither the
+   cross-covariance nor the norms. Zeroed with `np.where`, never by multiplying:
+   the masked entries are NaN and `0 * NaN` is NaN.
+
+   A pair with no rows in common gets `ssd = 0, n_eff = 0`; the caller decides
+   what that means (`_rmsd_rows` reports inf, matching the scalar path).
+   """
+   X = np.asarray(X, dtype=np.float32)
+   Y = np.asarray(Y, dtype=np.float32)
+   if X.shape != Y.shape:
+      raise ValueError(f"masked_kabsch_ssd got mismatched shapes: {X.shape} vs {Y.shape}")
+   if X.ndim != 3 or X.shape[2] != 3:
+      raise ValueError(f"masked_kabsch_ssd expected (M, n, 3), got {X.shape}")
+
+   M = X.shape[0]
+   if M == 0:
+      return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.int64)
+
+   valid = np.isfinite(X).all(axis=2) & np.isfinite(Y).all(axis=2)
+   n_eff = valid.sum(axis=1).astype(np.int64)
+
+   ssd = np.empty(M, dtype=np.float64)
+   for start in range(0, M, chunk_size):
+      stop = min(start + chunk_size, M)
+      keep = valid[start:stop, :, None]
+      # Divisor floored at 1 so an all-masked pair stays finite; its rows are
+      # all zeroed anyway, so every term below is 0.
+      inv = 1.0 / np.maximum(n_eff[start:stop], 1)[:, None, None]
+      out = []
+      for arr in (X[start:stop], Y[start:stop]):
+         c = np.where(keep, arr, 0.0).astype(np.float64)
+         c -= np.add.reduce(c, axis=1)[:, None, :] * inv
+         out.append(np.where(keep, c, 0.0))
+      Xc, Yc = out
+      H = np.matmul(np.transpose(Xc, (0, 2, 1)), Yc)
+      sv = np.linalg.svd(H, compute_uv=False)
+      d = np.where(_det3(H) < 0.0, -1.0, 1.0)
+      norms = (np.add.reduce(np.add.reduce(Xc * Xc, axis=2), axis=1)
+               + np.add.reduce(np.add.reduce(Yc * Yc, axis=2), axis=1))
+      trace = sv[:, 0] + sv[:, 1] + d * sv[:, 2]
+      ssd[start:stop] = np.maximum(norms - 2.0 * trace, 0.0)
+   return ssd, n_eff
+
+
+def _rmsd_rows(X, Y):
+   """Stage-2 flank RMSD for a batch of pairs; inf where they share no rows."""
+   ssd, n_eff = masked_kabsch_ssd(X, Y)
+   out = np.full(ssd.shape, np.inf, dtype=np.float64)
+   ok = n_eff > 0
+   out[ok] = np.sqrt(ssd[ok] / n_eff[ok])
+   return out
+
+
 def _rmsd_pair(X, Y):
    """Stage-2 RMSD over coordinate rows that are finite in both structures.
 
-   Stage 1 has no counterpart: its atoms are all mandatory, and records missing
-   any of them are dropped upstream by
-   `clus_and_deduplicate_vdgs._has_complete_stage1_coords`.
+   Scalar entry point for `masked_kabsch_ssd`. Stage 1 has no counterpart: its
+   atoms are all mandatory, and records missing any of them are dropped upstream
+   by `clus_and_deduplicate_vdgs._has_complete_stage1_coords`.
    """
    X = np.asarray(X, dtype=np.float32)
    Y = np.asarray(Y, dtype=np.float32)
@@ -730,13 +858,7 @@ def _rmsd_pair(X, Y):
       raise ValueError(f"RMSD pair got mismatched shapes: {X.shape} vs {Y.shape}")
    if X.ndim != 2 or X.shape[1] != 3:
       raise ValueError(f"RMSD pair expected shape (N, 3), got {X.shape}")
-   valid = np.isfinite(X).all(axis=1) & np.isfinite(Y).all(axis=1)
-   if not valid.any():
-      return float('inf')
-   X = X[valid]
-   Y = Y[valid]
-   ssd = kabsch_ssd(X[None, ...], Y[None, ...], chunk_size=1)
-   return float(np.sqrt(ssd[0] / len(X)))
+   return float(_rmsd_rows(X[None, ...], Y[None, ...])[0])
 
 def _permuted_rmsd_pair(X, Y, cg_index_perms, n_cg):
    """Min RMSD over explicit, graph-validated CG automorphisms via Kabsch.
@@ -978,11 +1100,12 @@ def clear_caches():
    """Clear Stage-2's memoized distance caches and dataset registries.
 
    Call between buckets so one bucket's index-keyed cache cannot be read by the
-   next. Stage 1 holds no module-level state -- get_butina_clusters is
-   self-contained -- so there is nothing to clear on its side."""
-   if not hasattr(get_leader_clusters, '_rmsd_cached'):
+   next. Only the sequence term is memoized now: flank fits are batched per
+   record and thrown away with it. Stage 1 holds no module-level state --
+   get_butina_clusters is self-contained -- so there is nothing to clear on its
+   side."""
+   if not hasattr(get_leader_clusters, '_seqsim_cached'):
       return
-   get_leader_clusters._rmsd_cached.cache_clear()
    get_leader_clusters._seqsim_cached.cache_clear()
    get_leader_clusters._SEQ_DATA = None
    get_leader_clusters._FLANKBB_DATA = None

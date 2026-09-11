@@ -14,16 +14,12 @@ from ligand_vdgs.functions.utils import mol_from_fragment
 #     (vdg_fp_utils.build_perm_group), so a repeated-label bucket costs prod(k!)
 #     permutations per pair-distance -- 2x at sizes 1-2, but 6x for a bb_bb_bb
 #     bucket at size 3, on top of an already O(N^2) clustering.
-#   - The CG_VDM_CONTACT_CUTOFF guard in clus_and_deduplicate_vdgs checks each
-#     vdM slot but discards the *whole* environment when any one fails, so a
-#     non-contacting slot takes its genuinely-contacting partners with it. At
-#     size 2 that costs 0.133% of vdGs (measured over 1,501 size-2 nr vdGs),
-#     which is why the simple version was kept. The loss grows with subset size:
-#     more slots means more chances that at least one fails, and more good slots
-#     discarded each time it does. Above 2, drop only the offending slot -- which
-#     means re-deriving the subset's aa_bucket and de-duplicating the remainder
-#     against the smaller-subset vdGs that generation already emits.
-# Raising this means fixing both, not editing this line.
+#   - The whole-environment loss this note used to describe came from the
+#     CG_VDM_CONTACT_CUTOFF guard, which is gone: membership is now the SASA
+#     gate's decision and the writer applies no distance test, so a
+#     non-contacting slot no longer takes its partners down with it. The
+#     remaining cost of raising this is the permutation term above.
+# Raising this means fixing that, not editing this line.
 MAX_SUBSET_SIZE = 2
 
 def get_bsr_combinations(solved_struct, ligname, quiet=True, pdbfile=""):

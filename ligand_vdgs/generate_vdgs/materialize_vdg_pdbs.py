@@ -80,7 +80,7 @@ def parse_args():
                    help="Write each vdM's sidechain heavy atoms, re-derived from the "
                         "parent PDB. On by default, but falls back to CG + bb-only.")
     p.add_argument("-P", "--pdb-dir", default=None,
-                   help="RCSB-style PDB mirror to resolve parent structures against, "
+                   help="RCSB-style parent database to resolve parent structures against, "
                         "overriding the build-time directory recorded in the buckets. "
                         f"Only used by {', '.join(PARENT_READING_FLAGS)}.")
 

@@ -38,9 +38,8 @@ from ligand_vdgs.functions.interactions import add_pdb_to_nr_db_dict
 from ligand_vdgs.functions.utils import set_up_outdir
 from ligand_vdgs.functions import parent_db
 from ligand_vdgs.preprocessing._prep_filters import (
-    drop_prepwizard_hazard_residues, load_ccd_polymer_types, modified_residues_to_protein)
-from ligand_vdgs.preprocessing._chain_ids import (ChainIdOverflow, remap_chain_ids,
-                                                  remap_remarks)
+    drop_prepwizard_hazard_residues, load_ccd_polymer_types, text_repairs)
+from ligand_vdgs.preprocessing._chain_ids import ChainIdOverflow, remap_remarks
 
 origin_dir = '/home/sophia/DockDesign/databases/consolidated_BioLiP2_split'
 target_dir = '/home/sophia/DockDesign/databases/consolidated_BioLiP2_trimmed'
@@ -63,17 +62,15 @@ previous_checkpoint_dict = 'checkpoint.pkl'
 
 def parse_pdb_with_single_char_chains(pdbpath, ccd_types):
     '''ProDy AtomGroup for *pdbpath* after the textual fixes that must precede parsing:
-    multi-character chain IDs remapped to single characters, MSE/SEC renamed to MET/CYS,
-    HETATM amino acids and chain-bonded modified residues made ATOM records
-    (_prep_filters.modified_residues_to_protein; *ccd_types* from
-    load_ccd_polymer_types). Returns (atoms, {old: new} chain mapping, stats dict from
-    modified_residues_to_protein). Raises ChainIdOverflow if the structure has more
-    chains than single characters.'''
+    _prep_filters.text_repairs -- multi-character chain IDs remapped to single
+    characters, MSE/SEC renamed to MET/CYS, HETATM amino acids and chain-bonded modified
+    residues made ATOM records (*ccd_types* from load_ccd_polymer_types). Returns
+    (atoms, {old: new} chain mapping, stats dict from modified_residues_to_protein).
+    Raises ChainIdOverflow if the structure has more chains than single characters.'''
     opener = gzip.open if pdbpath.endswith('.gz') else open
     with opener(pdbpath, 'rt') as f:
         lines = f.readlines()
-    lines, mapping = remap_chain_ids(lines)
-    lines, stats = modified_residues_to_protein(lines, ccd_types)
+    lines, mapping, stats = text_repairs(lines, ccd_types)
     atoms = pr.parsePDBStream(io.StringIO(''.join(lines)))
     return atoms, mapping, stats
 

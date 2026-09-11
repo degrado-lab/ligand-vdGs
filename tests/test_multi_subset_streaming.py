@@ -14,6 +14,34 @@ BB = np.array([[-1.459, 0.0, 0.0], [0.0, 0.0, 0.0], [0.551, 1.422, 0.0]],
               dtype=np.float32)
 
 
+
+def _write_cg_pickles(temp_dir, names=None, biounits=("1abc",), by_biounit=None):
+    """Matches pickle + its sibling annotation pickle, for one CG match each.
+
+    Both are required at build time: the writer refuses a record whose CG
+    annotations it would otherwise have to invent. Values here are synthetic.
+    `by_biounit` maps a biounit stem to that structure's CG atom names;
+    `names` + `biounits` is the shorthand for "the same names everywhere".
+    """
+    import pickle
+    from ligand_vdgs.functions import vdg_npz_utils
+    if by_biounit is None:
+        by_biounit = {b: names for b in biounits}
+    matches, annots = {}, {}
+    for biounit, atom_names in by_biounit.items():
+        key = (biounit, "", "A", "10", "LIG")
+        n = len(atom_names)
+        matches[key] = [list(atom_names)]
+        annots[key] = [{"heavy_degree": [1] * n, "num_h": [0] * n,
+                        "formal_charge": [0] * n, "nbr_elems": [""] * n,
+                        "perception": 1}]
+    matches_path = os.path.join(temp_dir, "cg_matches.pkl")
+    with open(matches_path, "wb") as handle:
+        pickle.dump(matches, handle)
+    with open(vdg_npz_utils.cg_annot_pkl_path(matches_path), "wb") as handle:
+        pickle.dump(annots, handle)
+    return matches_path
+
 class MultiSubsetStreamingTests(unittest.TestCase):
     def test_one_environment_builds_both_subset_sizes_once(self):
         environment = [["1abc", "", "A", 10, 1],
@@ -30,7 +58,13 @@ class MultiSubsetStreamingTests(unittest.TestCase):
             with open(os.path.join(environments_dir, "1abc.jsonl"), "w") as handle:
                 json.dump({"env": environment, "cg_max_b": 15.0,
                            "cg_min_occ": 1.0, "vdm_max_b": 25.0,
-                           "vdm_min_occ": 1.0}, handle)
+                           "vdm_min_occ": 1.0,
+                           # Synthetic until session 3's SASA gate lands; one
+                           # value per vdM slot, i.e. per env entry after the
+                           # CG. The writer refuses a record without them.
+                           "buried_area": [12.5, 4.0], "shared_area": [1.5, 0.0],
+                           "n_atom_pairs": [6, 2],
+                           "min_heavy_dist": [3.2, 4.9]}, handle)
                 handle.write("\n")
 
             worker_root = os.path.join(temp_dir, "worker")
@@ -38,7 +72,7 @@ class MultiSubsetStreamingTests(unittest.TestCase):
                 [("ab", "1abc.jsonl")],
                 os.path.join(temp_dir, "environments"),
                 os.path.join(temp_dir, "pdb"),
-                "test_cg", None, [1, 0, 2],
+                "test_cg", _write_cg_pickles(temp_dir, cg_result[1]), [1, 0, 2],
                 os.path.join(temp_dir, "log"), 3, ["C", "O", "O"], 2,
                 worker_root, (0, 0), (1, 2), pipeline._FLUSH_RECORDS_THRESHOLD)
 
@@ -47,7 +81,7 @@ class MultiSubsetStreamingTests(unittest.TestCase):
                 n = len(labels)
                 return (labels, [BB] * n,
                         ["AAAAA"] * n, [np.zeros((5, 3))] * n,
-                        [("", "A", 20 + i, label)
+                        [("", "A", 20 + 10 * i, label)
                          for i, label in enumerate(labels)], [0] * n,
                         [BB[2] + 1.23] * n)
 
@@ -98,7 +132,13 @@ class MultiSubsetStreamingTests(unittest.TestCase):
             with open(os.path.join(environments_dir, "1abc.jsonl"), "w") as handle:
                 json.dump({"env": environment, "cg_max_b": 15.0,
                            "cg_min_occ": 1.0, "vdm_max_b": 25.0,
-                           "vdm_min_occ": 1.0}, handle)
+                           "vdm_min_occ": 1.0,
+                           # Synthetic until session 3's SASA gate lands; one
+                           # value per vdM slot, i.e. per env entry after the
+                           # CG. The writer refuses a record without them.
+                           "buried_area": [12.5, 4.0], "shared_area": [1.5, 0.0],
+                           "n_atom_pairs": [6, 2],
+                           "min_heavy_dist": [3.2, 4.9]}, handle)
                 handle.write("\n")
 
             worker_root = os.path.join(temp_dir, "worker")
@@ -106,7 +146,7 @@ class MultiSubsetStreamingTests(unittest.TestCase):
                 [("ab", "1abc.jsonl")],
                 os.path.join(temp_dir, "environments"),
                 os.path.join(temp_dir, "pdb"),
-                "test_cg", None, [1, 0, 2],
+                "test_cg", _write_cg_pickles(temp_dir, cg_result[1]), [1, 0, 2],
                 os.path.join(temp_dir, "log"), 3, ["C", "O", "O"], 2,
                 worker_root, (0, 0), (1, 2),
                 pipeline._FLUSH_RECORDS_THRESHOLD)
@@ -151,7 +191,10 @@ class MultiSubsetStreamingTests(unittest.TestCase):
                 worker_root = os.path.join(temp_dir, f"worker_{tag}_{i}")
                 args = (
                     chunk, os.path.join(temp_dir, "environments"),
-                    os.path.join(temp_dir, "pdb"), "test_cg", None, [1, 0, 2],
+                    os.path.join(temp_dir, "pdb"), "test_cg",
+                    _write_cg_pickles(temp_dir, by_biounit={
+                        label.split("_")[0]: r[1]
+                        for label, r in cg_by_label.items()}), [1, 0, 2],
                     os.path.join(temp_dir, "log"), 3, expected_element_seq, 2,
                     worker_root, (0, 0), (1,), pipeline._FLUSH_RECORDS_THRESHOLD)
 
@@ -195,7 +238,11 @@ class MultiSubsetStreamingTests(unittest.TestCase):
                     json.dump({"env": [[biounit, "", "A", 10, 1],
                                        [biounit, "", "A", 20]],
                                "cg_max_b": 15.0, "cg_min_occ": 1.0,
-                               "vdm_max_b": 25.0, "vdm_min_occ": 1.0}, handle)
+                               "vdm_max_b": 25.0, "vdm_min_occ": 1.0,
+                           # Synthetic until session 3's SASA gate lands;
+                           # the writer refuses a record without them.
+                           "buried_area": [12.5], "shared_area": [1.5], "n_atom_pairs": [6],
+                           "min_heavy_dist": [3.2]}, handle)
                     handle.write("\n")
                 shards.append((subdir, f"{biounit}.jsonl"))
 
@@ -217,11 +264,16 @@ class MultiSubsetStreamingTests(unittest.TestCase):
             os.makedirs(environments_dir)
             with open(os.path.join(environments_dir, "1abc.jsonl"), "w") as handle:
                 json.dump({"env": environment, "cg_max_b": 15.0, "cg_min_occ": 1.0,
-                           "vdm_max_b": 25.0, "vdm_min_occ": 1.0}, handle)
+                           "vdm_max_b": 25.0, "vdm_min_occ": 1.0,
+                           # Synthetic until session 3's SASA gate lands;
+                           # the writer refuses a record without them.
+                           "buried_area": [12.5], "shared_area": [1.5], "n_atom_pairs": [6],
+                           "min_heavy_dist": [3.2]}, handle)
                 handle.write("\n")
             worker_root = os.path.join(temp_dir, "worker")
             args = ([("ab", "1abc.jsonl")], os.path.join(temp_dir, "environments"),
-                    os.path.join(temp_dir, "pdb"), "test_cg", None, [1, 0, 2],
+                    os.path.join(temp_dir, "pdb"), "test_cg",
+                    _write_cg_pickles(temp_dir, ["C1", "O1", "O2"]), [1, 0, 2],
                     os.path.join(temp_dir, "log"), 3, ["C", "O", "O"], 2,
                     worker_root, (0, 0), (1,), pipeline._FLUSH_RECORDS_THRESHOLD)
             collinear = BB.copy()
@@ -266,7 +318,11 @@ class MultiSubsetStreamingTests(unittest.TestCase):
                     json.dump({"env": [[biounit, "", "A", 10, 1],
                                        [biounit, "", "A", 20]],
                                "cg_max_b": 15.0, "cg_min_occ": 1.0,
-                               "vdm_max_b": 25.0, "vdm_min_occ": 1.0}, handle)
+                               "vdm_max_b": 25.0, "vdm_min_occ": 1.0,
+                           # Synthetic until session 3's SASA gate lands;
+                           # the writer refuses a record without them.
+                           "buried_area": [12.5], "shared_area": [1.5], "n_atom_pairs": [6],
+                           "min_heavy_dist": [3.2]}, handle)
                     handle.write("\n")
                 shards.append((subdir, f"{biounit}.jsonl"))
 
@@ -275,7 +331,9 @@ class MultiSubsetStreamingTests(unittest.TestCase):
             def run(chunk, tag):
                 args = (
                     chunk, os.path.join(temp_dir, "environments"),
-                    os.path.join(temp_dir, "pdb"), "test_cg", None, [1, 0, 2],
+                    os.path.join(temp_dir, "pdb"), "test_cg",
+                    _write_cg_pickles(temp_dir, ["C1", "O1", "O2"],
+                                      biounits=("1abc", "2xyz")), [1, 0, 2],
                     logfile, 3, ["C", "O", "O"], 2,
                     os.path.join(temp_dir, f"worker_{tag}"), (0, 0), (1,),
                     pipeline._FLUSH_RECORDS_THRESHOLD)

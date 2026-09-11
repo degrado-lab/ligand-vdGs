@@ -2,7 +2,7 @@
 Quick/dirty redundancy checks used while trimming the parent PDB database.
 
 These are deliberately crude: they compare residue numbers/names rather than
-geometry, to shrink the database cheaply before prepwizard/probe. Redundancy is
+geometry, to shrink the database cheaply before protonation. Redundancy is
 refined properly later, during vdG generation.
 '''
 from ligand_vdgs.functions import parent_db
