@@ -58,32 +58,51 @@ class GetCgAtomsCollapsesResidue(unittest.TestCase):
 
 
 class SmartSlotOrderSurvivesRecordUnpacking(unittest.TestCase):
+    @staticmethod
+    def _record(names=("O1", "P", "O2")):
+        return {
+            "cg_coords": np.arange(9, dtype=np.float32).reshape(3, 3),
+            "bbcoords": [np.zeros((3, 3), dtype=np.float32),
+                         np.ones((3, 3), dtype=np.float32)],
+            "flankseqs": [["A", "-", "vdm", "!", "GLY"], ["B", "C", "vdm", "D", "E"]],
+            "flankCAs": [np.zeros((5, 3)), np.ones((5, 3))],
+            "biounit": "1abc",
+            "scrr": [["", "A", 10, "GLY"], ["", "A", 11, "ALA"]],
+            "cg_names": list(names), "cg_elements": ["O", "P", "O"],
+            "cg_seg": "", "cg_chain": "L", "cg_resnum": 1, "cg_resname": "LIG",
+            "slot_flags": [0, 1],
+            "quality": (18.4, 1.0, 22.7, 1.0),
+            "bbo": [np.zeros(3, dtype=np.float32), np.full(3, np.nan, dtype=np.float32)],
+        }
+
     def test_cg_fields_are_copied_without_relabeling(self):
-        coords = np.arange(9, dtype=np.float32).reshape(3, 3)
-        bb = [np.zeros((3, 3), dtype=np.float32),
-              np.ones((3, 3), dtype=np.float32)]
-        record = [
-            coords, bb, [["A"], ["B"]], [np.zeros(3), np.ones(3)], "1abc.pdb",
-            [["", "A", 10, "GLY"], ["", "A", 11, "ALA"]],
-            ["O1", "P", "O2"], ["O", "P", "O"], "", "L", 1, "LIG", [0, 1],
-            18.4, 1.0, 22.7, 1.0,   # cg_max_b, cg_min_occ, vdm_max_b, vdm_min_occ
-        ]
-
-        out = clus_helpers.unpack_vdg_records([record, record])
-        out_coords, out_names = out[0], out[6]
-
-        # One record in, one record out: interchangeable slots are handled inside
+        cols = clus_helpers.records_to_columns([self._record(), self._record()])
+        # One record in, one row out: interchangeable slots are handled inside
         # the Stage-1 distance, not by replicating the vdG here.
-        self.assertEqual(len(out_coords), 2)
-        for cg_coords, cg_names in zip(out_coords, out_names):
-            np.testing.assert_array_equal(cg_coords, coords)
-            self.assertEqual(cg_names, ["O1", "P", "O2"])
-        self.assertIsNot(out_coords[0], out_coords[1])
-        self.assertIsNot(out_names[0], out_names[1])
+        self.assertEqual(cols["cgvdmbb"].shape, (2, 3 + 6, 3))
+        np.testing.assert_array_equal(cols["cgvdmbb"][1, :3],
+                                      np.arange(9).reshape(3, 3))
+        np.testing.assert_array_equal(cols["cgvdmbb"][0, 6:], np.ones((3, 3)))
+        self.assertEqual(cols["cg_names"][0].tolist(), ["O1", "P", "O2"])
+        self.assertEqual(cols["flank_seq"][0].tolist(),
+                         ["A", "-", "vdm", "!", "GLY", "B", "C", "vdm", "D", "E"])
+        self.assertEqual(cols["flank_ca"].shape, (2, 10, 3))
+        self.assertEqual(cols["scrr_resnum"].tolist(), [[10, 11], [10, 11]])
+        self.assertEqual(cols["quality"].shape, (2, 4))
 
-    def test_a_wrong_width_record_is_rejected(self):
+    def test_a_name_filling_its_width_is_kept_and_one_over_is_refused(self):
+        cols = clus_helpers.records_to_columns([self._record(names=("HO3'", "P", "O2"))])
+        self.assertEqual(cols["cg_names"][0, 0], "HO3'")
+        with self.assertRaisesRegex(ValueError, "cg_names.*5-char"):
+            clus_helpers.records_to_columns([self._record(names=("HO3''", "P", "O2"))])
+        long_stem = dict(self._record(), biounit="x" * 33)
+        with self.assertRaisesRegex(ValueError, "biounit.*33-char"):
+            clus_helpers.records_to_columns([long_stem])
+
+    def test_a_ragged_record_is_rejected(self):
+        short = self._record(names=("O1", "P"))
         with self.assertRaises(ValueError):
-            clus_helpers.unpack_vdg_records([[1, 2, 3]])
+            clus_helpers.records_to_columns([self._record(), short])
 
 
 class BuildAtomGroupTakesScalarResidue(unittest.TestCase):
@@ -101,26 +120,33 @@ class BuildAtomGroupTakesScalarResidue(unittest.TestCase):
 
 
 class CentroidIsStoredExactlyOnce(unittest.TestCase):
-    """The medoid lives in nr_*, never also in mem_*."""
+    """The nr row lives in nr_*, never also in mem_*."""
 
-    def test_extract_members_drops_the_medoid(self):
+    def test_writer_drops_the_nr_row_from_the_members(self):
+        import tempfile
         from ligand_vdgs.generate_vdgs import clus_and_deduplicate_vdgs as clus
 
         n = 5
-        args = ([f"pdb{i}" for i in range(n)],                     # pdbpaths
-                [[("", "A", 10 + i, "ASP")] for i in range(n)],    # scrr
-                [["O1", "O2"] for _ in range(n)],                  # cg_names
-                [""] * n, ["A"] * n, list(range(n)), ["SO4"] * n,  # cg residue
-                [(10.0, 1.0, 20.0, 1.0)] * n)                      # quality
-        members = clus._extract_members(*args, member_idxs=[0, 1, 2, 3, 4],
-                                        nr_idx=2)
-
-        self.assertEqual(len(members), n - 1)
-        self.assertNotIn("pdb2", [m["pdbpath"] for m in members])
-        # cluster_size counts the medoid, so the rows are one short of it.
-        self.assertEqual(len(members) + 1, n)
-        self.assertNotIn("is_centroid", members[0])
-        self.assertEqual(members[0]["quality"], (10.0, 1.0, 20.0, 1.0))
+        recs = [SmartSlotOrderSurvivesRecordUnpacking._record() for _ in range(n)]
+        for i, rec in enumerate(recs):
+            rec["biounit"] = f"1a{i:02d}" if i < 4 else "1a00_2"   # 4 entries
+        cols = clus_helpers.records_to_columns(recs)
+        members = np.arange(n, dtype=np.int32)
+        subgroups = [clus.Subgroup(1, 1, 2, members, 0.25)]
+        with tempfile.TemporaryDirectory() as tmp:
+            clus._write_bucket_npz(tmp, 2, ("GLY", "ALA"), cols, subgroups, "/db")
+            with np.load(os.path.join(tmp, "nr_vdgs", "2", "GLY_ALA.npz")) as z:
+                self.assertEqual(z["cluster_size"].tolist(), [n])
+                self.assertEqual(z["cluster_num_parents"].tolist(), [4])
+                self.assertEqual(z["nr_parent_biounit"].tolist(), ["1a02"])
+                mem = z["mem_parent_biounit"].tolist()
+                self.assertEqual(len(mem), n - 1)
+                self.assertNotIn("1a02", mem)
+                self.assertEqual(z["mem_cluster_id"].tolist(), [1] * (n - 1))
+                self.assertEqual(z["nr_vdm_bb_coords"].shape, (1, 2, 3, 3))
+                self.assertEqual(z["cg_elements"].tolist(), ["O", "P", "O"])
+                self.assertEqual(str(z["parent_pdb_dir"]), "/db")
+                self.assertAlmostEqual(float(z["nr_cg_max_b"][0]), 18.4, places=5)
 
 
 if __name__ == "__main__":

@@ -79,6 +79,11 @@ MAX_H_RT=36:00:00 ./run_production_frags.sh --mode threshold-plus-include
 The generated scripts use `#$ -cwd` with repo-relative paths, so submit from the
 repository root.
 
+- After a build or rebuild (and after any change to the fragment key scheme), run
+  `python ligand_vdgs/tools/h_class_diagnostic.py --lib <vdg_library> --out h_class.tsv`
+  before deciding which `H0`/`!H0` key variants to pool at read time; see
+  ["When to run the H-class diagnostic"](docs/database_generation_guide.md#when-to-run-the-h-class-diagnostic).
+
 ---
 
 ## Bioisostere Identification

@@ -19,6 +19,7 @@ Usage:
 import os
 import argparse
 import shutil
+from ligand_vdgs.functions import parent_db
 
 pdb_input_dir = 'consolidated_BioLiP2'
 pdb_output_dir = 'consolidated_BioLiP2_split'
@@ -48,16 +49,16 @@ def main():
 
     # Validate all file names up front so a bad name aborts before any file is touched
     for pdb in pdbs:
-        pdbcode = pdb.removesuffix('.pdb')
-        if len(pdbcode) != 4:
-            raise ValueError('PDB file names are expected to have 4 characters ("XXXX.pdb"). '
-                             'Invalid file: {}'.format(os.path.join(pdb_input_dir, pdb)))
+        if not pdb.endswith(parent_db.STRUCTURE_EXT) or len(parent_db.stem_of(pdb)) < 3:
+            raise ValueError('PDB file names are expected to be <stem>.pdb with a stem of '
+                             'at least 3 characters. Invalid file: {}'.format(
+                                 os.path.join(pdb_input_dir, pdb)))
 
     # Copy the pdbs (source database is left intact)
     for pdb in pdbs:
         print(pdb)
         # Determine its subdir, based on the inner 2 characters in the pdb name
-        subdir_code = pdb[1:3].lower()   # readers lowercase the middle two
+        subdir_code = parent_db.shard(parent_db.stem_of(pdb))
         subdir_path = os.path.join(pdb_output_dir, subdir_code)
         if not os.path.exists(subdir_path):
             os.mkdir(subdir_path)

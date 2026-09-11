@@ -24,7 +24,7 @@ import hashlib
 import fcntl
 import errno
 import itertools
-from collections import OrderedDict
+from collections import OrderedDict, deque, namedtuple
 
 # Distinct exit code for "the run completed but streamed nothing". Not 1:
 # the wrapper treats it as a warning rather than a crash -- the job exits 0,
@@ -129,15 +129,17 @@ from fingerprint_helpers import (align_coords_sanity_check,
 from constants import cg_atoms
 
 from ligand_vdgs.functions import align_and_cluster as clust
-from ligand_vdgs.functions.clus_helpers import (unpack_vdg_records,
-    combine_cg_and_vdmbb_coords, flatten_flanking_seqs, flatten_flanking_CAs,
+from ligand_vdgs.functions import parent_db
+from ligand_vdgs.functions.clus_helpers import (
     get_vdg_subsets_target_size, select_diverse_pdbIDs, _aa_tmp_dir,
-    _stream_root, VDG_FIELDS,)
+    _stream_root, stage1_record_is_complete, records_to_columns, concat_columns,
+    save_shard, load_shard, save_columns, load_columns, load_stage1, COLUMNS_FILE)
 from ligand_vdgs.functions.vdg_struct_utils import (VDM_OCC, cg_slot_occupancy,
-    get_cg_atoms, is_valid_backbone_coords, is_hydrogen)
+    get_cg_atoms, is_hydrogen)
 from ligand_vdgs.functions.vdg_npz_utils import (write_cg_symmetry, name_selstr,
     parse_pdb_with_retry)
 from ligand_vdgs.functions.vdg_fp_utils import build_perm_group, slot_orders
+from ligand_vdgs.functions.align_and_cluster import butina_partition, neighbor_csr, stage1_edges
 from ligand_vdgs.functions.dock_utils import cg_element_symbols
 from ligand_vdgs.functions.compute_profile import ComputeProfile
 from ligand_vdgs.functions.utils import (convert_time_elapsed, normalize_rmsd,
@@ -188,28 +190,19 @@ def _cg_bond_components(coords, cutoff=MAX_CG_BOND_DIST):
     return comps
 
 
-# One source of truth for both the pickled record keys and the positional order
-# unpack_vdg_records reads them back in.
-_REQUIRED_VDG_KEYS = set(VDG_FIELDS)
-
 # Streaming chunks per worker process. >1 so the executor can rebalance across
 # workers; small enough that the per-chunk dispatch cost stays a rounding error
 # against a chunk's parse cost.
 STREAM_CHUNKS_PER_WORKER = 4
 
-
-def _has_complete_stage1_coords(vdg_data, expected_n_cg, expected_num_vdms):
-    """Return whether a serialized vdG has all mandatory finite Stage-1 atoms."""
-    try:
-        cg_coords = np.asarray(vdg_data[0], dtype=np.float32)
-        bb_coords = np.asarray(vdg_data[1], dtype=np.float32)
-    except (TypeError, ValueError):
-        return False
-    if cg_coords.shape != (expected_n_cg, 3) or not np.isfinite(cg_coords).all():
-        return False
-    if bb_coords.shape != (expected_num_vdms, 3, 3):
-        return False
-    return all(is_valid_backbone_coords(bb) for bb in bb_coords)
+# Buckets with at least this many records are clustered as phased tasks --
+# Stage-1 row blocks, graph assembly, Stage-2 cluster blocks, write -- so the
+# pool stays busy through the tail instead of one worker holding the largest
+# bucket alone. Smaller ones run start to finish in one task.
+_SPLIT_MIN_RECORDS = 8_000
+# Blocks per split bucket, as a multiple of --num-procs: enough granularity for
+# the pool to absorb the data-dependent cost of the exact fits and of Stage 2.
+_BLOCKS_PER_PROC = 4
 
 
 def parse_args():
@@ -252,7 +245,10 @@ def parse_args():
         "IDs; a single PDB can still contribute multiple vdGs after this filter. "
         "Default: no limit.",)
     parser.add_argument("-p", "--num-procs", default=10, type=int,
-        help="Number of AA composition buckets to run concurrently.",)
+        help="Worker processes for streaming and clustering.",)
+    parser.add_argument("--keep-stream-dir", action="store_true",
+        help="Leave the streamed bucket columns on scratch after the run "
+        "instead of deleting them, and print their location.")
     parser.add_argument("--pdb-cache-size", default=256, type=int,
         help="Max number of parsed PDB structures to keep in memory during "
         "streaming. This is an entry cap only -- a parsed biounit ranges from "
@@ -266,12 +262,6 @@ def parse_args():
         parser.error(f"--num-procs must be at least 1, got {args.num_procs}")
     return args
 
-def _pdb_id_from_path(pdbpath):
-    """Recover the bare PDB ID from a `rec["pdbpath"]` value, i.e. the path built as
-    `pdb_dir/<biounit[1:3].lower()>/<biounit>.pdb` (see `_stream_one_chunk`), where
-    `biounit` is `<pdbid>` or `<pdbid>_<n>`. Keep in sync with that construction."""
-    return os.path.splitext(os.path.basename(pdbpath))[0].split("_")[0]
-
 # Well under the 255-byte filename limit on ext4/xfs, with room for the hash,
 # the flush index and the extension.
 _MAX_BUCKET_FNAME_BYTES = 200
@@ -281,26 +271,25 @@ def _bucket_fname(aa_key, flush_idx=None):
     """Name of the on-disk file holding one AA-composition bucket.
 
     The aa_key is written **whole**, never truncated: it is the only record of the
-    bucket's composition, and both readers (`_merge_worker_dirs` and the bucket
-    dispatch in `main`) recover it by parsing this name back with
-    `_aa_key_from_bucket_fname`. A truncated key would merge distinct buckets into
-    one file and mislabel their residues, silently. The sha1 is kept for name stability
-    and legibility; it is not what makes the name unique.
+    shard's composition, and `_merge_worker_dirs` recovers it by parsing this name
+    back with `_aa_key_from_bucket_fname`. A truncated key would merge distinct
+    buckets into one file and mislabel their residues, silently. The sha1 is kept
+    for name stability and legibility; it is not what makes the name unique.
     """
     h = hashlib.sha1(aa_key.encode()).hexdigest()[:16]
     stem = f"{aa_key}__{h}" if flush_idx is None else f"{aa_key}__{h}__{flush_idx:04d}"
-    fname = f"{stem}.pkl"
+    fname = f"{stem}.npz"
     if len(fname.encode()) > _MAX_BUCKET_FNAME_BYTES:
         raise ValueError(
             f"AA bucket key {aa_key!r} ({len(aa_key)} chars) does not fit in a "
             f"{_MAX_BUCKET_FNAME_BYTES}-byte filename. Labels are <=4 chars, so this "
             "needs a subset size around 40 -- far past MAX_SUBSET_SIZE. Store the key "
-            "inside the pickle instead of shortening it here; the readers parse it "
+            "inside the shard instead of shortening it here; the reader parses it "
             "back out of the name.")
     return fname
 
 
-_BUCKET_FNAME_RE = re.compile(r"^(?P<key>[^_].*?)__[0-9a-f]{16}(?:__\d{4})?\.pkl$")
+_BUCKET_FNAME_RE = re.compile(r"^(?P<key>[^_].*?)__[0-9a-f]{16}(?:__\d{4})?\.npz$")
 
 
 def _aa_key_from_bucket_fname(fname):
@@ -312,79 +301,6 @@ def _aa_key_from_bucket_fname(fname):
     """
     match = _BUCKET_FNAME_RE.match(fname)
     return match.group("key") if match else None
-
-def _dump_pickle_atomic(obj, path):
-    """Pickle to a temp name in the same directory, then os.replace onto `path`.
-
-    Same contract as the npz writer: a worker killed part-way through the dump
-    (the OOM killer, an SGE h_rt kill, a full scratch quota) must never leave a
-    truncated file sitting on a name the readers accept, because every reader
-    trusts a well-formed name and would fail at unpickling -- after streaming has
-    already finished. The temp name deliberately does not end in '.pkl', which is
-    what `_merge_worker_dirs` and `_bucket_jobs` walk for.
-    """
-    tmp = f"{path}.{os.getpid()}.tmp"
-    try:
-        with open(tmp, "wb") as fh:
-            pickle.dump(obj, fh, protocol=pickle.HIGHEST_PROTOCOL)
-        os.replace(tmp, path)
-    except BaseException:
-        # BaseException, not Exception: a queue SIGTERM arrives as SystemExit,
-        # which is one of the cases this cleanup exists for.
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-        raise
-
-
-def _load_bucket(path):
-    with open(path, "rb") as f:
-        records = pickle.load(f)
-    _vdgs = []
-    for rec in records:
-        if not isinstance(rec, dict):
-            raise ValueError(f"Bucket pickle corrupted: record is not a dict ({type(rec)})")
-        if not _REQUIRED_VDG_KEYS.issubset(rec.keys()):
-            raise ValueError(f"Bucket pickle corrupted: missing keys {_REQUIRED_VDG_KEYS - set(rec.keys())}")
-        converted = dict(rec)
-        converted["cg_coords"] = np.asarray(rec["cg_coords"], dtype=np.float32)
-        converted["bbcoords"] = [np.asarray(r, dtype=np.float32) for r in rec["bbcoords"]]
-        converted["flankCAs"] = [np.asarray(r, dtype=np.float32) for r in rec["flankCAs"]]
-        _vdgs.append([converted[k] for k in VDG_FIELDS])
-    return _vdgs
-
-def _extract_env(all_cg_coords, all_vdmbb_coords,
-    all_pdbpaths, all_scrr, all_cg_names, all_cg_elements, all_cg_seg, all_cg_chain,
-    all_cg_resnum, all_cg_resname, all_slot_flags, all_quality, idx):
-    """The representative record for one cluster, in the shape _write_bucket_npz reads.
-
-    Flanking sequence and flank CA coords are deliberately absent: they drive Stage-2
-    subclustering and nothing else, and no npz field holds them.
-    """
-    return {
-        "cg_coords": np.asarray(all_cg_coords[idx], dtype=np.float32),
-        "vdm_bb_coords": np.asarray(all_vdmbb_coords[idx], dtype=np.float32),
-        "pdbpath": all_pdbpaths[idx], "scrr": all_scrr[idx],
-        "slot_flags": list(all_slot_flags[idx]),
-        "cg_names": list(all_cg_names[idx]), "cg_elements": list(all_cg_elements[idx]),
-        "cg_seg": all_cg_seg[idx], "cg_chain": all_cg_chain[idx],
-        "cg_resnum": all_cg_resnum[idx], "cg_resname": all_cg_resname[idx],
-        "quality": all_quality[idx]}
-
-def _extract_members(all_pdbpaths, all_scrr, all_cg_names, all_cg_seg,
-    all_cg_chain, all_cg_resnum, all_cg_resname, all_quality,
-    member_idxs, nr_idx):
-    """The cluster's members *excluding* its medoid.
-
-    The nr vdG's identity is already in the nr_ arrays, in full and then
-    some (it carries coordinates and a slot flag the member rows do not), so
-    emitting it here too would store the same vdG twice.
-    """
-    return [_extract_member_identity(all_pdbpaths, all_scrr, all_cg_names,
-                all_cg_seg, all_cg_chain, all_cg_resnum, all_cg_resname,
-                all_quality, idx)
-            for idx in member_idxs if idx != nr_idx]
 
 def _bucket_npz_path(vdglib_dir, size_subset, reordered_AAs):
     aa_label = "_".join(reordered_AAs)
@@ -400,254 +316,131 @@ def _write_failed_marker(vdglib_dir, size_subset, aa_label, err_text):
     with open(os.path.join(size_dir, f"{aa_label}.FAILED"), "w") as fh:
         fh.write(err_text + "\n")
 
-def _clear_bucket_outputs(vdglib_dir, size_subset, aa_label):
-    """Remove any previous run's npz and .FAILED marker for one bucket.
+# ---- bucket output ----------------------------------------------------------
 
-    Called at bucket entry so the outputs on disk always describe the current
-    invocation: a stale npz would be counted by _subset_output_counts even when
-    this run's bucket failed, and a stale .FAILED would condemn a library this
-    run rebuilt successfully."""
-    size_dir = os.path.join(vdglib_dir, "nr_vdgs", str(size_subset))
-    for name in (f"{aa_label}.npz", f"{aa_label}.FAILED"):
-        try:
-            os.remove(os.path.join(size_dir, name))
-        except FileNotFoundError:
-            pass
+# One Stage-2 subgroup: its Stage-1 cluster rank, its number within that
+# cluster, the row stored as the nr vdG, every member row (nr included), and
+# the exact pose radius about the nr row.
+Subgroup = namedtuple("Subgroup", "stage1_id stage2_id nr_idx member_idxs radius")
 
-def _extract_member_identity(all_pdbpaths, all_scrr, all_cg_names,
-    all_cg_seg, all_cg_chain, all_cg_resnum, all_cg_resname, all_quality, idx):
-    return {
-        "pdbpath": all_pdbpaths[idx],
-        "scrr": all_scrr[idx],
-        "cg_names": list(all_cg_names[idx]),
-        "cg_seg": all_cg_seg[idx], "cg_chain": all_cg_chain[idx],
-        "cg_resnum": all_cg_resnum[idx], "cg_resname": all_cg_resname[idx],
-        "quality": all_quality[idx],}
-
-def _renumber_clusters_by_size(clusters):
-    """Sort a bucket's clusters largest-first and renumber cluster_id 1..N.
-    Mutates and returns ``clusters``; _write_bucket_npz writes nr vdGs in list
-    order and stamps mem_cluster_id from the same dicts, so reordering here
-    keeps the nr rows and the member records consistent.
-    """
-    clusters.sort(key=lambda clus: -clus["cluster_size"])
-    for new_id, clus in enumerate(clusters, start=1):
-        clus["cluster_id"] = new_id
-    return clusters
-
-
-def _biounit_of(pdbpath):
-    """Biounit stem of a `rec["pdbpath"]`, i.e. the `<biounit>` in
-    `pdb_dir/<biounit[1:3].lower()>/<biounit>.pdb`. Unlike `_pdb_id_from_path`
-    this keeps any `_<n>` assembly suffix, because it must round-trip back to a
-    filename."""
-    return os.path.splitext(os.path.basename(pdbpath))[0]
-
-
-def _parent_dir_of(pdbpath):
-    """The `pdb_dir` a `rec["pdbpath"]` was built from (strip `<mid2>/<file>`)."""
-    return os.path.dirname(os.path.dirname(pdbpath))
-
-
-# Order of the per-record quality tuple carried on every vdG record. Written for
-# both the nr_ and mem_ row sets, so it lives here rather than being spelled out
-# at each of the four sites that allocate or fill it.
 _QUALITY_FIELDS = ("cg_max_b", "cg_min_occ", "vdm_max_b", "vdm_min_occ")
 
 
-def _quality_arrays(prefix, n):
-    return {f"{prefix}_{key}": np.empty(n, dtype=np.float32)
-            for key in _QUALITY_FIELDS}
+def _write_bucket_npz(vdglib_dir, size_subset, reordered_AAs, cols, subgroups,
+                      parent_pdb_dir):
+    """Write one AA bucket: nr_ rows gathered from `cols` by each subgroup's nr
+    index, mem_ rows for every other member, largest subgroup first."""
+    if not subgroups:
+        return
+    subgroups = sorted(subgroups,
+                       key=lambda g: (-len(g.member_idxs), g.stage1_id, g.stage2_id))
+    C = len(subgroups)
+    n_cg = cols["cg_names"].shape[1]
+    num_vdms = cols["scrr_seg"].shape[1]
+    nr = np.asarray([g.nr_idx for g in subgroups], dtype=np.intp)
+    sizes = np.asarray([len(g.member_idxs) for g in subgroups], dtype=np.int32)
+    mem = np.concatenate([g.member_idxs[g.member_idxs != g.nr_idx] for g in subgroups]
+                         + [np.empty(0, dtype=np.int32)]).astype(np.intp)
+    if mem.size != int(sizes.sum()) - C:
+        raise ValueError(f"mem_ row count {mem.size} != summed cluster_size minus "
+                         f"one per cluster ({int(sizes.sum()) - C}); cluster "
+                         "membership was lost.")
+    # Distinct PDB *entries*, not biounit stems: `1abc_1` and `1abc_2` are two
+    # assemblies of one deposition, so counting stems would readmit exactly the
+    # NCS/homolog inflation this field exists to strip out of cluster_size.
+    entries = np.asarray([parent_db.entry_of(b) for b in cols["biounit"]])
+    num_parents = np.asarray([np.unique(entries[g.member_idxs]).size
+                              for g in subgroups], dtype=np.int32)
+    cgvdmbb = np.asarray(cols["cgvdmbb"][nr], dtype=np.float32)
 
-
-def _store_quality(arrays, prefix, row, quality):
-    """Fill one row's quality columns. strict=True because the arrays are
-    np.empty: a short tuple would otherwise leave uninitialized floats in the
-    library with nothing to signal it."""
-    for key, value in zip(_QUALITY_FIELDS, quality, strict=True):
-        arrays[f"{prefix}_{key}"][row] = value
-
-
-def _write_bucket_npz(vdglib_dir, size_subset, reordered_AAs, clusters):
-    if not clusters: return
-    C = len(clusters)
-    nr0 = clusters[0]["nr"]
-    n_cg, num_vdms = nr0["cg_coords"].shape[0], nr0["vdm_bb_coords"].shape[0]
-    parent_pdb_dir = _parent_dir_of(nr0["pdbpath"])
+    # Resolved position by position across the bucket's nr rows: a blank PDB
+    # element column is common, and streaming already admits records whose
+    # blanks it could not check. Only positions where two rows are non-blank can
+    # disagree, and a disagreement means the automorphism group does not
+    # preserve elements, so the library's atom correspondence is suspect.
+    elements = np.char.capitalize(np.char.strip(cols["cg_elements"][nr]))
+    resolved = np.array([""] * n_cg, dtype="U2")
+    for k in range(n_cg):
+        seen = {e for e in elements[:, k] if e}
+        if len(seen) > 1:
+            raise ValueError(
+                f"CG element sequence differs between nr vdGs in bucket "
+                f"{'_'.join(reordered_AAs)} at atom {k}: {sorted(seen)}. "
+                "CG automorphisms must preserve element.")
+        if seen:
+            resolved[k] = seen.pop()
 
     arrays = {
         # Bucket-level (not per nr vdG): the label of each residue slot. U4 fits
-        # every label -- the 20 resnames, 'bb', and 'X'. A longer label would
-        # silently truncate here, so widen this alongside adding one.
+        # every label -- the 20 resnames, 'bb', and 'X'.
         "aa_bucket_parts": np.asarray(list(reordered_AAs), dtype="U4"),
-        "cluster_id": np.empty(C, dtype=np.int32),
-        "cluster_size": np.empty(C, dtype=np.int32),
+        "cluster_id": np.arange(1, C + 1, dtype=np.int32),
+        "cluster_size": sizes,
         # Exact pose radius: the greatest symmetry-aware RMSD from any member to
         # the stored nr vdG. Sphere exclusion bounds this by the Stage-1 cutoff
         # for a whole Stage-1 cluster, but Stage 2 splits those and re-picks a
-        # row, so the stored value is measured, not assumed. It is what a
-        # consumer needs to reason about recall: a query within `tau` of some
-        # discarded member is within `tau + radius` of the nr vdG that replaced it.
-        "cluster_pose_radius": np.empty(C, dtype=np.float32),
+        # row, so the stored value is measured, not assumed. A query within
+        # `tau` of some discarded member is within `tau + radius` of the nr vdG.
+        "cluster_pose_radius": np.asarray([g.radius for g in subgroups], dtype=np.float32),
         # Distinct parent structures behind the cluster, counting the nr vdG.
         # `cluster_size` counts observations, which NCS copies and homologous
         # entries inflate; this is the support figure to do statistics on.
-        "cluster_num_parents": np.empty(C, dtype=np.int32),
-        "first_stage_cluster_id": np.empty(C, dtype=np.int32),
-        "second_stage_cluster_id": np.empty(C, dtype=np.int32),
-        "nr_cg_coords": np.empty((C, n_cg, 3), dtype=np.float32),
-        "nr_vdm_bb_coords": np.empty((C, num_vdms, 3, 3), dtype=np.float32),
-        # Parent structures are stored as the biounit stem ("1f8s", or "1f8s_1"
-        # when the database carries assembly suffixes), not the absolute path:
-        # the path is identical for every record in a library, so storing it in
-        # full made two arrays ~80% of the bytes np.load pulls into memory.
-        # `parent_pdb_dir` below records the directory once per file so a bucket
-        # stays self-describing; readers rebuild the path with
-        # vdg_npz_utils.resolve_parent_pdb_path, which takes an override so a
-        # relocated PDB database (e.g. a collaborator's copy) still resolves.
+        "cluster_num_parents": num_parents,
+        "first_stage_cluster_id": np.asarray([g.stage1_id for g in subgroups], dtype=np.int32),
+        "second_stage_cluster_id": np.asarray([g.stage2_id for g in subgroups], dtype=np.int32),
+        "nr_cg_coords": cgvdmbb[:, :n_cg],
+        "nr_vdm_bb_coords": cgvdmbb[:, n_cg:].reshape(C, num_vdms, 3, 3),
+        # Backbone carbonyl O per vdM slot, same frame as nr_vdm_bb_coords (the
+        # environment frame, not the parent's), NaN where the residue has no O. Stored for contact statistics
+        # (tools/h_class_diagnostic.py --contact-atoms N,CA,C,O); it is not a
+        # Stage-1 atom and must never be appended to the RMSD input.
+        "nr_vdm_o_coords": np.asarray(cols["vdm_o"][nr], dtype=np.float32),
+        # Parents are stored as the biounit stem plus the database directory once
+        # per file; readers rebuild the path with vdg_npz_utils.resolve_parent_pdb_path,
+        # which takes an override so a relocated database still resolves.
         "parent_pdb_dir": np.asarray(str(parent_pdb_dir or ""), dtype="U512"),
-        "nr_parent_biounit": np.empty(C, dtype="U16"),
-        "nr_scrr_seg": np.empty((C, num_vdms), dtype="U8"),
-        "nr_scrr_chain": np.empty((C, num_vdms), dtype="U2"),
-        "nr_scrr_resnum": np.empty((C, num_vdms), dtype=np.int32),
-        "nr_scrr_resname": np.empty((C, num_vdms), dtype="U4"),
+        "nr_parent_biounit": cols["biounit"][nr],
+        "nr_scrr_seg": cols["scrr_seg"][nr],
+        "nr_scrr_chain": cols["scrr_chain"][nr],
+        "nr_scrr_resnum": cols["scrr_resnum"][nr],
+        "nr_scrr_resname": cols["scrr_resname"][nr],
         # Atom names are per CG atom: two records can be the same chemical group
-        # in differently-named ligands. The CG's *residue* is a single value per
-        # record (get_cg_atoms enforces one residue per CG), and its *elements*
-        # are one value per bucket because every record retains the fragment's
-        # SMARTS-slot order.
-        # Both were previously stored per atom per record and were pure padding.
-        "nr_cg_names": np.empty((C, n_cg), dtype="U4"),
-        "cg_elements": np.empty(n_cg, dtype="U2"),
-        "nr_cg_seg": np.empty(C, dtype="U8"),
-        "nr_cg_chain": np.empty(C, dtype="U2"),
-        "nr_cg_resnum": np.empty(C, dtype=np.int32),
-        "nr_cg_resname": np.empty(C, dtype="U4"),
-        # Per-vdM-slot provenance (SLOT_* in vdg_struct_utils): which moiety of
-        # the canonical residue is nearest the CG, plus a bit for whether the
-        # residue carries non-canonical atoms. Disjoint from the bucket label by
-        # construction, so nothing here restates the file name; read it together
-        # with nr_scrr_resname (SLOT_NO_SC is chemistry on a glycine and
-        # missing density anywhere else).
-        # CAVEAT: this is the medoid's flag only, not every member's. Clustering
-        # never consults it and flank-sequence similarity tolerates mismatches,
-        # so a cluster can mix e.g. SLOT_NO_SC and SLOT_BB_CLOSER members;
-        # weighting this code by cluster_size is invalid.
-        "nr_slot_flag": np.empty((C, num_vdms), dtype=np.int8),
-        # Measured on the atoms that enter the vdG -- CG atoms, and the
-        # contacting residues' heavy atoms -- not on each residue's first atom.
-        # Stored rather than only filtered on so a stricter cut is a read-path
-        # decision instead of a reason to re-mine the PDB.
-        **_quality_arrays("nr", C),}
+        # in differently-named ligands. The CG's residue is one value per record
+        # and its elements one row per bucket, since every record keeps the
+        # fragment's SMARTS-slot order.
+        "nr_cg_names": cols["cg_names"][nr],
+        "cg_elements": resolved,
+        "nr_cg_seg": cols["cg_seg"][nr],
+        "nr_cg_chain": cols["cg_chain"][nr],
+        "nr_cg_resnum": cols["cg_resnum"][nr],
+        "nr_cg_resname": cols["cg_resname"][nr],
+        # Per-vdM-slot provenance (SLOT_* in vdg_struct_utils) of the nr row
+        # only: clustering never consults it and flank-sequence similarity
+        # tolerates mismatches, so a cluster can mix e.g. SLOT_NO_SC and
+        # SLOT_BB_CLOSER members; weighting this code by cluster_size is invalid.
+        "nr_slot_flag": cols["slot_flags"][nr],
+        # A "mem_" row is a clustered observation that is *not* the nr vdG, whose
+        # identity lives in the nr_ arrays; each vdG is stored exactly once.
+        # `cluster_size` counts the nr row, so a reader treating these as "the
+        # members" would be off by one per cluster.
+        "mem_cluster_id": np.repeat(np.arange(1, C + 1, dtype=np.int32), sizes - 1),
+        "mem_parent_biounit": cols["biounit"][mem],
+        "mem_scrr_seg": cols["scrr_seg"][mem],
+        "mem_scrr_chain": cols["scrr_chain"][mem],
+        "mem_scrr_resnum": cols["scrr_resnum"][mem],
+        "mem_scrr_resname": cols["scrr_resname"][mem],
+        "mem_cg_names": cols["cg_names"][mem],
+        "mem_cg_seg": cols["cg_seg"][mem],
+        "mem_cg_chain": cols["cg_chain"][mem],
+        "mem_cg_resnum": cols["cg_resnum"][mem],
+        "mem_cg_resname": cols["cg_resname"][mem],
+    }
+    # Measured on the atoms that enter the vdG -- CG atoms and the contacting
+    # residues' heavy atoms. Stored so a stricter cut is a read-path decision.
+    for k, key in enumerate(_QUALITY_FIELDS):
+        arrays[f"nr_{key}"] = cols["quality"][nr, k]
+        arrays[f"mem_{key}"] = cols["quality"][mem, k]
 
-    # A "member" here is a clustered observation that is *not* the nr vdG; the nr
-    # vdG's own identity lives in the nr_ arrays.
-    #
-    # `mem_`, not `member_`: these rows are every member of the cluster
-    # EXCEPT the nr vdG itself, whose identity lives in the nr_ arrays. Each vdG is
-    # therefore stored exactly once. The name is deliberately not `member_` --
-    # `cluster_size` counts the medoid, so a reader treating these as "the
-    # members" would be off by one per cluster with nothing to signal it.
-    M = sum(len(clus["members"]) for clus in clusters)
-    expected_M = sum(clus["cluster_size"] for clus in clusters) - C
-    if M != expected_M:
-        raise ValueError(f"mem_ row count {M} != summed cluster_size "
-            f"minus one per cluster ({expected_M}); cluster membership was lost.")
-    member_arrays = {
-        "mem_cluster_id": np.empty(M, dtype=np.int32),
-        "mem_parent_biounit": np.empty(M, dtype="U16"),
-        "mem_scrr_seg": np.empty((M, num_vdms), dtype="U8"),
-        "mem_scrr_chain": np.empty((M, num_vdms), dtype="U2"),
-        "mem_scrr_resnum": np.empty((M, num_vdms), dtype=np.int32),
-        "mem_scrr_resname": np.empty((M, num_vdms), dtype="U4"),
-        "mem_cg_names": np.empty((M, n_cg), dtype="U4"),
-        "mem_cg_seg": np.empty(M, dtype="U8"),
-        "mem_cg_chain": np.empty(M, dtype="U2"),
-        "mem_cg_resnum": np.empty(M, dtype=np.int32),
-        "mem_cg_resname": np.empty(M, dtype="U4"),
-        **_quality_arrays("mem", M),}
-    m = 0
-    for clus in clusters:
-        for mem in clus["members"]:
-            member_arrays["mem_cluster_id"][m] = clus["cluster_id"]
-            member_arrays["mem_parent_biounit"][m] = _biounit_of(mem["pdbpath"])
-            for key in ["cg_names", "cg_seg", "cg_chain", "cg_resnum", "cg_resname"]:
-                member_arrays[f"mem_{key}"][m] = np.asarray(
-                    mem[key], dtype=member_arrays[f"mem_{key}"].dtype)
-            segs, chains, resnums, resnames = zip(
-                *[(str(s), str(c), int(r), str(n)) for s, c, r, n in mem["scrr"]])
-            member_arrays["mem_scrr_seg"][m] = np.array(segs, dtype="U8")
-            member_arrays["mem_scrr_chain"][m] = np.array(chains, dtype="U2")
-            member_arrays["mem_scrr_resnum"][m] = np.array(resnums, dtype=np.int32)
-            member_arrays["mem_scrr_resname"][m] = np.array(resnames, dtype="U4")
-            _store_quality(member_arrays, "mem", m, mem["quality"])
-            m += 1
-    arrays.update(member_arrays)
-
-    # Resolved position by position across the bucket's nr rows, not taken from
-    # row 0: a blank PDB element column is common, and the streaming gate
-    # (_stream_worker) already admits records whose blanks it could not check.
-    # Comparing row 0 verbatim would then reject a later row that merely fills a
-    # blank row 0 left empty. Normalized the same way the gate normalizes, so the
-    # stored row is comparable to RDKit symbols.
-    resolved_elements = [""] * n_cg
-    for i, clus in enumerate(clusters):
-        nr = clus["nr"]
-        arrays["cluster_id"][i] = clus["cluster_id"]
-        arrays["cluster_size"][i] = clus["cluster_size"]
-        arrays["cluster_pose_radius"][i] = clus["cluster_pose_radius"]
-        # Distinct PDB *entries*, not biounit stems: `1abc_1` and `1abc_2` are two
-        # assemblies of one deposition, so counting stems would readmit exactly
-        # the NCS/homolog inflation this field exists to strip out of
-        # cluster_size.
-        arrays["cluster_num_parents"][i] = len({_pdb_id_from_path(nr["pdbpath"])}
-            | {_pdb_id_from_path(mem["pdbpath"]) for mem in clus["members"]})
-        arrays["first_stage_cluster_id"][i] = clus["first_stage_cluster_id"]
-        arrays["second_stage_cluster_id"][i] = clus["second_stage_cluster_id"]
-        arrays["nr_cg_coords"][i] = np.asarray(nr["cg_coords"], dtype=np.float32)
-        arrays["nr_vdm_bb_coords"][i] = np.asarray(nr["vdm_bb_coords"], dtype=np.float32)
-        arrays["nr_parent_biounit"][i] = _biounit_of(nr["pdbpath"])
-        _store_quality(arrays, "nr", i, nr["quality"])
-        for key in ["cg_names", "cg_seg", "cg_chain", "cg_resnum", "cg_resname"]:
-            arrays[f"nr_{key}"][i] = np.asarray(nr[key], dtype=arrays[f"nr_{key}"].dtype)
-        # One elements row per bucket: assert rather than assume, since a
-        # disagreement would mean the automorphism group does not preserve
-        # elements and the whole library's atom correspondence is suspect.
-        # Only positions where both rows are non-blank can disagree -- a blank is
-        # an absent annotation, not the claim "no element here".
-        elements = [str(e).strip().capitalize() for e in nr["cg_elements"]]
-        conflict = [(k, resolved_elements[k], e) for k, e in enumerate(elements)
-                    if e and resolved_elements[k] and resolved_elements[k] != e]
-        if conflict:
-            raise ValueError(
-                f"CG element sequence differs between nr vdGs in bucket "
-                f"{'_'.join(reordered_AAs)}: {conflict}. "
-                f"CG automorphisms must preserve element.")
-        for k, e in enumerate(elements):
-            if e and not resolved_elements[k]:
-                resolved_elements[k] = e
-        arrays["nr_slot_flag"][i] = np.asarray(nr["slot_flags"], dtype=np.int8)
-        segs, chains, resnums, resnames = zip(*[(str(s), str(c), int(r), str(n)) for s, c, r, n in nr["scrr"]])
-        arrays["nr_scrr_seg"][i] = np.array(segs, dtype="U8")
-        arrays["nr_scrr_chain"][i] = np.array(chains, dtype="U2")
-        arrays["nr_scrr_resnum"][i] = np.array(resnums, dtype=np.int32)
-        arrays["nr_scrr_resname"][i] = np.array(resnames, dtype="U4")
-
-    arrays["cg_elements"][:] = np.asarray(resolved_elements, dtype="U2")
-
-    # Fixed-width assignment truncates silently in numpy. A clipped biounit stem
-    # or database path makes resolve_parent_pdb_path fail for every row in the
-    # bucket, and nothing downstream can tell a clipped value from a real one.
-    for _name in ("nr_parent_biounit", "mem_parent_biounit"):
-        _arr = arrays.get(_name)
-        if _arr is None or _arr.size == 0:
-            continue
-        _width = _arr.dtype.itemsize // 4
-        _clipped = [v for v in np.unique(_arr) if len(v) >= _width]
-        if _clipped:
-            raise ValueError(
-                f"{_name} values reach the {_width}-char dtype width and may be "
-                f"truncated (e.g. {_clipped[:3]}); widen the dtype.")
     if len(str(parent_pdb_dir or "")) >= arrays["parent_pdb_dir"].dtype.itemsize // 4:
         raise ValueError(
             f"parent_pdb_dir {parent_pdb_dir!r} reaches the dtype width and may be "
@@ -655,14 +448,12 @@ def _write_bucket_npz(vdglib_dir, size_subset, reordered_AAs, clusters):
 
     # Written via tmp + os.replace, never straight onto the final name: an SGE
     # kill or a quota hit part-way through savez_compressed would otherwise leave
-    # a truncated npz that both readers treat as a warning and skip. 
+    # a truncated npz that both readers treat as a warning and skip. The temp
+    # name deliberately does not end in '.npz': a SIGKILL is uncatchable, and a
+    # leftover *.npz in the bucket dir is loaded as a real bucket by every reader
+    # that walks for '*.npz'. Written through a file handle because
+    # np.savez_compressed appends '.npz' to a *path* that lacks it.
     path = _bucket_npz_path(vdglib_dir, size_subset, reordered_AAs)
-    # Deliberately does NOT end in '.npz': a SIGKILL is uncatchable, so the
-    # except below cannot run, and a leftover *.npz in the bucket dir is loaded
-    # as a real bucket by every reader that walks for '*.npz' -- with an AA label
-    # parsed out of the temp name. Written through a file handle because
-    # np.savez_compressed appends '.npz' to a *path* that lacks it, but leaves a
-    # file object's name alone.
     tmp = f"{path}.{os.getpid()}.tmp"
     try:
         with open(tmp, 'wb') as handle:
@@ -694,196 +485,235 @@ def _abort_profile(profile, profile_json, prefix, reason):
     profile.write(profile_json)
 
 
-def _run_one_bucket_strict(args):
-    """
-    Run clustering for each AA-composition bucket in a separate process.
-    """
-    (bucket_path, seq_sim_thresh, reordered_AAs, cg_automorphisms, vdglib_dir,
-     logfile, size_subset, max_num_to_clus) = args
 
-    try:
-        # A stale npz and a stale .FAILED from an earlier invocation are both
-        # cleared before this bucket does anything else: otherwise a bucket that
-        # fails now leaves the previous run's npz beside its new .FAILED (and
-        # _subset_output_counts counts it), and a bucket that succeeds now
-        # leaves the previous run's .FAILED marking a library that is fine.
-        _clear_bucket_outputs(vdglib_dir, size_subset, "_".join(reordered_AAs))
-        _vdgs = _load_bucket(bucket_path)
-        cg_automorphisms = validate_atom_permutations(cg_automorphisms)
-        expected_n_cg = len(cg_automorphisms[0])
-        # Dropped records are counted and sampled in the log: a systematic
-        # failure (bad --cg-smarts, a truncated stage-1 stage) otherwise shows
-        # up only as an empty bucket with nothing explaining it.
-        _kept, _dropped_paths = [], []
-        for vdg_data in _vdgs:
-            if _has_complete_stage1_coords(
-                    vdg_data, expected_n_cg, expected_num_vdms=size_subset):
-                _kept.append(vdg_data)
-            elif len(_dropped_paths) < 5:
-                try:
-                    _dropped_paths.append(str(vdg_data[4]))
-                except (IndexError, TypeError):
-                    _dropped_paths.append("<unreadable record>")
-        _n_dropped = len(_vdgs) - len(_kept)
-        if _n_dropped:
-            _log_write(logfile,
-                f"\t[WARNING] AA bucket {'_'.join(reordered_AAs)}: dropped "
-                f"{_n_dropped}/{len(_vdgs)} vdGs with missing or non-finite "
-                f"Stage-1 coords (e.g. {_dropped_paths}).\n")
-        _vdgs = _kept
+# ---- clustering tasks -------------------------------------------------------
 
-        if not _vdgs:
-            return ("_".join(reordered_AAs), 0, {})
+# Static per-bucket facts every task needs: `key` is (size_subset, aa_label),
+# `aa_parts` the slot labels, `n` the record count, `bucket_dir` the merged
+# columns on scratch.
+Bucket = namedtuple("Bucket", "key size_subset aa_parts n bucket_dir")
+# Static per-run facts.
+Run = namedtuple("Run", "cg_automorphisms seq_sim_thresh vdglib_dir logfile parent_pdb_dir")
 
-        # Cap on distinct PDB IDs (single PDB can still contribute multiple vdGs)
-        if max_num_to_clus is not None and len(_vdgs) > max_num_to_clus:
-            orig_num = len(_vdgs)
-            vdg_pdb_ids = [_pdb_id_from_path(z[4]) for z in _vdgs]
-            selected_ids = set(select_diverse_pdbIDs(vdg_pdb_ids, max_num_to_clus))
-            _vdgs = [z for z, pid in zip(_vdgs, vdg_pdb_ids) if pid in selected_ids]
-            if orig_num != len(_vdgs):
-                _log_write(logfile, f"\t{orig_num} vdGs → {len(_vdgs)} vdGs from {len(selected_ids)} diverse PDB IDs for {tuple(reordered_AAs)}.\n")
 
-        reordered_AAs_str = "_".join(reordered_AAs)
-        (all_cg_coords, all_vdmbb_coords, all_flankseqs, all_flankCAs, all_pdbpaths,
-         all_scrr, all_cg_names, all_cg_elements,
-         all_cg_seg, all_cg_chain, all_cg_resnum, all_cg_resname,
-         all_slot_flags, all_quality
-         ) = unpack_vdg_records(_vdgs)
-        if not all_cg_coords:
-            _log_write(logfile, f"[WARNING] AA bucket {reordered_AAs_str} has no CG environments; skipping.\n")
-            return (reordered_AAs_str, 0, {})
-        all_cgvdmbb_coords = combine_cg_and_vdmbb_coords(all_cg_coords, all_vdmbb_coords)
-        all_flat_flankseqs = flatten_flanking_seqs(all_flankseqs)
-        all_flat_flankCAs = flatten_flanking_CAs(all_flankCAs)
+def _bucket_geometry(run, bucket, cols):
+    n_cg = cols["cg_names"].shape[1]
+    n_total = cols["cgvdmbb"].shape[1]
+    cutoff = normalize_rmsd(n_total, "cgvdmbb")
+    # The vdG's full symmetry group: CG automorphisms crossed with orderings
+    # of interchangeable same-label vdM slots. Both are minimised over inside
+    # the Stage-1 distance, so one record is one physical environment.
+    perm_group = build_perm_group(run.cg_automorphisms, n_cg, bucket.aa_parts)
+    return n_cg, cutoff, perm_group
 
-        n_cg_atoms = len(all_cg_coords[0])
-        num_cgvdmbb_atoms = n_cg_atoms + len(all_vdmbb_coords[0]) * 3
-        cgvdmbb_rmsd_cut = normalize_rmsd(num_cgvdmbb_atoms, "cgvdmbb")
-        # The vdG's full symmetry group: CG automorphisms crossed with orderings
-        # of interchangeable same-label vdM slots. Both are minimised over inside
-        # the Stage-1 distance, so one record is one physical environment.
-        perm_group = build_perm_group(cg_automorphisms, n_cg_atoms, reordered_AAs)
-        bucket_stats = {"records": len(all_cgvdmbb_coords),
-                        "perm_group": len(perm_group)}
-        _stage1_t0 = time.time()
-        stage1_clusters, _stage1_reps, _stage1_radii = clust.get_butina_clusters(
-            all_cgvdmbb_coords, cgvdmbb_rmsd_cut, n_cg_atoms,
-            cg_symm_perms=cg_automorphisms, aa_bucket_parts=reordered_AAs,
-            counters=bucket_stats)
-        bucket_stats["stage1_wall_s"] = time.time() - _stage1_t0
-        bucket_stats["stage1_clusters"] = len(stage1_clusters)
-        # Rank Stage-1 clusters by size so cluster 1 is the most populated one.
-        reassigned_cgvdmbb_clus = {
-            new_num: members for new_num, (_old, members) in enumerate(
-                sorted(stage1_clusters.items(),
-                       key=lambda kv: (-len(kv[1]), kv[0])), start=1)}
+
+def _rank_clusters(clusters):
+    """Largest first, ties by formation order, so cluster 1 is the most populated."""
+    return sorted(clusters, key=lambda members: -len(members))
+
+
+def _row_blocks(n, n_blocks):
+    """Row ranges over `range(n - 1)` with equal shares of the candidate-pair
+    triangle (row i has n - 1 - i candidates)."""
+    cum = np.cumsum(np.arange(n - 1, 0, -1), dtype=np.int64)
+    targets = cum[-1] * np.arange(1, n_blocks) / n_blocks
+    cuts = np.searchsorted(cum, targets) + 1
+    bounds = np.unique(np.concatenate([[0], cuts, [n - 1]]))
+    return [(int(a), int(b)) for a, b in zip(bounds[:-1], bounds[1:])]
+
+
+def _stage2_blocks(sizes, n_blocks):
+    """Stage-1 cluster ids (1-based ranks) grouped into blocks of similar Stage-2
+    cost, which is ~quadratic in cluster size; singletons cost nothing and share
+    one block."""
+    sizes = np.asarray(sizes)
+    ids = np.flatnonzero(sizes > 1) + 1
+    order = ids[np.argsort(-sizes[ids - 1], kind="stable")]
+    blocks = [[] for _ in range(max(1, min(n_blocks, order.size)))]
+    load = [0] * len(blocks)
+    for cid in order.tolist():
+        k = int(np.argmin(load))
+        blocks[k].append(cid)
+        load[k] += int(sizes[cid - 1]) ** 2
+    singletons = (np.flatnonzero(sizes == 1) + 1).tolist()
+    if singletons:
+        blocks.append(singletons)
+    return [b for b in blocks if b]
+
+
+def _stage2_for_clusters(run, bucket, cols, clusters, cluster_ids, perm_group, n_cg):
+    """Partition each listed Stage-1 cluster by flanking context and pick each
+    subgroup's pose prototype. Returns (subgroups, stats)."""
+    data = np.asarray(cols["cgvdmbb"], dtype=np.float32)
+    flank_seq, flank_ca = cols["flank_seq"], cols["flank_ca"]
+    orders = slot_orders(bucket.aa_parts)
+    n_flank = flank_ca.shape[1]
+    # get_leader_clusters mixes RMSD and sequence dissimilarity as
+    # seq_dissim * seq_weight + RMSD with seq_weight=0.5, so the threshold lives
+    # on that combined scale: the flank RMSD cutoff plus half the allowed
+    # sequence-dissimilarity budget. Missing flanks must not tighten the
+    # geometric criterion: the cutoff is based on the expected flattened size,
+    # while pair RMSDs use only coordinate rows finite in both structures.
+    thresh = normalize_rmsd(n_flank, "flankbb") + (1.0 - run.seq_sim_thresh) / 2.0
+    subgroups = []
+    stats = {"stage2_wall_s": 0.0, "stage2_same_label_wall_s": 0.0,
+             "stage2_slot_orders": len(orders),
+             "stage2_largest_cluster": 0, "stage2_largest_cluster_s": 0.0}
+    t_all = time.time()
+    for cid in cluster_ids:
+        members = np.asarray(clusters[cid - 1], dtype=np.int32)
+        if members.size == 1:
+            subgroups.append(Subgroup(cid, 1, int(members[0]), members, 0.0))
+            continue
+        t0 = time.time()
+        # Same-label slot orderings, the ones Stage 1 already quotients out via
+        # build_perm_group. Without them Stage 2 compares slot 1's flank to slot
+        # 1's flank positionally and splits a swapped pair into two subgroups,
+        # halving the cluster_size/cluster_num_parents of one real mode.
+        assigns = clust.get_leader_clusters(
+            zip([flank_seq[members].tolist(), list(flank_ca[members])],
+                ["flankseq", "flankbb"]),
+            thresh, missing_seq_similarity=run.seq_sim_thresh,
+            final_exact_medoid_pass=True, final_reassign_once=True,
+            slot_orders=orders)
         clust.clear_caches()
-
-        # Stage 2 is timed separately from Stage 1 because the two scale on
-        # different things and only Stage 1 was instrumented: the profile could
-        # show Stage 1's cost but left the rest of clustering as an unattributed
-        # residual, so there was no way to tell what share Stage 2 held. That
-        # matters now that Stage 2 minimises over same-label slot orderings,
-        # which costs ~2.5x on the same-label buckets (~9% of size-2 buckets).
-        clusters_out, cluster_counter = [], 0
-        _stage2_t0 = time.time()
-        _stage2_same_label_s = 0.0
-        _n_slot_orders = len(slot_orders(reordered_AAs))
-        for cgvdmbb_clusnum, stage1_idxs in reassigned_cgvdmbb_clus.items():
-            stage1_idxs = list(stage1_idxs)
-            if not stage1_idxs: continue
-            if len(stage1_idxs) == 1:
-                cluster_counter += 1
-                clusters_out.append({
-                    "cluster_id": cluster_counter, "cluster_size": 1,
-                    "cluster_pose_radius": 0.0,
-                    "first_stage_cluster_id": int(cgvdmbb_clusnum), "second_stage_cluster_id": 1,
-                    "nr": _extract_env(all_cg_coords, all_vdmbb_coords,
-                        all_pdbpaths, all_scrr, all_cg_names, all_cg_elements, all_cg_seg, all_cg_chain,
-                        all_cg_resnum, all_cg_resname, all_slot_flags, all_quality, stage1_idxs[0]),
-                    "members": _extract_members(all_pdbpaths, all_scrr, all_cg_names,
-                        all_cg_seg, all_cg_chain, all_cg_resnum, all_cg_resname,
-                        all_quality, stage1_idxs, stage1_idxs[0])})
+        n_before = len(subgroups)
+        for sub_num, local in assigns.items():
+            if not local:
                 continue
-            clus_flat_seqs = [all_flat_flankseqs[i] for i in stage1_idxs]
-            clus_flat_cas = [all_flat_flankCAs[i] for i in stage1_idxs]
-            # Missing flanks must not tighten the geometric criterion: the cutoff
-            # is based on the expected flattened size, while pair RMSDs use only
-            # coordinate rows that are finite in both structures.
-            expected_flank_atoms = len(clus_flat_cas[0])
-            flankbb_cut = normalize_rmsd(expected_flank_atoms, "flankbb")
-            # get_leader_clusters below mixes RMSD and sequence dissimilarity as
-            # seq_dissim * seq_weight + RMSD, with seq_weight=0.5 by default, so
-            # the threshold must live on that same combined scale: the flank RMSD
-            # cutoff plus half the allowed sequence-dissimilarity budget.
-            thresh = flankbb_cut + (1.0 - seq_sim_thresh) / 2.0
-            # Same-label slot orderings, the ones Stage 1 already quotients out
-            # via build_perm_group. Without them Stage 2 compares slot 1's flank
-            # to slot 1's flank positionally and splits a swapped pair into two
-            # subgroups, halving the cluster_size/cluster_num_parents of one real
-            # mode. Mixed-label buckets yield only the identity and cost nothing.
-            _t0 = time.time()
-            stage2_assigns = clust.get_leader_clusters(
-                zip([clus_flat_seqs, clus_flat_cas], ["flankseq", "flankbb"]), thresh,
-                missing_seq_similarity=seq_sim_thresh,
-                final_exact_medoid_pass=True, final_reassign_once=True,
-                slot_orders=slot_orders(reordered_AAs))
-            if _n_slot_orders > 1:
-                # Attributed separately so the cost of the permutation minimisation
-                # is readable on its own, not buried in the Stage-2 total.
-                _stage2_same_label_s += time.time() - _t0
-            stage2_before = len(clusters_out)
-            for sub_num, local_idxs in stage2_assigns.items():
-                if not local_idxs: continue
-                cluster_counter += 1
-                global_member_idxs = [stage1_idxs[i] for i in local_idxs]
-                # Stage 2 partitions on flanking context, so its own medoid is
-                # chosen on the wrong metric: the stored row has to be central in
-                # *pose*, or the radius recorded next to it means nothing.
-                global_cent_idx, subgroup_radius = clust.pose_minimax_prototype(
-                    all_cgvdmbb_coords, global_member_idxs, n_cg_atoms, perm_group)
-                clusters_out.append({
-                    "cluster_id": cluster_counter, "cluster_size": len(local_idxs),
-                    "cluster_pose_radius": subgroup_radius,
-                    "first_stage_cluster_id": int(cgvdmbb_clusnum), "second_stage_cluster_id": int(sub_num),
-                    "nr": _extract_env(all_cg_coords, all_vdmbb_coords,
-                        all_pdbpaths, all_scrr, all_cg_names, all_cg_elements, all_cg_seg, all_cg_chain,
-                        all_cg_resnum, all_cg_resname, all_slot_flags, all_quality, global_cent_idx),
-                    "members": _extract_members(all_pdbpaths, all_scrr, all_cg_names,
-                        all_cg_seg, all_cg_chain, all_cg_resnum, all_cg_resname,
-                        all_quality, global_member_idxs, global_cent_idx)})
-            if len(clusters_out) == stage2_before:
-                _log_write(logfile, f"[WARNING] Stage 1 cluster {cgvdmbb_clusnum} in {reordered_AAs_str} lost {len(stage1_idxs)} envs in Stage 2.\n")
+            global_idxs = members[np.asarray(local, dtype=np.intp)]
+            # Stage 2 partitions on flanking context, so its own medoid is chosen
+            # on the wrong metric: the stored row has to be central in *pose*,
+            # or the radius recorded next to it means nothing.
+            centre, radius = clust.pose_minimax_prototype(
+                data, global_idxs, n_cg, perm_group)
+            subgroups.append(Subgroup(cid, int(sub_num), int(centre), global_idxs, radius))
+        if len(subgroups) == n_before:
+            _log_write(run.logfile,
+                f"[WARNING] Stage 1 cluster {cid} in {bucket.key[1]} lost "
+                f"{members.size} envs in Stage 2.\n")
+        dt = time.time() - t0
+        if len(orders) > 1:
+            stats["stage2_same_label_wall_s"] += dt
+        if members.size > stats["stage2_largest_cluster"]:
+            stats["stage2_largest_cluster"] = int(members.size)
+            stats["stage2_largest_cluster_s"] = dt
+    stats["stage2_wall_s"] = time.time() - t_all
+    return subgroups, stats
 
-        # cluster_counter above is provisional: ids are reassigned by final
-        # cluster size so that cluster 1 is always the most populated one.
-        bucket_stats["stage2_wall_s"] = time.time() - _stage2_t0
-        bucket_stats["stage2_same_label_wall_s"] = _stage2_same_label_s
-        bucket_stats["stage2_slot_orders"] = _n_slot_orders
 
-        _renumber_clusters_by_size(clusters_out)
+def _task_small(run, bucket, _payload):
+    """A whole bucket start to finish in one process."""
+    cols = load_columns(bucket.bucket_dir)
+    n_cg, cutoff, perm_group = _bucket_geometry(run, bucket, cols)
+    stats = {"records": bucket.n, "perm_group": len(perm_group)}
+    t0 = time.time()
+    clusters = _rank_clusters(clust.get_butina_clusters(
+        cols["cgvdmbb"], cutoff, n_cg, perm_group, counters=stats))
+    stats["stage1_wall_s"] = time.time() - t0
+    stats["stage1_clusters"] = len(clusters)
+    subgroups, s2 = _stage2_for_clusters(
+        run, bucket, cols, clusters, range(1, len(clusters) + 1), perm_group, n_cg)
+    stats.update(s2)
+    t0 = time.time()
+    _write_bucket_npz(run.vdglib_dir, bucket.size_subset, bucket.aa_parts, cols,
+                      subgroups, run.parent_pdb_dir)
+    stats["write_s"] = time.time() - t0
+    return sum(len(g.member_idxs) for g in subgroups), stats
 
-        # Write this AA bucket summary to npz (per-cluster nr vdGs, plus
-        # lightweight per-member identity so cluster members can be
-        # re-materialized on demand -- see _write_bucket_npz).
-        _write_bucket_npz(vdglib_dir, size_subset, reordered_AAs, clusters_out)
-        total_vdgs = sum(c["cluster_size"] for c in clusters_out)
-        return ("_".join(reordered_AAs), total_vdgs, bucket_stats)
 
-    except Exception as e:
-        # One bad bucket must not abort the pool: every nr_vdgs/*.npz already
-        # written would stay on disk and the fragment dir would look like a
-        # finished library. Drop a .FAILED marker beside the buckets, keep
-        # going, and let main() exit non-zero at the end.
-        aa_label = "_".join(reordered_AAs) if reordered_AAs else "UNKNOWN_AAs"
-        tb = traceback.format_exc()
-        err_text = (f"[WORKER ERROR] AA bucket: {aa_label} "
-                    f"(subset size {size_subset})\n"
-                    f"Exception: {e}\nTraceback:\n{tb}")
-        _log_write(logfile, err_text + "\n")
-        _write_failed_marker(vdglib_dir, size_subset, aa_label, err_text)
-        return (aa_label, None, None)
+def _edges_path(bucket, k):
+    return os.path.join(bucket.bucket_dir, f"edges_{k:04d}.npy")
+
+
+def _task_stage1_block(run, bucket, payload):
+    """Within-cutoff pairs for one block of rows, written to scratch."""
+    k, start, stop = payload
+    cols = {"cgvdmbb": np.asarray(load_stage1(bucket.bucket_dir, mmap=True)),
+            "cg_names": load_shard(os.path.join(bucket.bucket_dir, COLUMNS_FILE))["cg_names"]}
+    n_cg, cutoff, perm_group = _bucket_geometry(run, bucket, cols)
+    stats = {}
+    t0 = time.time()
+    qi, qj = stage1_edges(cols["cgvdmbb"], cutoff, n_cg, perm_group,
+                          row_range=(start, stop), counters=stats)
+    stats["stage1_wall_s"] = time.time() - t0
+    path = _edges_path(bucket, k)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "wb") as handle:
+        np.save(handle, np.stack([qi, qj]))
+    os.replace(tmp, path)
+    return stats
+
+
+def _partition_path(bucket):
+    return os.path.join(bucket.bucket_dir, "partition.npz")
+
+
+def _task_stage1_partition(run, bucket, n_blocks):
+    """Assemble the row blocks' edges into the neighbour graph and partition it.
+    The partition goes to scratch (largest cluster first); the sizes come back."""
+    t0 = time.time()
+    parts = [np.load(_edges_path(bucket, k)) for k in range(n_blocks)]
+    qi = np.concatenate([part[0] for part in parts])
+    qj = np.concatenate([part[1] for part in parts])
+    del parts
+    clusters = _rank_clusters(butina_partition(*neighbor_csr(bucket.n, qi, qj)))
+    del qi, qj
+    sizes = np.asarray([len(c) for c in clusters], dtype=np.int32)
+    indptr = np.zeros(sizes.size + 1, dtype=np.int64)
+    np.cumsum(sizes, out=indptr[1:])
+    order = np.concatenate(clusters) if clusters else np.empty(0, dtype=np.int32)
+    path = _partition_path(bucket)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "wb") as handle:
+        np.savez(handle, order=order, indptr=indptr)
+    os.replace(tmp, path)
+    for k in range(n_blocks):
+        os.remove(_edges_path(bucket, k))
+    return sizes, {"stage1_partition_s": time.time() - t0,
+                   "stage1_clusters": int(sizes.size)}
+
+
+def _load_partition(bucket):
+    with np.load(_partition_path(bucket)) as data:
+        order, indptr = data["order"], data["indptr"]
+    return [order[indptr[c]:indptr[c + 1]] for c in range(indptr.size - 1)]
+
+
+def _task_stage2_block(run, bucket, cluster_ids):
+    cols = load_columns(bucket.bucket_dir)
+    n_cg, _cutoff, perm_group = _bucket_geometry(run, bucket, cols)
+    clusters = _load_partition(bucket)
+    return _stage2_for_clusters(run, bucket, cols, clusters, cluster_ids, perm_group, n_cg)
+
+
+def _task_write(run, bucket, subgroups):
+    t0 = time.time()
+    cols = load_columns(bucket.bucket_dir)
+    _write_bucket_npz(run.vdglib_dir, bucket.size_subset, bucket.aa_parts, cols,
+                      subgroups, run.parent_pdb_dir)
+    os.remove(_partition_path(bucket))
+    return sum(len(g.member_idxs) for g in subgroups), {"write_s": time.time() - t0}
+
+
+_TASKS = {"small": _task_small, "stage1_block": _task_stage1_block,
+          "stage1_partition": _task_stage1_partition,
+          "stage2_block": _task_stage2_block, "write": _task_write}
+
+
+def _run_task(kind, run, bucket, payload):
+    """Pool entry point. One bad bucket must not abort the pool: every
+    nr_vdgs/*.npz already written would stay on disk and the fragment dir would
+    look like a finished library. Failures come back as text; the driver drops
+    a .FAILED marker, skips the bucket's remaining tasks, and exits non-zero
+    at the end."""
+    try:
+        return kind, bucket.key, _TASKS[kind](run, bucket, payload), None
+    except Exception as exc:
+        return kind, bucket.key, None, (
+            f"[WORKER ERROR] AA bucket: {bucket.key[1]} (subset size "
+            f"{bucket.size_subset}, task {kind})\nException: {exc}\n"
+            f"Traceback:\n{traceback.format_exc()}")
 
 def _parse_pdb_with_retry(pdb_file, attempts=3, delay=0.5):
     """pr.parsePDB with retries -- worker chunks are file-level while biounits are
@@ -931,8 +761,7 @@ def _get_atomgroup_for_env(
     environment, pdb_dir, cg, cg_match_dict, align_atoms, logfile,
     pdb_cache=None):
     biounit = environment[0][0]
-    middle_two = biounit[1:3].lower()
-    pdb_file = os.path.join(pdb_dir, middle_two, biounit + ".pdb")
+    pdb_file = parent_db.structure_path(pdb_dir, biounit)
 
     if pdb_cache is not None and pdb_file in pdb_cache:
         whole_struct = pdb_cache[pdb_file]
@@ -1147,9 +976,12 @@ def _get_atomgroup_for_env(
 
 _FLUSH_RECORDS_THRESHOLD = 500_000
 
-# Total parsed atoms a worker may hold in its PDB cache. ~40 M atoms is roughly
-# 1 GB of ProDy coordinate+label arrays; divided across workers in main().
-_PDB_CACHE_ATOM_BUDGET = 40_000_000
+# Total parsed atoms the streaming workers may hold in their PDB caches, divided
+# across workers in main(). A default ProDy parse costs ~160 B/atom (coordinates
+# plus the per-atom label, index and flag arrays), so this is ~1.5 GB over a
+# 20-worker run; environments are chunked by file, so a worker rarely needs
+# more than the structure it is on.
+_PDB_CACHE_ATOM_BUDGET = 10_000_000
 
 
 def _struct_atom_count(struct):
@@ -1160,11 +992,11 @@ def _struct_atom_count(struct):
         return 0
 
 
-def _flush_buckets_to_disk(bucket_records, worker_tmp_dir, flush_idx):
-    """Write bucket records to disk with flush-index suffix."""
+def _flush_buckets_to_disk(bucket_records, worker_tmp_dir, flush_idx=None):
+    """Write each bucket's buffered records as one column shard."""
     for aa_key, records in bucket_records.items():
         fname = _bucket_fname(aa_key, flush_idx=flush_idx)
-        _dump_pickle_atomic(records, os.path.join(worker_tmp_dir, fname))
+        save_shard(os.path.join(worker_tmp_dir, fname), records_to_columns(records))
 
 
 def _stream_one_chunk(args):
@@ -1192,7 +1024,8 @@ def _stream_one_chunk(args):
     # Every silent drop below is tallied so a systematic --cg-smarts/--cg-match-dict
     # mismatch shows up as a reason in the log instead of an empty library.
     skips = {"no_atomgroup": 0, "dup_occupancy": 0, "no_cg_atoms": 0,
-             "bad_cg_coords": 0, "cg_elements_mismatch": 0, "unparsable_line": 0}
+             "bad_cg_coords": 0, "cg_elements_mismatch": 0, "unparsable_line": 0,
+             "incomplete_stage1": 0}
     # Deltas, not absolutes: _WARN_COUNTS is module state and the executor reuses
     # a worker across chunks, so the totals at exit include earlier chunks' counts.
     warn_counts_at_entry = dict(_WARN_COUNTS)
@@ -1219,9 +1052,6 @@ def _stream_one_chunk(args):
 
                 pdb_label = "_".join([str(el) for el in environment[0]])
                 _biounit = environment[0][0]
-                # Format consumed by _pdb_id_from_path -- keep the two in sync.
-                _actual_pdb_path = os.path.join(
-                    pdb_dir, _biounit[1:3].lower(), _biounit + ".pdb")
 
                 atomgroup = _get_atomgroup_for_env(
                     environment, pdb_dir, CG, cg_match_dict, align_atoms, logfile,
@@ -1302,7 +1132,8 @@ def _stream_one_chunk(args):
                         try:
                             (re_ordered_aas, re_ordered_bbcoords,
                              re_ordered_flankingseqs, re_ordered_CAs,
-                             re_ordered_scrr, re_ordered_slot_flags
+                             re_ordered_scrr, re_ordered_slot_flags,
+                             re_ordered_bbo
                              ) = clust.reorder_vdg_subset(
                                 vdg_subset, vdms_dict, _cg_heavy, atomgroup)
                         except ValueError as _e:
@@ -1316,15 +1147,22 @@ def _stream_one_chunk(args):
                             "bbcoords": [np.asarray(x, dtype=np.float32) for x in re_ordered_bbcoords],
                             "flankseqs": re_ordered_flankingseqs,
                             "flankCAs": [np.asarray(x, dtype=np.float32) for x in re_ordered_CAs],
-                            "pdbpath": _actual_pdb_path,
+                            "biounit": str(_biounit),
                             "scrr": [[str(s), str(ch), int(r), str(rn)] for (s, ch, r, rn) in re_ordered_scrr],
                             "cg_names": list(cg_names), "cg_elements": list(cg_elements),
                             "cg_seg": str(cg_seg), "cg_chain": str(cg_chain),
                             "cg_resnum": int(cg_resnum), "cg_resname": str(cg_resname),
                             "slot_flags": [int(f) for f in re_ordered_slot_flags],
-                            "cg_max_b": env_quality[0], "cg_min_occ": env_quality[1],
-                            "vdm_max_b": env_quality[2], "vdm_min_occ": env_quality[3],
+                            "quality": tuple(float(q) for q in env_quality),
+                            # Carbonyl O per slot, NaN where the parent lacks it.
+                            # Kept out of cgvdmbb so it never enters an RMSD.
+                            "bbo": [np.asarray(x, dtype=np.float32) for x in re_ordered_bbo],
                         }
+                        # Every Stage-1 atom is mandatory; a record missing one
+                        # would only fail much later, inside the clustering.
+                        if not stage1_record_is_complete(rec, expected_n_cg, size_subset):
+                            skips["incomplete_stage1"] += 1
+                            continue
                         aa_key = "_".join(re_ordered_aas)
                         size_records = bucket_records[size_subset]
                         size_records.setdefault(aa_key, []).append(rec)
@@ -1337,11 +1175,8 @@ def _stream_one_chunk(args):
                             flush_idx += 1
                             total_in_memory = 0
 
-    # Write any remaining records as the final pickle for each bucket.
     for size, size_records in bucket_records.items():
-        for aa_key, records in size_records.items():
-            _dump_pickle_atomic(
-                records, os.path.join(worker_tmp_dirs[size], _bucket_fname(aa_key)))
+        _flush_buckets_to_disk(size_records, worker_tmp_dirs[size])
 
     warns = {key: count - warn_counts_at_entry.get(key, 0)
              for key, count in _WARN_COUNTS.items()
@@ -1349,21 +1184,33 @@ def _stream_one_chunk(args):
     return worker_tmp_root, skips, warns
 
 
-def _merge_worker_dirs(worker_dirs, final_dir):
-    """Merge per-worker pickle files by aa_key.
+def _cap_distinct_entries(cols, aa_key, max_num_to_clus, logfile):
+    """DEBUG ONLY (-m): keep the records of at most `max_num_to_clus` diverse
+    PDB entries; one entry can still contribute several records."""
+    entries = [parent_db.entry_of(b) for b in cols["biounit"]]
+    if len(set(entries)) <= max_num_to_clus:
+        return cols
+    keep = set(select_diverse_pdbIDs(entries, max_num_to_clus))
+    rows = np.asarray([e in keep for e in entries])
+    _log_write(logfile, f"\t{len(entries)} vdGs -> {int(rows.sum())} vdGs from "
+                        f"{len(keep)} diverse PDB IDs for {aa_key}.\n")
+    return {key: arr[rows] for key, arr in cols.items()}
 
-    Downstream clustering (`_run_one_bucket_strict`) needs one complete file per
-    aa_key, so buckets can't be re-split across files the way workers flush them.
-    Instead, merge one aa_key at a time: peak memory is bounded by the largest
-    single bucket rather than the sum of every bucket in the library.
+
+def _merge_worker_dirs(worker_dirs, final_dir, max_num_to_clus, logfile):
+    """Merge per-worker shards into one column set per aa_key under `final_dir`.
+
+    One aa_key at a time, so peak memory is bounded by the largest single bucket
+    rather than the sum of every bucket in the library. Returns
+    ``{aa_key: record count}``.
     """
     os.makedirs(final_dir, exist_ok=True)
-    files_by_key = {}  # aa_key -> list of source paths
+    files_by_key = {}  # aa_key -> list of shard paths
     for d in worker_dirs:
         if not os.path.isdir(d):
             continue
         for fname in os.listdir(d):
-            if not fname.endswith(".pkl"):
+            if not fname.endswith(".npz"):
                 continue
             aa_key = _aa_key_from_bucket_fname(fname)
             if aa_key is None:
@@ -1372,58 +1219,176 @@ def _merge_worker_dirs(worker_dirs, final_dir):
                 continue
             files_by_key.setdefault(aa_key, []).append(os.path.join(d, fname))
 
-    for aa_key, paths in files_by_key.items():
-        records = []
-        for path in paths:
+    counts = {}
+    for aa_key, paths in sorted(files_by_key.items()):
+        parts = []
+        for path in sorted(paths):
             try:
-                with open(path, "rb") as f:
-                    records.extend(pickle.load(f))
+                parts.append(load_shard(path))
             except Exception as exc:
-                # Shards are written through _dump_pickle_atomic, so a shard that
-                # exists is a shard that was written whole; reaching here means
+                # Shards are written whole or not at all, so reaching here means
                 # real corruption (bad block, truncated NFS write) rather than an
-                # interrupted worker. Raise rather than skip. 
+                # interrupted worker. Raise rather than skip.
                 raise RuntimeError(
                     f"Unreadable stream shard {path} for AA bucket {aa_key}: "
                     f"{type(exc).__name__}: {exc}") from exc
-        _dump_pickle_atomic(records, os.path.join(final_dir, _bucket_fname(aa_key)))
+        cols = concat_columns(parts)
+        del parts
+        if max_num_to_clus is not None:
+            cols = _cap_distinct_entries(cols, aa_key, max_num_to_clus, logfile)
+        save_columns(os.path.join(final_dir, aa_key), cols)
+        counts[aa_key] = len(cols["biounit"])
+    return counts
 
 
-def _bucket_jobs(stream_dirs, subset_sizes, seq_sim_thresh, cg_automorphisms,
-                 vdglib_dir, logfile, max_num_to_clus):
-    """Build clustering jobs for every requested subset size, largest first.
+def _buckets(counts_by_size, stream_dirs):
+    """Every bucket of every subset size, largest first.
 
     Bucket cost is superlinear in record count and the distribution is very
     lopsided (`bb_bb` and `ARG` run ~500x the median). Queued in name order, one
-    of those can be handed out last and set the wall time on its own; longest-
-    processing-time-first puts them in while the pool is still empty. Pickle
-    size is the proxy for record count -- exact, since every record is the same
-    fixed-width tuple.
+    of those can be handed out last and set the wall time on its own; largest
+    first puts them in while the pool is still empty.
     """
-    jobs = []
-    for size_subset in subset_sizes:
-        stream_dir = stream_dirs[size_subset]
-        if not os.path.isdir(stream_dir):
-            _log_write(logfile,
-                f"\t[STREAM ERROR] No buckets found at {stream_dir}\n")
-            continue
-        for fname in sorted(os.listdir(stream_dir)):
-            if not fname.endswith(".pkl"):
+    buckets = []
+    for size_subset, counts in counts_by_size.items():
+        for aa_key, n in counts.items():
+            buckets.append(Bucket(
+                key=(size_subset, aa_key), size_subset=size_subset,
+                aa_parts=tuple(aa_key.split("_")), n=n,
+                bucket_dir=os.path.join(stream_dirs[size_subset], aa_key)))
+    buckets.sort(key=lambda b: (-b.n, b.key))
+    return buckets
+
+
+def _record_bucket_stats(profile, stats):
+    """Fold one bucket's counters into the profile. perm_group and the Stage-2
+    slot-order / largest-cluster figures are per-bucket sizes, not tallies, so
+    they are kept as maxima; everything else is additive."""
+    if not profile.enabled or not stats:
+        return
+    stats = dict(stats)
+    perm_group = stats.pop("perm_group", None)
+    if perm_group is not None:
+        profile.max("stage1.perm_group_max", perm_group)
+    n_orders = stats.pop("stage2_slot_orders", None)
+    if n_orders is not None:
+        profile.max("stage2.slot_orders_max", n_orders)
+        if n_orders > 1:
+            profile.add("stage2.same_label_buckets")
+    largest = stats.pop("stage2_largest_cluster", None)
+    largest_s = stats.pop("stage2_largest_cluster_s", None)
+    if largest is not None and largest >= profile.counters.get("stage2.largest_cluster", 0):
+        profile.set("stage2.largest_cluster", largest)
+        profile.set("stage2.largest_cluster_s", largest_s)
+    stage2 = {k[len("stage2_"):]: v for k, v in stats.items() if k.startswith("stage2_")}
+    stage1 = {k: v for k, v in stats.items() if not k.startswith("stage2_")}
+    profile.merge(stage2, prefix="stage2.")
+    profile.merge(stage1, prefix="stage1.")
+
+
+def _cluster_buckets(pool, num_procs, run, buckets, profile):
+    """Drive every bucket through the pool; returns the labels that failed.
+
+    Small buckets are one task each. A bucket of at least _SPLIT_MIN_RECORDS
+    records is four phases: Stage-1 row blocks, then graph assembly and
+    partition, then Stage-2 cluster blocks, then the write. Large buckets'
+    blocks are queued first, and a bucket's next phase goes to the *front* of
+    the queue when its current one completes; small buckets are released only
+    to keep the pool fed, so the executor's own FIFO never holds more than one
+    pool's worth of them ahead of a large bucket's next phase.
+    """
+    n_blocks = _BLOCKS_PER_PROC * num_procs
+    pending = deque()
+    state = {}
+    for bucket in buckets:
+        if bucket.n >= _SPLIT_MIN_RECORDS:
+            blocks = _row_blocks(bucket.n, n_blocks)
+            state[bucket.key] = {"bucket": bucket, "blocks": len(blocks),
+                                 "blocks_done": 0, "stats": {"records": bucket.n},
+                                 "subgroups": [], "stage2_blocks": 0,
+                                 "stage2_done": 0}
+            for k, (start, stop) in enumerate(blocks):
+                pending.append(("stage1_block", bucket, (k, start, stop)))
+        else:
+            pending.append(("small", bucket, None))
+    profile.set("buckets_split", len(state))
+
+    failed, done, inflight = set(), set(), {}
+
+    def _fail(bucket, err_text):
+        failed.add(bucket.key)
+        _log_write(run.logfile, err_text + "\n")
+        _write_failed_marker(run.vdglib_dir, bucket.size_subset, bucket.key[1], err_text)
+
+    def _fill():
+        while pending and len(inflight) < 2 * num_procs:
+            kind, bucket, payload = pending.popleft()
+            if bucket.key in failed:
                 continue
-            aa_key = _aa_key_from_bucket_fname(fname)
-            if aa_key is None:
-                _log_write(logfile,
-                    f"\t[STREAM WARNING] Ignoring unrecognized bucket file {fname}\n")
+            fut = pool.submit(_run_task, kind, run, bucket, payload)
+            inflight[fut] = (kind, bucket)
+
+    def _push_front(tasks):
+        for task in reversed(tasks):
+            pending.appendleft(task)
+
+    _fill()
+    while inflight:
+        finished, _ = concurrent.futures.wait(
+            inflight, return_when=concurrent.futures.FIRST_COMPLETED)
+        for fut in finished:
+            kind, bucket = inflight.pop(fut)
+            _kind, key, value, err_text = fut.result()
+            if key in failed:
                 continue
-            path = os.path.join(stream_dir, fname)
-            # Size captured here so the sort below does not re-stat every bucket
-            # O(n log n) times on NFS.
-            jobs.append((os.path.getsize(path), (
-                path, seq_sim_thresh,
-                aa_key.split("_"), cg_automorphisms, vdglib_dir, logfile,
-                size_subset, max_num_to_clus)))
-    jobs.sort(key=lambda sized_job: sized_job[0], reverse=True)
-    return [job for _, job in jobs]
+            if err_text is not None:
+                _fail(bucket, err_text)
+                continue
+            if kind == "small":
+                total, stats = value
+                _record_bucket_stats(profile, stats)
+                done.add(key)
+                continue
+            st = state[key]
+            if kind == "stage1_block":
+                st["blocks_done"] += 1
+                for name, v in value.items():
+                    st["stats"][name] = st["stats"].get(name, 0) + v
+                if st["blocks_done"] == st["blocks"]:
+                    _push_front([("stage1_partition", bucket, st["blocks"])])
+            elif kind == "stage1_partition":
+                sizes, stats = value
+                st["stats"].update(stats)
+                st["stats"]["perm_group"] = len(build_perm_group(
+                    run.cg_automorphisms, len(run.cg_automorphisms[0]), bucket.aa_parts))
+                blocks = _stage2_blocks(sizes, n_blocks)
+                st["stage2_blocks"] = len(blocks)
+                _push_front([("stage2_block", bucket, ids) for ids in blocks])
+            elif kind == "stage2_block":
+                subgroups, stats = value
+                st["subgroups"].extend(subgroups)
+                st["stage2_done"] += 1
+                for name, v in stats.items():
+                    if name.endswith("largest_cluster") or name.endswith("largest_cluster_s"):
+                        continue
+                    st["stats"][name] = st["stats"].get(name, 0) + v
+                if stats["stage2_largest_cluster"] >= st["stats"].get("stage2_largest_cluster", 0):
+                    st["stats"]["stage2_largest_cluster"] = stats["stage2_largest_cluster"]
+                    st["stats"]["stage2_largest_cluster_s"] = stats["stage2_largest_cluster_s"]
+                st["stats"]["stage2_slot_orders"] = stats["stage2_slot_orders"]
+                if st["stage2_done"] == st["stage2_blocks"]:
+                    _push_front([("write", bucket, st["subgroups"])])
+                    st["subgroups"] = []
+            elif kind == "write":
+                total, stats = value
+                st["stats"].update(stats)
+                _record_bucket_stats(profile, st["stats"])
+                done.add(key)
+        _fill()
+    if profile.enabled:
+        profile.set("stage1.buckets", len(done))
+        profile.set("stage2.buckets", len(done))
+    return sorted(key[1] for key in failed)
 
 
 def _subset_output_counts(vdglib_dir, size_subset, logfile):
@@ -1461,10 +1426,7 @@ def _scan_failed_markers(vdglib_dir, size_subset):
     """AA labels carrying a .FAILED marker in one subset directory.
 
     Read at the end of the run rather than trusting this run's in-memory tally:
-    a marker is the only trace left by a bucket whose process is gone, and one
-    left by an earlier run over the same directory (a bucket this run never
-    re-ran, so _clear_bucket_outputs never touched it) condemns the library just
-    as much as one written a minute ago.
+    a marker is the only trace left by a bucket whose process is gone.
     """
     nr_dir = os.path.join(vdglib_dir, "nr_vdgs", str(size_subset))
     if not os.path.isdir(nr_dir):
@@ -1709,7 +1671,7 @@ def main():
         # record was appended, so this is the cheapest true test of "did streaming
         # produce anything" without re-reading them.
         _streamed_any = any(
-            fname.endswith(".pkl")
+            fname.endswith(".npz")
             for wdir in worker_dirs
             for _r, _d, _files in os.walk(wdir)
             for fname in _files)
@@ -1750,10 +1712,11 @@ def main():
 
         try:
           with profile.phase("merge_worker_shards"):
+            counts_by_size = {}
             for size_subset in subset_sizes:
-                _merge_worker_dirs(
+                counts_by_size[size_subset] = _merge_worker_dirs(
                     [os.path.join(wdir, str(size_subset)) for wdir in worker_dirs],
-                    stream_dirs[size_subset])
+                    stream_dirs[size_subset], max_num_to_clus, logfile)
             # Merged buckets and the per-worker shards they were built from
             # coexist until this rmtree, so scratch has to hold both at once.
             merged_mb = sum(profile.record_dir_size(
@@ -1775,89 +1738,44 @@ def main():
             sys.exit(1)
 
     # AA buckets from all subset sizes share one clustering pool.
-    jobs = _bucket_jobs(
-        stream_dirs, subset_sizes, seq_sim_thresh, cg_automorphisms,
-        vdglib_dir, logfile, max_num_to_clus)
-    profile.set("buckets_queued", len(jobs))
-    if jobs:
-        # jobs is sorted largest-first, so job[0] is the bucket that sets both
-        # the clustering tail and per-worker peak RSS. Sizing mem_free means
-        # multiplying this by --num-procs, not by one worker.
-        profile.set("largest_bucket_mb",
-                    round(os.path.getsize(jobs[0][0]) / (1024 * 1024), 1))
-        profile.set("largest_bucket_aa_key", "_".join(jobs[0][2]))
-        profile.set("largest_bucket_subset_size", jobs[0][6])
+    buckets = _buckets(counts_by_size, stream_dirs)
+    profile.set("buckets_queued", len(buckets))
+    if buckets:
+        profile.set("largest_bucket_records", buckets[0].n)
+        profile.set("largest_bucket_aa_key", buckets[0].key[1])
+        profile.set("largest_bucket_subset_size", buckets[0].size_subset)
+    run = Run(cg_automorphisms=cg_automorphisms, seq_sim_thresh=seq_sim_thresh,
+              vdglib_dir=vdglib_dir, logfile=logfile,
+              parent_pdb_dir=os.path.abspath(pdb_dir))
     failed_buckets = []
-    if jobs:
+    if buckets:
         ctx = mp.get_context("spawn")
         try:
           with profile.phase("cluster"):
             # ProcessPoolExecutor rather than mp.Pool: a worker killed by the OOM
-            # killer (the common failure on the largest buckets) leaves mp.Pool
-            # hanging forever on imap_unordered -- it respawns the worker but never
-            # reports the lost task -- so the job burns its full h_rt and exits with
-            # a partial nr_vdgs/ and no traceback. The executor raises
-            # BrokenProcessPool instead.
-            #
-            # TRADE-OFF, and it is real: this drops the old maxtasksperchild=1,
-            # which tore each worker down after its bucket so the Python-arena
-            # memory behind adj/adj_d went back to the OS. The equivalent
-            # (max_tasks_per_child) needs Python 3.11 and this env is 3.10.18, so
-            # workers now persist and each retains the high-water mark of the
-            # largest bucket it has handled. Jobs are dispatched largest-first, so
-            # the peak is reached early and reused rather than growing; watch
-            # cluster.rss_peak_child_mb. On 3.11+, add max_tasks_per_child=1 here
-            # and this paragraph goes away.
+            # killer leaves mp.Pool hanging forever on imap_unordered -- it
+            # respawns the worker but never reports the lost task -- so the job
+            # burns its full h_rt and exits with a partial nr_vdgs/ and no
+            # traceback. The executor raises BrokenProcessPool instead.
             pool = concurrent.futures.ProcessPoolExecutor(
                 max_workers=int(args.num_procs), mp_context=ctx)
             try:
-                futures = [pool.submit(_run_one_bucket_strict, job) for job in jobs]
-                for fut in concurrent.futures.as_completed(futures):
-                    result = fut.result()
-                    # total_vdgs is None only for a bucket the worker caught an
-                    # exception on; it already wrote its .FAILED marker.
-                    if result[1] is None:
-                        failed_buckets.append(result[0])
-                        continue
-                    if profile.enabled and len(result) > 2:
-                        stats = dict(result[2] or {})
-                        # perm_group is a group *size*, not a tally. Summing it
-                        # across buckets reports a number no bucket ever had; every
-                        # other counter here is genuinely additive.
-                        perm_group = stats.pop("perm_group", None)
-                        if perm_group is not None:
-                            profile.max("stage1.perm_group_max", perm_group)
-                        # Stage-2 counters carry their own prefix; merging them
-                        # under "stage1." would file them as Stage-1 cost, which
-                        # is the confusion this split exists to remove.
-                        stage2 = {k: stats.pop(k) for k in list(stats)
-                                  if k.startswith("stage2_")}
-                        n_orders = stage2.pop("stage2_slot_orders", None)
-                        if n_orders is not None:
-                            profile.max("stage2.slot_orders_max", n_orders)
-                            if n_orders > 1:
-                                profile.add("stage2.same_label_buckets")
-                        profile.merge({k[len("stage2_"):]: v
-                                       for k, v in stage2.items()}, prefix="stage2.")
-                        profile.merge(stats, prefix="stage1.")
-                        profile.add("stage1.buckets")
-                        profile.add("stage2.buckets")
+                failed_buckets = _cluster_buckets(
+                    pool, int(args.num_procs), run, buckets, profile)
             finally:
                 # cancel_futures matters: the executor's __exit__ would otherwise
-                # run every queued bucket to completion before the exception
+                # run every queued task to completion before the exception
                 # surfaced, so a systematic failure would still burn the whole
-                # h_rt. mp.Pool's __exit__ called terminate() and stopped at once;
-                # this is the nearest equivalent (in-flight buckets still finish).
+                # h_rt (in-flight tasks still finish).
                 pool.shutdown(wait=True, cancel_futures=True)
         except BrokenProcessPool as e:
             err_text = (
                 "[FATAL ERROR] A clustering worker died without returning a result "
-                f"({e}). The usual cause is the OOM killer on the largest AA bucket: "
-                "Stage 1 builds Python adjacency lists at roughly 60 B/edge, so a "
-                "dense bucket can exceed the per-slot mem_free on its own. Re-run "
-                "with fewer --num-procs or a larger -l mem_free (PER SLOT under "
-                "-pe smp); the largest_bucket_* counters in the profile say which "
-                "bucket to size for.\n")
+                f"({e}). The usual cause is the OOM killer. Per-task peaks are the "
+                "Kabsch batch of a Stage-1 row block (~0.3 GB) and the graph "
+                "assembly of a large bucket (~30 B per within-cutoff pair); "
+                "largest_bucket_* in the profile says which bucket to look at, "
+                "and -l mem_free is PER SLOT under -pe smp.\n")
             _log_write(logfile, err_text)
             print(err_text, file=sys.stderr)
             _abort_profile(profile, args.profile_json, "cluster.", "cluster_worker_died")
@@ -1871,7 +1789,11 @@ def main():
             shutil.rmtree(stream_root, ignore_errors=True)
             sys.exit(1)  # hard-fail the whole run if the pool itself dies
         profile.record_peak_rss("cluster.")
-    shutil.rmtree(stream_root, ignore_errors=True)
+    if args.keep_stream_dir:
+        _log_write(logfile, f"Streamed bucket columns kept at {stream_root}\n")
+        print(f"Streamed bucket columns kept at {stream_root}")
+    else:
+        shutil.rmtree(stream_root, ignore_errors=True)
 
     hours, minutes, seconds = convert_time_elapsed(time.time() - start_time)
     _log_write(logfile,

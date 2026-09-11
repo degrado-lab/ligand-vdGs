@@ -1,13 +1,17 @@
 import json
 import os
-import pickle
 import tempfile
 import unittest
 from unittest import mock
 
 import numpy as np
 
+from ligand_vdgs.functions.clus_helpers import load_shard
 from ligand_vdgs.generate_vdgs import clus_and_deduplicate_vdgs as pipeline
+
+# A real N/CA/C triple: a zero backbone is degenerate and streaming drops it.
+BB = np.array([[-1.459, 0.0, 0.0], [0.0, 0.0, 0.0], [0.551, 1.422, 0.0]],
+              dtype=np.float32)
 
 
 class MultiSubsetStreamingTests(unittest.TestCase):
@@ -41,10 +45,11 @@ class MultiSubsetStreamingTests(unittest.TestCase):
             def reorder(subset, _vdms, _cg, _atomgroup):
                 labels = ["ALA"] if len(subset) == 1 else ["ALA", "SER"]
                 n = len(labels)
-                return (labels, [np.zeros((3, 3))] * n,
+                return (labels, [BB] * n,
                         ["AAAAA"] * n, [np.zeros((5, 3))] * n,
                         [("", "A", 20 + i, label)
-                         for i, label in enumerate(labels)], [0] * n)
+                         for i, label in enumerate(labels)], [0] * n,
+                        [BB[2] + 1.23] * n)
 
             with mock.patch.object(
                     pipeline, "_get_atomgroup_for_env", return_value=object()), \
@@ -73,8 +78,7 @@ class MultiSubsetStreamingTests(unittest.TestCase):
                 self.assertEqual(
                     pipeline._aa_key_from_bucket_fname(os.path.basename(paths[0])),
                     aa_key)
-                with open(paths[0], "rb") as handle:
-                    self.assertEqual(len(pickle.load(handle)), 1)
+                self.assertEqual(load_shard(paths[0])["biounit"].tolist(), ["1abc"])
 
     def test_cg_element_mismatch_is_skipped_and_counted(self):
         """A CG whose elements disagree with the SMARTS must be dropped at stream
@@ -152,8 +156,9 @@ class MultiSubsetStreamingTests(unittest.TestCase):
                     worker_root, (0, 0), (1,), pipeline._FLUSH_RECORDS_THRESHOLD)
 
                 def reorder(subset, _vdms, _cg, _atomgroup):
-                    return (["ALA"], [np.zeros((3, 3))], ["AAAAA"],
-                            [np.zeros((5, 3))], [("", "A", 20, "ALA")], [0])
+                    return (["ALA"], [BB], ["AAAAA"],
+                            [np.zeros((5, 3))], [("", "A", 20, "ALA")], [0],
+                            [BB[2] + 1.23])
 
                 with mock.patch.object(
                         pipeline, "_get_atomgroup_for_env", return_value=object()), \
@@ -176,8 +181,7 @@ class MultiSubsetStreamingTests(unittest.TestCase):
                 total_skips += skips["cg_elements_mismatch"]
                 bucket_dir = os.path.join(worker_root, "1")
                 for name in os.listdir(bucket_dir):
-                    with open(os.path.join(bucket_dir, name), "rb") as handle:
-                        total_records += len(pickle.load(handle))
+                    total_records += load_shard(os.path.join(bucket_dir, name))["biounit"].size
             return total_records, total_skips
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -201,6 +205,47 @@ class MultiSubsetStreamingTests(unittest.TestCase):
         # Both records are kept either way; nothing is rejected on the unpinned slot.
         self.assertEqual(one_chunk, (2, 0))
         self.assertEqual(one_chunk, two_chunks)
+
+    def test_incomplete_stage1_record_is_skipped_and_counted(self):
+        """A record missing a mandatory Stage-1 atom is dropped where it is
+        built, with a count; it must never reach a bucket."""
+        environment = [["1abc", "", "A", 10, 1], ["1abc", "", "A", 20]]
+        cg_result = (np.zeros((3, 3), dtype=np.float32), ["C1", "O1", "O2"],
+                     ["C", "O", "O"], "", "A", 10, "LIG")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            environments_dir = os.path.join(temp_dir, "environments", "ab")
+            os.makedirs(environments_dir)
+            with open(os.path.join(environments_dir, "1abc.jsonl"), "w") as handle:
+                json.dump({"env": environment, "cg_max_b": 15.0, "cg_min_occ": 1.0,
+                           "vdm_max_b": 25.0, "vdm_min_occ": 1.0}, handle)
+                handle.write("\n")
+            worker_root = os.path.join(temp_dir, "worker")
+            args = ([("ab", "1abc.jsonl")], os.path.join(temp_dir, "environments"),
+                    os.path.join(temp_dir, "pdb"), "test_cg", None, [1, 0, 2],
+                    os.path.join(temp_dir, "log"), 3, ["C", "O", "O"], 2,
+                    worker_root, (0, 0), (1,), pipeline._FLUSH_RECORDS_THRESHOLD)
+            collinear = BB.copy()
+            collinear[:, 1] = 0.0
+
+            def reorder(subset, _vdms, _cg, _atomgroup):
+                return (["ALA"], [collinear], ["AAAAA"], [np.zeros((5, 3))],
+                        [("", "A", 20, "ALA")], [0], [np.full(3, np.nan)])
+
+            with mock.patch.object(
+                    pipeline, "_get_atomgroup_for_env", return_value=object()), \
+                    mock.patch.object(
+                        pipeline, "_resolve_duplicate_ligand_occupancies",
+                        side_effect=lambda atomgroup, _label: atomgroup), \
+                    mock.patch.object(pipeline, "get_cg_atoms", return_value=cg_result), \
+                    mock.patch.object(pipeline.clust, "get_vdm_res_features",
+                                      return_value={20: object()}), \
+                    mock.patch.object(pipeline, "get_vdg_subsets_target_size",
+                                      side_effect=lambda _i, size: [(20,)]), \
+                    mock.patch.object(pipeline.clust, "reorder_vdg_subset",
+                                      side_effect=reorder):
+                _, skips, _warns = pipeline._stream_one_chunk(args)
+            self.assertEqual(skips["incomplete_stage1"], 1)
+            self.assertEqual(os.listdir(os.path.join(worker_root, "1")), [])
 
     def test_warning_counts_returned_are_per_chunk_deltas(self):
         """_WARN_COUNTS is module state and the executor reuses a worker across

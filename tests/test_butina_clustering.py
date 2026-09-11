@@ -51,6 +51,15 @@ def _clustered_blob(rng, n_cg, n_res, n_centers=5, per_center=9, spread=0.22):
         for center in centers]).astype(np.float32)
 
 
+def _edge_set(qi, qj):
+    return set(zip(qi.tolist(), qj.tolist()))
+
+
+def _partition(clusters, remap=None):
+    return {frozenset(int(remap[m]) if remap is not None else int(m) for m in members)
+            for members in clusters}
+
+
 CASES = (
     ('asymmetric CG, 1 slot',   4, ['ALA'],        None),
     ('carboxylate, 1 slot',     4, ['ALA'],        ((0, 1, 2, 3), (0, 1, 3, 2))),
@@ -69,21 +78,19 @@ class ButinaGuaranteeTests(unittest.TestCase):
                 data = _clustered_blob(rng, n_cg, len(parts))
                 group = build_perm_group(perms, n_cg, parts)
                 exact = _brute_force_distances(data, n_cg, group)
-                clusters, reps, radii = ac.get_butina_clusters(
-                    data, cutoff, n_cg, perms, parts)
-                for cnum, members in clusters.items():
-                    worst = exact[members, reps[cnum]].max()
+                clusters = ac.get_butina_clusters(data, cutoff, n_cg, build_perm_group(perms, n_cg, parts))
+                for members in clusters:
+                    # The representative is emitted first.
+                    worst = exact[members, members[0]].max()
                     self.assertLessEqual(worst, cutoff + 1e-6)
-                    self.assertAlmostEqual(radii[cnum], worst, places=6)
 
     def test_every_record_belongs_to_exactly_one_cluster(self):
         rng = np.random.default_rng(5)
         for label, n_cg, parts, perms in CASES:
             with self.subTest(label):
                 data = _clustered_blob(rng, n_cg, len(parts))
-                clusters, _reps, _radii = ac.get_butina_clusters(
-                    data, 0.6, n_cg, perms, parts)
-                assigned = sorted(i for m in clusters.values() for i in m)
+                clusters = ac.get_butina_clusters(data, 0.6, n_cg, build_perm_group(perms, n_cg, parts))
+                assigned = sorted(i for m in clusters for i in m.tolist())
                 self.assertEqual(assigned, list(range(len(data))))
 
     def test_neighbour_graph_is_exactly_the_within_cutoff_graph(self):
@@ -95,13 +102,29 @@ class ButinaGuaranteeTests(unittest.TestCase):
                 data = _clustered_blob(rng, n_cg, len(parts))
                 group = build_perm_group(perms, n_cg, parts)
                 exact = _brute_force_distances(data, n_cg, group)
-                adj, _dists = ac._stage1_neighbor_graph(
-                    data, cutoff, n_cg, group)
-                got = {(min(i, j), max(i, j))
-                       for i in range(len(data)) for j in adj[i]}
+                got = _edge_set(*ac.stage1_edges(data, cutoff, n_cg, group))
                 want = {(i, j) for i in range(len(data))
                         for j in range(i + 1, len(data)) if exact[i, j] <= cutoff}
                 self.assertEqual(got, want)
+
+    def test_boundary_pairs_are_kept_under_every_group_element(self):
+        """The discriminating case for per-element pruning: a pair within the
+        cutoff only under a non-identity element, whose bound under the
+        identity exceeds the cutoff. Failure looks like a dropped edge."""
+        rng = np.random.default_rng(12)
+        n_cg, parts = 5, ['bb', 'bb']
+        base = rng.normal(scale=3.0, size=(n_cg + 6, 3)).astype(np.float32)
+        # Relabel two oxygens AND swap the two slots; the identity element sees
+        # a large RMSD, the combined element sees ~0.
+        other = base[[0, 1, 3, 2, 4, 8, 9, 10, 5, 6, 7]] + \
+            rng.normal(scale=0.02, size=base.shape).astype(np.float32)
+        data = np.stack([base, other])
+        group = build_perm_group(_phosphate_permutations(), n_cg, parts)
+        exact = _brute_force_distances(data, n_cg, group)
+        self.assertLess(exact[0, 1], 0.1)
+        self.assertEqual(_edge_set(*ac.stage1_edges(data, 0.5, n_cg, group)), {(0, 1)})
+        identity_only = build_perm_group(None, n_cg, ['ARG', 'bb'])
+        self.assertEqual(_edge_set(*ac.stage1_edges(data, 0.5, n_cg, identity_only)), set())
 
 
 class ButinaDeterminismTests(unittest.TestCase):
@@ -111,25 +134,26 @@ class ButinaDeterminismTests(unittest.TestCase):
         n_cg, parts = 4, ['ARG']
         data = _clustered_blob(rng, n_cg, 1)
         order = rng.permutation(len(data))
-        base, _r, _rad = ac.get_butina_clusters(data, 0.6, n_cg, None, parts)
-        shuffled, _r2, _rad2 = ac.get_butina_clusters(
-            data[order], 0.6, n_cg, None, parts)
-
-        def as_partition(clusters, remap=None):
-            out = set()
-            for members in clusters.values():
-                out.add(frozenset(int(remap[m]) if remap is not None else int(m)
-                                  for m in members))
-            return out
-
-        self.assertEqual(as_partition(base), as_partition(shuffled, remap=order))
+        base = ac.get_butina_clusters(data, 0.6, n_cg, build_perm_group(None, n_cg, parts))
+        shuffled = ac.get_butina_clusters(data[order], 0.6, n_cg, build_perm_group(None, n_cg, parts))
+        self.assertEqual(_partition(base), _partition(shuffled, remap=order))
 
     def test_singleton_and_empty_inputs(self):
         self.assertEqual(ac.get_butina_clusters(
-            np.zeros((0, 7, 3), np.float32), 0.5, 4, None, ['ALA']), ({}, {}, {}))
-        clusters, reps, radii = ac.get_butina_clusters(
-            np.zeros((1, 7, 3), np.float32), 0.5, 4, None, ['ALA'])
-        self.assertEqual((clusters, reps, radii), ({1: [0]}, {1: 0}, {1: 0.0}))
+            np.zeros((0, 7, 3), np.float32), 0.5, 4, build_perm_group(None, 4, ['ALA'])), [])
+        clusters = ac.get_butina_clusters(
+            np.zeros((1, 7, 3), np.float32), 0.5, 4, build_perm_group(None, 4, ['ALA']))
+        self.assertEqual([m.tolist() for m in clusters], [[0]])
+
+    def test_empty_and_complete_graphs(self):
+        n = 6
+        indptr, indices = ac.neighbor_csr(n, np.empty(0, np.int32), np.empty(0, np.int32))
+        self.assertEqual(len(ac.butina_partition(indptr, indices)), n)
+        ii, jj = np.triu_indices(n, k=1)
+        indptr, indices = ac.neighbor_csr(n, ii.astype(np.int32), jj.astype(np.int32))
+        self.assertEqual(np.diff(indptr).tolist(), [n - 1] * n)
+        clusters = ac.butina_partition(indptr, indices)
+        self.assertEqual([m.tolist() for m in clusters], [list(range(n))])
 
 
 class MandatoryCoordinateTests(unittest.TestCase):
@@ -162,19 +186,17 @@ class MandatoryCoordinateTests(unittest.TestCase):
             with self.subTest(label):
                 data = self._two_tight_pairs_plus(bad)
                 with self.assertRaisesRegex(ValueError, "non-finite Stage-1"):
-                    ac.get_butina_clusters(data, 0.5, 4, None, ["bb", "bb"])
+                    ac.get_butina_clusters(data, 0.5, 4, build_perm_group(None, 4, ["bb", "bb"]))
 
     def test_the_bad_record_is_what_raises_not_the_shape(self):
         """Same input with the bad value repaired must cluster, or the test is vacuous."""
         data = self._two_tight_pairs_plus(np.nan)
         data[4, 2, 1] = float(data[0, 2, 1])
-        clusters, _reps, _radii = ac.get_butina_clusters(
-            data, 0.5, 4, None, ["bb", "bb"])
-        assigned = sorted(i for m in clusters.values() for i in m)
+        clusters = ac.get_butina_clusters(data, 0.5, 4, build_perm_group(None, 4, ["bb", "bb"]))
+        assigned = sorted(i for m in clusters for i in m.tolist())
         self.assertEqual(assigned, list(range(5)))
         # Records 0, 1 and 4 are the same pose; 2 and 3 are the other one.
-        partition = {frozenset(m) for m in clusters.values()}
-        self.assertEqual(partition, {frozenset({0, 1, 4}), frozenset({2, 3})})
+        self.assertEqual(_partition(clusters), {frozenset({0, 1, 4}), frozenset({2, 3})})
 
     def test_a_single_non_finite_record_raises_before_the_n_eq_1_shortcut(self):
         # n == 1 returns before any distance is computed, so this row would go
@@ -182,11 +204,7 @@ class MandatoryCoordinateTests(unittest.TestCase):
         data = np.zeros((1, 7, 3), dtype=np.float32)
         data[0, 0, 0] = np.nan
         with self.assertRaisesRegex(ValueError, "non-finite Stage-1"):
-            ac.get_butina_clusters(data, 0.5, 4, None, ["ALA"])
-
-    def test_empty_input_is_still_accepted(self):
-        self.assertEqual(ac.get_butina_clusters(
-            np.zeros((0, 7, 3), np.float32), 0.5, 4, None, ["ALA"]), ({}, {}, {}))
+            ac.get_butina_clusters(data, 0.5, 4, build_perm_group(None, 4, ["ALA"]))
 
 
 class SlotSymmetryTests(unittest.TestCase):
@@ -205,15 +223,11 @@ class SlotSymmetryTests(unittest.TestCase):
         swapped[n_cg + 3:] = base[n_cg:n_cg + 3]
         data = np.stack((base, swapped))
 
-        clusters, _reps, radii = ac.get_butina_clusters(
-            data, 0.5, n_cg, None, ['bb', 'bb'])
-        self.assertEqual(len(clusters), 1)
-        self.assertEqual(sorted(clusters[1]), [0, 1])
-        self.assertAlmostEqual(radii[1], 0.0, places=6)
+        clusters = ac.get_butina_clusters(data, 0.5, n_cg, build_perm_group(None, n_cg, ['bb', 'bb']))
+        self.assertEqual([m.tolist() for m in clusters], [[0, 1]])
 
         # With distinguishable slots the same pair is genuinely different.
-        apart, _r, _rad = ac.get_butina_clusters(
-            data, 0.5, n_cg, None, ['ARG', 'bb'])
+        apart = ac.get_butina_clusters(data, 0.5, n_cg, build_perm_group(None, n_cg, ['ARG', 'bb']))
         self.assertEqual(len(apart), 2)
 
 
@@ -239,21 +253,41 @@ class PoseMinimaxPrototypeTests(unittest.TestCase):
 
 
 class BatchedRmsdTests(unittest.TestCase):
-    def test_batched_matches_pairwise_across_chunk_boundaries(self):
+    def setUp(self):
         rng = np.random.default_rng(10)
-        n_cg, parts = 5, ['bb', 'bb']
-        data = _clustered_blob(rng, n_cg, 2, n_centers=3, per_center=8)
-        group = build_perm_group(_phosphate_permutations(), n_cg, parts)
-        full_perms = full_row_permutations(group, n_cg)
-        n_total = data.shape[1]
-        ii, jj = np.triu_indices(len(data), k=1)
+        self.n_cg, parts = 5, ['bb', 'bb']
+        self.data = _clustered_blob(rng, self.n_cg, 2, n_centers=3, per_center=8)
+        self.group = build_perm_group(_phosphate_permutations(), self.n_cg, parts)
+        self.full_perms = full_row_permutations(self.group, self.n_cg)
+        self.ii, self.jj = np.triu_indices(len(self.data), k=1)
 
-        one_shot = ac._batched_min_rmsd(data, ii, jj, full_perms, n_total)
-        chunked = ac._batched_min_rmsd(data, ii, jj, full_perms, n_total,
-                                       batch_rows=len(full_perms) * 3)
+    def test_batched_matches_pairwise_across_chunk_boundaries(self):
+        n_total = self.data.shape[1]
+        one_shot = ac._batched_min_rmsd(self.data, self.ii, self.jj, self.full_perms, n_total)
+        chunked = ac._batched_min_rmsd(self.data, self.ii, self.jj, self.full_perms,
+                                       n_total, batch_rows=len(self.full_perms) * 3)
         np.testing.assert_allclose(one_shot, chunked, atol=1e-6)
         np.testing.assert_allclose(
-            one_shot, _brute_force_distances(data, n_cg, group)[ii, jj], atol=1e-5)
+            one_shot, _brute_force_distances(self.data, self.n_cg, self.group)[self.ii, self.jj],
+            atol=1e-5)
+
+    def test_masked_fit_equals_the_full_fit_when_the_argmin_element_survives(self):
+        n_total = self.data.shape[1]
+        full = ac._batched_min_rmsd(self.data, self.ii, self.jj, self.full_perms, n_total)
+        n_perm = len(self.full_perms)
+        all_on = np.ones((self.ii.size, n_perm), dtype=bool)
+        np.testing.assert_allclose(
+            ac._masked_min_rmsd(self.data, self.ii, self.jj, all_on, self.full_perms,
+                                n_total, batch_rows=7), full, atol=1e-6)
+        # Keep only the argmin element of every pair: still the same value.
+        per_elem = np.stack([
+            ac._batched_min_rmsd(self.data, self.ii, self.jj, (perm,), n_total)
+            for perm in self.full_perms], axis=1)
+        only_best = np.zeros_like(all_on)
+        only_best[np.arange(self.ii.size), per_elem.argmin(axis=1)] = True
+        np.testing.assert_allclose(
+            ac._masked_min_rmsd(self.data, self.ii, self.jj, only_best, self.full_perms,
+                                n_total), full, atol=1e-6)
 
 
 class NeighbourOrderTests(unittest.TestCase):
@@ -266,22 +300,23 @@ class NeighbourOrderTests(unittest.TestCase):
     *set* and partitions as *frozensets*, which is deliberate for the properties
     they assert but leaves order entirely unpinned.
 
-    That matters for two reasons. `adj[x]` being ascending is what lets the
-    Python adjacency lists be replaced by a CSR edge array without moving a
-    single vdG between subgroups. And the order currently falls out of where
-    `_flush` happens to land, which is driven by `_GRAPH_BATCH_ROWS` -- a
-    performance knob. If the order were flush-dependent, tuning that constant
-    would silently re-partition the library, so the batch-size sweep below is the
-    discriminating case, not the ascending check.
+    The order must not depend on where `_flush` happens to land (driven by
+    `_GRAPH_BATCH_ROWS`, a performance knob) nor on how the rows were split
+    across processes -- otherwise tuning either would silently re-partition the
+    library. Those sweeps are the discriminating cases, not the ascending check.
     """
 
-    def _graph(self, data, n_cg, parts, perms, cutoff, batch_rows=None):
-        group = build_perm_group(perms, n_cg, parts)
+    def _edges(self, data, group, cutoff, batch_rows=None, blocks=None):
         original = ac._GRAPH_BATCH_ROWS
         if batch_rows is not None:
             ac._GRAPH_BATCH_ROWS = batch_rows
         try:
-            return ac._stage1_neighbor_graph(data, cutoff, n_cg, group)
+            if blocks is None:
+                return ac.stage1_edges(data, cutoff, group[0][0].size, group)
+            parts = [ac.stage1_edges(data, cutoff, group[0][0].size, group, row_range=b)
+                     for b in blocks]
+            return (np.concatenate([p[0] for p in parts]),
+                    np.concatenate([p[1] for p in parts]))
         finally:
             ac._GRAPH_BATCH_ROWS = original
 
@@ -290,30 +325,30 @@ class NeighbourOrderTests(unittest.TestCase):
         for label, n_cg, parts, perms in CASES:
             with self.subTest(label):
                 data = _clustered_blob(rng, n_cg, len(parts))
-                adj, _d = self._graph(data, n_cg, parts, perms, 0.6)
-                for i, nbrs in enumerate(adj):
-                    self.assertEqual(nbrs, sorted(nbrs), f'adj[{i}] not ascending')
-                    self.assertEqual(len(nbrs), len(set(nbrs)),
-                                     f'adj[{i}] has duplicates')
+                group = build_perm_group(perms, n_cg, parts)
+                indptr, indices = ac.neighbor_csr(len(data), *self._edges(data, group, 0.6))
+                for i in range(len(data)):
+                    nbrs = indices[indptr[i]:indptr[i + 1]].tolist()
+                    self.assertEqual(nbrs, sorted(set(nbrs)), f'row {i}')
+                    self.assertNotIn(i, nbrs)
 
-    def test_neighbour_order_does_not_depend_on_the_flush_boundary(self):
-        """Tiny batches force a flush per row; the graph must be byte-identical.
-
-        Failure looks like the same edge *set* with a different order inside some
-        `adj[x]` -- which every other test in this file would pass.
-        """
+    def test_edges_do_not_depend_on_the_flush_boundary_or_the_row_split(self):
+        """Tiny batches force a flush per row and row blocks split the scan;
+        the edge arrays must be byte-identical."""
         rng = np.random.default_rng(22)
         for label, n_cg, parts, perms in CASES:
             with self.subTest(label):
                 data = _clustered_blob(rng, n_cg, len(parts))
-                base_adj, base_d = self._graph(data, n_cg, parts, perms, 0.6)
-                self.assertTrue(any(base_adj), 'no edges: test would be vacuous')
-                for batch_rows in (1, 7, 64):
-                    adj, dists = self._graph(
-                        data, n_cg, parts, perms, 0.6, batch_rows=batch_rows)
-                    self.assertEqual(adj, base_adj, f'batch_rows={batch_rows}')
-                    for a, b in zip(dists, base_d):
-                        np.testing.assert_allclose(a, b)
+                group = build_perm_group(perms, n_cg, parts)
+                base = self._edges(data, group, 0.6)
+                self.assertGreater(base[0].size, 0, 'no edges: test would be vacuous')
+                n = len(data)
+                for batch_rows, blocks in ((1, None), (7, None), (64, None),
+                                           (None, [(0, 5), (5, 20), (20, n - 1)]),
+                                           (3, [(0, n // 2), (n // 2, n - 1)])):
+                    got = self._edges(data, group, 0.6, batch_rows, blocks)
+                    np.testing.assert_array_equal(got[0], base[0])
+                    np.testing.assert_array_equal(got[1], base[1])
 
     def test_cluster_member_order_is_stable_across_flush_boundaries(self):
         """What Stage 2 actually consumes: member *lists*, not member sets."""
@@ -326,12 +361,11 @@ class NeighbourOrderTests(unittest.TestCase):
                 for batch_rows in (original, 1, 7):
                     ac._GRAPH_BATCH_ROWS = batch_rows
                     try:
-                        clusters, _r, _rad = ac.get_butina_clusters(
-                            data, 0.6, n_cg, perms, parts)
+                        clusters = ac.get_butina_clusters(data, 0.6, n_cg, build_perm_group(perms, n_cg, parts))
                     finally:
                         ac._GRAPH_BATCH_ROWS = original
-                    runs.append({c: list(m) for c, m in clusters.items()})
-                self.assertTrue(any(len(m) > 1 for m in runs[0].values()),
+                    runs.append([m.tolist() for m in clusters])
+                self.assertTrue(any(len(m) > 1 for m in runs[0]),
                                 'all singletons: order test would be vacuous')
                 for other in runs[1:]:
                     self.assertEqual(other, runs[0])

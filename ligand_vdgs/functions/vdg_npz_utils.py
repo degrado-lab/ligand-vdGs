@@ -5,6 +5,7 @@ import time
 import zipfile
 
 import numpy as np
+from ligand_vdgs.functions import parent_db
 import prody as pr
 
 from ligand_vdgs.functions import utils
@@ -498,7 +499,7 @@ def require_parent_pdb_dir(data=None, pdb_dir=None):
     stems = [] if data is None else [str(b) for b in data["nr_parent_biounit"][:3]]
     stems = [b for b in stems if b]
     if stems:
-        test_probes = [os.path.join(resolved, b[1:3].lower(), b + ".pdb") for b in stems]
+        test_probes = [parent_db.structure_path(resolved, b) for b in stems]
         if not any(os.path.isfile(test_probe) for test_probe in test_probes):
             raise ParentPdbDirError(
                 f"Parent PDB database {resolved} (from {source}) holds none of "
@@ -590,7 +591,7 @@ def resolve_parent_pdb_path(data, biounit, pdb_dir=None, for_reading=True):
     resolved, _ = effective_parent_pdb_dir(data, pdb_dir=pdb_dir)
     if not resolved:
         return ""
-    return os.path.join(resolved, biounit[1:3].lower(), biounit + ".pdb")
+    return parent_db.structure_path(resolved, biounit)
 
 
 def _resnum_selstr(resnum):
@@ -876,9 +877,11 @@ def load_fragment_aliases(vdg_lib_dir):
         for line in handle:
             if line.startswith("#") or not line.strip():
                 continue
-            alias, _, representative = line.rstrip("\n").partition("\t")
-            if representative:
-                aliases[alias] = representative
+            # alias, representative[, kind]; kind is informational (see
+            # extract_fragment_smiles.write_fragment_aliases).
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) >= 2 and fields[1]:
+                aliases[fields[0]] = fields[1]
     return aliases
 
 

@@ -7,6 +7,8 @@ exists to remove the *input* that provokes that, so it must run before s02. It i
 from both s01 (which is already rewriting PDBs) and s02 itself, because s01 is optional.
 '''
 
+import os
+
 import prody as pr
 
 AAs = ('ALA', 'CYS', 'ASP', 'GLU', 'PHE', 'GLY', 'HIS', 'ILE', 'LYS', 'LEU',
@@ -97,6 +99,58 @@ def clean_pdb_file(in_path, out_path):
         return 0
     pr.writePDB(out_path, parsed.select(f"resindex {' '.join(str(i) for i in keep)}"))
     return n_dropped
+
+
+# --- Protein chains written as HETATM ---------------------------------------------
+
+
+def embedded_amino_acid_hetatm_to_atom(lines):
+    '''Rewrite HETATM records of standard amino acids that are peptide-bonded to another
+    amino acid as ATOM records. Returns (lines, number of residues rewritten).
+
+    The 2026-09 database carried 670 structures whose two-character-chain segments
+    (see _chain_ids) were written as HETATM throughout: 113,720 protein residues, and
+    every HETATM standard amino acid in the database sat on such a chain. vdG-miner's
+    ligand scan reads HETATM only, so once the chain IDs are repaired those residues
+    would be mined as ligands (TRP indole as an aromatic CG, ASP as a carboxylate...).
+    A free amino acid -- HETATM, bonded to nothing, carboxylate complete (OXT) -- is a
+    real ligand and is left alone. Rewritten: residues with a peptide bond (N or C within
+    COVALENT_BOND_CUTOFF of another amino acid's C or N), and unbonded residues with no
+    OXT, which are chain fragments whose neighbours fell outside the s01 sphere (8any:
+    ARG 120 alone on chain AF). A Cys adduct or a single-residue ligand keeps its records.
+    '''
+    import numpy as np
+    key_of = lambda line: (line[21], line[22:27])
+    bb = {}      # reskey -> {'N': xyz, 'C': xyz} over every standard amino acid
+    het = set()  # reskeys of HETATM standard amino acids
+    has_oxt = set()
+    for line in lines:
+        if line[:6] not in ('ATOM  ', 'HETATM') or line[17:20] not in AAs:
+            continue
+        name = line[12:16].strip()
+        if name in ('N', 'C'):
+            bb.setdefault(key_of(line), {})[name] = (
+                float(line[30:38]), float(line[38:46]), float(line[46:54]))
+        elif name == 'OXT':
+            has_oxt.add(key_of(line))
+        if line.startswith('HETATM'):
+            het.add(key_of(line))
+    if not het:
+        return lines, 0
+
+    keys = list(bb)
+    n_xyz = np.array([bb[k].get('N', (9e9,) * 3) for k in keys])
+    c_xyz = np.array([bb[k].get('C', (9e9,) * 3) for k in keys])
+    # residue i's N bonded to residue j's C (i != j), or vice versa
+    d = np.sqrt(((n_xyz[:, None, :] - c_xyz[None, :, :]) ** 2).sum(-1))
+    np.fill_diagonal(d, np.inf)
+    bonded = (d <= COVALENT_BOND_CUTOFF).any(axis=1) | (d <= COVALENT_BOND_CUTOFF).any(axis=0)
+    convert = {k for k, b in zip(keys, bonded) if k in het and (b or k not in has_oxt)}
+    if not convert:
+        return lines, 0
+    out = [('ATOM  ' + line[6:]) if line.startswith('HETATM') and key_of(line) in convert
+           else line for line in lines]
+    return out, len(convert)
 
 
 # --- Restoring ligands prepwizard renames into protein -----------------------------
@@ -220,3 +274,120 @@ def restore_renamed_ligands(prepped_path, snapshot):
         with open(prepped_path, 'w') as fh:
             fh.writelines(lines)
     return len(changed)
+
+
+# --- Modified residues without prepwizard --------------------------------------------
+
+
+# Isosteric selenium variants: same atom names apart from SE for SD/SG, so the residue
+# is a full slot once renamed (vdg_struct_utils._ALTERNATE_HEAVY_ATOMS admits SE).
+MODIFIED_RESIDUE_RENAMES = {'MSE': 'MET', 'SEC': 'CYS'}
+
+CCD_POLYMER_TYPES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..',
+                                      'resources', 'ccd_polymer_types.tsv')
+
+
+def load_ccd_polymer_types(path=CCD_POLYMER_TYPES_PATH):
+    '''{CCD id: _chem_comp.type} from scripts/fetch_ccd_polymer_types.py's table.
+    Missing table -> {} with a warning: every non-standard HETATM residue then counts
+    as unknown and is left alone (prepwizard-era behaviour minus the renames).'''
+    if not os.path.isfile(path):
+        print(f'[WARNING] {path} not found; run scripts/fetch_ccd_polymer_types.py. '
+              'Chain-bonded modified residues will be left as HETATM (mined as ligands).')
+        return {}
+    types = {}
+    with open(path) as fh:
+        for line in fh:
+            if line.startswith('#') or not line.strip():
+                continue
+            fields = line.rstrip('\n').split('\t')
+            types[fields[0]] = fields[1] if len(fields) > 1 else ''
+    return types
+
+
+def is_peptide_linking(ccd_type):
+    '''`L-PEPTIDE LINKING`, `D-PEPTIDE LINKING`, `PEPTIDE LINKING` (any case); not
+    `peptide-like` (a ligand class) and not the gamma/beta-peptide variants.'''
+    return ccd_type.strip().upper().endswith('PEPTIDE LINKING')
+
+
+def modified_residues_to_protein(lines, ccd_types):
+    '''Make chain-embedded modified residues protein records, so that without
+    prepwizard's renaming they are neither dropped as slots nor scanned as ligands.
+
+    Prepwizard used to rename every modified residue to its parent (LLP -> LYS,
+    KCX -> LYS, SEP -> SER...), which vdG-miner then accepted as a slot (labelled X
+    when the modification is within 4.5 A). Without it they stay HETATM under their
+    own resname: the 20-resname slot whitelist rejects them and the HETATM-only ligand
+    scan would mine KCX/SEP/PTR/CSO as carbamate/phosphate/sulfenic-acid ligand CGs.
+    Audit of the 2026-09 database: 3322 such residues, 1686 within 4.5 A of a ligand;
+    MSE alone 4881 residues, 1148 near a ligand.
+
+    Three rewrites, in order:
+    1. MODIFIED_RESIDUE_RENAMES (MSE -> MET, SEC -> CYS): isosteres whose slots are
+       worth keeping; record type unchanged, atom names unchanged (SE stays SE).
+    2. embedded_amino_acid_hetatm_to_atom: standard amino acids written as HETATM
+       (including the ones just renamed) become ATOM when peptide-bonded or when an
+       unbonded chain fragment; a free amino-acid ligand with OXT stays HETATM.
+    3. Every other HETATM residue whose CCD type is `*PEPTIDE LINKING` and which has
+       a heavy atom within COVALENT_BOND_CUTOFF of a standard amino acid's heavy atom
+       becomes an ATOM record under its own resname: not a slot, not a ligand. The
+       CCD type is the discriminator, not backbone atom names -- in the audited
+       database 353 chain-bonded cofactor residues (SAM, SAH, NXL, 0G6) carry N/CA/C
+       names and must stay ligands, while 23 peptide-linking residues do not carry
+       them. A peptide-linking residue bonded only to other non-standard residues (a
+       peptide ligand made of ncAAs) stays HETATM; one bonded to a standard residue
+       of a peptide ligand is lost as a ligand (tiny numbers: 85 chain-bonded
+       peptide-linking residues in 65,600 structures, 15 near a ligand, 10 of them
+       SEC). Unknown resnames (not in *ccd_types*) are left alone and reported.
+
+    Returns (lines, stats) with stats = {'renamed': n residues, 'amino_acids_to_atom':
+    n, 'modres_to_atom': n, 'unknown_resnames': sorted list}.
+    '''
+    import numpy as np
+    coord_records = ('ATOM  ', 'HETATM')
+    key_of = lambda line: (line[21], line[22:27])
+
+    # 1. isosteric renames (also on ANISOU so the file stays self-consistent)
+    renamed = set()
+    out = []
+    for line in lines:
+        if line[:6] in coord_records + ('ANISOU',):
+            new = MODIFIED_RESIDUE_RENAMES.get(line[17:20])
+            if new is not None:
+                if line[:6] in coord_records:
+                    renamed.add(key_of(line))
+                line = line[:17] + new + line[20:]
+        out.append(line)
+    lines = out
+
+    # 2. HETATM standard amino acids (incl. the renamed ones) -> ATOM
+    lines, n_aa = embedded_amino_acid_hetatm_to_atom(lines)
+
+    # 3. chain-bonded peptide-linking non-standard residues -> ATOM
+    aa_xyz, cand, unknown = [], {}, set()
+    for line in lines:
+        if line[:6] not in coord_records or line[76:78].strip().upper() in ('H', 'D'):
+            continue
+        resname = line[17:20]
+        xyz = (float(line[30:38]), float(line[38:46]), float(line[46:54]))
+        if resname in AAs:
+            aa_xyz.append(xyz)
+        elif line.startswith('HETATM') and resname != 'HOH':
+            ccd_type = ccd_types.get(resname.strip())
+            if ccd_type is None:
+                unknown.add(resname.strip())
+            elif is_peptide_linking(ccd_type):
+                cand.setdefault(key_of(line), []).append(xyz)
+    convert = set()
+    if cand and aa_xyz:
+        aa_xyz = np.asarray(aa_xyz)
+        for key, xyz in cand.items():
+            d2 = ((np.asarray(xyz)[:, None, :] - aa_xyz[None, :, :]) ** 2).sum(-1)
+            if d2.min() <= COVALENT_BOND_CUTOFF ** 2:
+                convert.add(key)
+    if convert:
+        lines = [('ATOM  ' + line[6:]) if line.startswith('HETATM') and key_of(line) in convert
+                 else line for line in lines]
+    return lines, {'renamed': len(renamed), 'amino_acids_to_atom': n_aa,
+                   'modres_to_atom': len(convert), 'unknown_resnames': sorted(unknown)}

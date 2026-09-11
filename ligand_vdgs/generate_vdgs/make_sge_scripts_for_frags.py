@@ -38,8 +38,8 @@ from ligand_vdgs.functions import utils
 from ligand_vdgs.functions.utils import _int_or_none, file_sha256
 from ligand_vdgs.functions.vdg_npz_utils import load_fragment_aliases
 from ligand_vdgs.generate_vdgs.extract_fragment_smiles import (
-    prepare_fragments, resolve_include_fragments, select_fragments,
-    write_fragment_aliases)
+    alias_kind, fragment_dict_keys, prepare_fragments, resolve_include_fragments,
+    select_fragments, write_fragment_aliases)
 from ligand_vdgs.generate_vdgs.estimate_frag_cost import (
     DEFAULT_SAMPLE_SIZE, estimate_fragment_counts, read_estimate_tsv,
     read_estimate_header, sampling_upper_bound, _LAST_SAMPLE_SCALE)
@@ -480,6 +480,7 @@ def main():
     # Written into the library root, not next to the scripts: a consumer holding
     # a charged fragment name resolves it against the library it is reading.
     alias_path = os.path.join(args.vdg_lib_dir, 'fragment_aliases.tsv')
+    dict_keys = fragment_dict_keys(frags_dict)
     if args.include_only:
         # Top-up: this run knows only about the fragments it was asked for, so
         # overwriting would drop every alias the original build recorded and make
@@ -495,10 +496,10 @@ def main():
             fcntl.flock(lock, fcntl.LOCK_EX)
             merged = dict(load_fragment_aliases(args.vdg_lib_dir))
             merged.update(aliases)
-            write_fragment_aliases(alias_path, merged)
+            write_fragment_aliases(alias_path, merged, dict_keys)
         aliases = merged
     else:
-        write_fragment_aliases(alias_path, aliases)
+        write_fragment_aliases(alias_path, aliases, dict_keys)
         write_provenance(args.vdg_lib_dir, args)
 
     if args.include_only:
@@ -529,6 +530,13 @@ def main():
               f'e.g. {clamped_top_tier[:3]}')
     if aliases:
         print(f'Collapsed {len(aliases)} protonation variant(s); wrote {alias_path}.')
+        promoted = sorted(r for r in set(aliases.values())
+                          if alias_kind(r, dict_keys) == 'promoted')
+        if promoted:
+            print(f'{len(promoted)} representative(s) are promoted charge-stripped keys '
+                  f'absent from the fragment dict; their library directories are named '
+                  f'for a SMARTS no CCD ligand is drawn with. See kind=promoted in '
+                  f'{alias_path} and scripts/lookup_fragment_key.py: {promoted}')
 
 
 def output_script(template_lines, smiles, sge_out_dir, replace):

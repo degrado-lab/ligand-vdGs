@@ -26,10 +26,10 @@ import tempfile
 
 import prody as pr
 
+from ligand_vdgs.functions import parent_db
 from ligand_vdgs.functions.utils import set_up_outdir
 
 
-KNOWN_STRUCT_EXTS = (".pdb.gz", ".pdb", ".cif.gz", ".cif", ".gz")
 DUP_SUFFIX = "~"
 
 
@@ -38,12 +38,7 @@ def sanitize(x):
 
 
 def strip_known_exts(path):
-    """Basename with a structure-file extension removed (``1abc.pdb.gz`` -> ``1abc``)."""
-    base = os.path.basename(str(path))
-    for ext in KNOWN_STRUCT_EXTS:
-        if base.endswith(ext):
-            return base[:-len(ext)]
-    return os.path.splitext(base)[0]
+    return parent_db.stem_of(path)
 
 
 def normalize_seg(seg):

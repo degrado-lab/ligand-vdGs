@@ -15,7 +15,7 @@ import numpy as np
 
 from ligand_vdgs.functions import align_and_cluster as ac
 from ligand_vdgs.functions.utils import kabsch_ssd
-from ligand_vdgs.functions.vdg_fp_utils import (FP_SAFETY_FACTOR, fp_tolerances,
+from ligand_vdgs.functions.vdg_fp_utils import (FP_SAFETY_FACTOR, build_perm_group, fp_tolerances,
                                                 precompute_bucket_fingerprints)
 
 
@@ -133,10 +133,9 @@ class ClusteringUnchangedTests(unittest.TestCase):
         if disabled:
             ac.fp_tolerances = lambda t, n, ncg, nres: (1e9,) * (1 if nres == 1 else 3)
         try:
-            assigns, cents, radii = ac.get_butina_clusters(
-                data, threshold, n_cg, cg_symm_perms=None,
-                aa_bucket_parts=['ARG', 'bb'])
-            return ({k: sorted(v) for k, v in assigns.items()}, dict(cents))
+            clusters = ac.get_butina_clusters(
+                data, threshold, n_cg, build_perm_group(None, n_cg, ['ARG', 'bb']))
+            return [members.tolist() for members in clusters]
         finally:
             ac.fp_tolerances = original
 

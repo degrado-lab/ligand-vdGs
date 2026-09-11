@@ -56,35 +56,6 @@ def set_up_outdir(outdir, overwrite=False):
             os.makedirs(parent_dir, exist_ok=True)
         os.makedirs(outdir, exist_ok=True)
 
-def valid_database_subdir_format(input_dir):
-    ''' Ensure that the pdb database dir has subdirs formatted similarly to the RCSB
-    mirror format (see docs/database_generation_guide.md). '''
-    
-    def error_message():
-        print('Database structure must be similar to the RCSB mirror format; '
-              'see docs/database_generation_guide.md')
-    
-    # Input path must be a dir
-    if not os.path.exists(input_dir):
-        error_message()
-        return False
-    # Input dir must not be empty
-    if len(os.listdir(input_dir)) == 0:
-        error_message()
-        return False
-    # Ensure that there is at least one correctly formatted subdir
-    for p in os.listdir(input_dir):
-        subdir_path = os.path.join(input_dir, p)
-        if os.path.isdir(subdir_path):
-            # Subdirs should be the inner 2 characters of a 4-char pdb file name
-            if len(p) == 2 and p == p.lower():
-                for pdb in os.listdir(subdir_path):
-                    if len(pdb) >= 3 and pdb[1:3].lower() == p:
-                        return True
-    # No valid subdir was found
-    error_message()
-    return False
-
 def smiles_equiv(existingfrag, sub_smiles):
     """Whether two fragment keys denote the same substructure.
 

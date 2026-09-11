@@ -1,16 +1,18 @@
 # align_and_cluster.py
 
+import time
 import numpy as np
 from collections import OrderedDict, namedtuple
+from scipy import sparse
 from functools import lru_cache
 from ligand_vdgs.functions.clus_helpers import calc_seq_similarity
 from ligand_vdgs.functions import vdg_struct_utils as struct_utils
 from ligand_vdgs.functions.vdg_struct_utils import (get_res_iden, found_chain_break,
-    get_AA_and_CA_coords, get_bb_coords, build_flank_lookup_index)
+    get_AA_and_CA_coords, get_bb_coords, get_bb_o_coords, build_flank_lookup_index)
 from ligand_vdgs.functions.utils import kabsch_ssd
 from ligand_vdgs.functions.vdg_fp_utils import (
-    INTERNAL_DISTANCE_EPS, build_perm_group, fp_tolerances,
-    full_row_permutations, internal_distance_lower_bounds,
+    INTERNAL_DISTANCE_EPS, fp_tolerances,
+    full_row_permutations, internal_distance_bound_matrix,
     precompute_bucket_fingerprints, precompute_internal_distance_descriptors)
 
 _SEQ_CACHE_MAXSIZE  = 100_000   # sequence similarity (Stage 2 sub-clusters only)
@@ -93,11 +95,11 @@ class _BoundedRmsdCache:
                         self._maxsize, len(self._d))
 
 
-# Rows (pairs x group elements) per batched Kabsch call. Kabsch is ~99% of
+# Rows (pair x group element) per batched Kabsch call. Kabsch is ~99% of
 # Stage-1 time, and calling it per candidate pair costs ~12x what batching does,
 # so the graph builder defers survivors and flushes them in blocks. The cap is on
 # rows rather than pairs because a 24-automorphism CG at subset size 2 expands
-# each pair 48-fold, and the temporaries have to stay bounded regardless.
+# each pair up to 48-fold, and the temporaries have to stay bounded regardless.
 _GRAPH_BATCH_ROWS = 500_000
 
 
@@ -128,25 +130,66 @@ def _batched_min_rmsd(data, ia, ib, full_perms, n_total,
    return out
 
 
-def _stage1_neighbor_graph(data, threshold, n_cg, perm_group, counters=None):
-   """Exact symmetry-aware within-cutoff neighbour lists and their distances.
+def _masked_min_rmsd(data, ia, ib, elem_mask, full_perms, n_total,
+                     batch_rows=_GRAPH_BATCH_ROWS):
+   """RMSD for pairs (ia[k], ib[k]) minimised over the group elements their
+   `elem_mask[k]` row admits. Every row of `elem_mask` must admit at least one.
 
-   Runs the admissible cascade -- CA/CG-COM fingerprints, the six-atom backbone
-   fit at subset size 2, then the internal-distance bound -- before the exact
-   fit. Every stage is minimised over the same `perm_group` the exact RMSD uses;
-   screening a subset of the group would make the bounds inadmissible, because
-   the true distance is itself a minimum over all of it.
+   Equal to `_batched_min_rmsd` wherever the pair is within the cutoff, provided
+   the elements masked out were rejected by an admissible bound: the element
+   realising the minimum then survives. Outside the cutoff the value may be
+   larger, which no caller distinguishes.
+   """
+   pair_idx, perm_idx = np.nonzero(elem_mask)
+   full_perms = np.asarray(full_perms, dtype=np.intp)
+   ssd = np.empty(pair_idx.size, dtype=np.float64)
+   for start in range(0, pair_idx.size, batch_rows):
+      stop = min(start + batch_rows, pair_idx.size)
+      p = pair_idx[start:stop]
+      A = data[ia[p]]
+      X = np.take_along_axis(A, full_perms[perm_idx[start:stop]][:, :, None], axis=1)
+      ssd[start:stop] = kabsch_ssd(X, data[ib[p]])
+   starts = np.zeros(ia.size, dtype=np.intp)
+   np.cumsum(elem_mask.sum(axis=1)[:-1], out=starts[1:])
+   best = np.minimum.reduceat(ssd, starts) if ssd.size else ssd
+   return np.sqrt(best / n_total)
+
+
+def stage1_edges(data, threshold, n_cg, perm_group, row_range=None,
+                 counters=None):
+   """Exact symmetry-aware within-cutoff pairs (i, j), i < j, for i in `row_range`.
+
+   Returns `(qi, qj)` as int32 arrays sorted lexicographically, plus per-stage
+   counters. Rows are independent, so splitting `range(n - 1)` across calls and
+   concatenating the results in row order gives exactly the single-call graph.
+
+   Per row the admissible cascade is: CA/CG-COM fingerprints; the internal-
+   distance bound per group element; at subset size 2 the six-atom backbone fit
+   per distinct backbone relabeling; then the exact fit, only under the group
+   elements the bounds left standing. Every stage sees the same `perm_group` the
+   exact RMSD minimises over; screening a subset of the group would make the
+   bounds inadmissible, because the true distance is itself a minimum over all
+   of it.
    """
    n, n_total = len(data), data.shape[1]
    n_res = (n_total - n_cg) // 3
-   full_perms = full_row_permutations(perm_group, n_cg)
+   full_perms = np.stack(full_row_permutations(perm_group, n_cg))
+   n_perm = len(full_perms)
+   start, stop = (0, n - 1) if row_range is None else row_range
+   stop = min(stop, n - 1)
 
-   # Distinct backbone relabelings in the group, for the two stages that see
-   # backbone atoms but not CG atoms.
-   bb_perms = []
-   for _cg_perm, bb_perm in perm_group:
-      if not any(np.array_equal(bb_perm, seen) for seen in bb_perms):
-         bb_perms.append(bb_perm)
+   # Distinct backbone relabelings in the group, and which one each element
+   # uses, for the stages that see backbone atoms but not CG atoms.
+   bb_perms, bb_of_elem = [], np.empty(n_perm, dtype=np.intp)
+   for e, (_cg_perm, bb_perm) in enumerate(perm_group):
+      for k, seen in enumerate(bb_perms):
+         if np.array_equal(bb_perm, seen):
+            bb_of_elem[e] = k
+            break
+      else:
+         bb_of_elem[e] = len(bb_perms)
+         bb_perms.append(np.asarray(bb_perm, dtype=np.intp))
+   elems_of_bb = [np.flatnonzero(bb_of_elem == k) for k in range(len(bb_perms))]
    res_orders = [tuple(bb[::3] // 3) for bb in bb_perms]
 
    fp = precompute_bucket_fingerprints(data, n_cg)
@@ -156,34 +199,32 @@ def _stage1_neighbor_graph(data, threshold, n_cg, perm_group, counters=None):
       fp_ca = (np.stack([fp['fp0'], fp['fp1']], axis=1) if n_res == 2
                else fp['fp0'][:, None])
       fp_ca_ca = fp.get('fp2')
-
    bb_arr = data[:, n_cg:]
-   adj = [[] for _ in range(n)]
-   adj_d = [[] for _ in range(n)]
-   pend_i, pend_j, pend_rows = [], [], 0
-   n_perm = len(full_perms)
-   stats = {'fp': 0, 'bb_lb': 0, 'internal_lb': 0, 'exact': 0, 'edges': 0}
+   cutoff = threshold + INTERNAL_DISTANCE_EPS
+
+   stats = {'fp': 0, 'internal_lb': 0, 'bb_lb': 0, 'exact': 0, 'exact_rows': 0,
+            'edges': 0, 'scan_s': 0.0, 'exact_s': 0.0}
+   out_i, out_j = [], []
+   pend_i, pend_j, pend_mask, pend_rows = [], [], [], 0
 
    def _flush():
       nonlocal pend_rows
       if not pend_i:
          return
+      t0 = time.perf_counter()
       qi = np.concatenate(pend_i)
       qj = np.concatenate(pend_j)
-      rmsd = _batched_min_rmsd(data, qi, qj, full_perms, n_total)
-      keep = rmsd <= threshold
-      for a, b, d in zip(qi[keep].tolist(), qj[keep].tolist(),
-                         rmsd[keep].tolist()):
-         adj[a].append(b)
-         adj_d[a].append(d)
-         adj[b].append(a)
-         adj_d[b].append(d)
+      mask = np.concatenate(pend_mask)
+      keep = _masked_min_rmsd(data, qi, qj, mask, full_perms, n_total) <= threshold
+      out_i.append(qi[keep].astype(np.int32))
+      out_j.append(qj[keep].astype(np.int32))
       stats['edges'] += int(keep.sum())
-      pend_i.clear()
-      pend_j.clear()
+      stats['exact_s'] += time.perf_counter() - t0
+      pend_i.clear(); pend_j.clear(); pend_mask.clear()
       pend_rows = 0
 
-   for i in range(n - 1):
+   t_scan = time.perf_counter()
+   for i in range(start, stop):
       cand = np.arange(i + 1, n, dtype=np.intp)
       if fp:
          # A slot relabeling swaps which residue each CA fingerprint belongs to,
@@ -199,70 +240,118 @@ def _stage1_neighbor_graph(data, threshold, n_cg, perm_group, counters=None):
          cand = cand[mask]
       stats['fp'] += cand.size
 
-      if cand.size and n_res == 2:
-         # A single N/CA/C triplet is nearly rigid and does not prune; six atoms
-         # across two residues do.
-         lb = None
-         for bb_perm in bb_perms:
-            ssd = kabsch_ssd(bb_arr[i][bb_perm], bb_arr[cand])
-            cur = np.sqrt(ssd / n_total)
-            lb = cur if lb is None else np.minimum(lb, cur)
-         cand = cand[lb <= threshold + INTERNAL_DISTANCE_EPS]
-      stats['bb_lb'] += cand.size
-
       if cand.size and desc:
-         lb = internal_distance_lower_bounds(i, cand, desc, n_total, perm_group)
-         cand = cand[lb <= threshold + INTERNAL_DISTANCE_EPS]
+         elem_ok = internal_distance_bound_matrix(
+            i, cand, desc, n_total, perm_group) <= cutoff
+         alive = elem_ok.any(axis=1)
+         cand, elem_ok = cand[alive], elem_ok[alive]
+      else:
+         elem_ok = np.ones((cand.size, n_perm), dtype=bool)
       stats['internal_lb'] += cand.size
 
+      if cand.size and n_res == 2:
+         # A single N/CA/C triplet is nearly rigid and does not prune; six atoms
+         # across two residues do. Rejecting a backbone relabeling rejects every
+         # group element that uses it.
+         for bb_perm, elems in zip(bb_perms, elems_of_bb):
+            need = elem_ok[:, elems].any(axis=1)
+            rows = np.flatnonzero(need)
+            if rows.size == 0:
+               continue
+            ssd = kabsch_ssd(bb_arr[i][bb_perm], bb_arr[cand[rows]])
+            reject = rows[np.sqrt(ssd / n_total) > cutoff]
+            elem_ok[np.ix_(reject, elems)] = False
+         alive = elem_ok.any(axis=1)
+         cand, elem_ok = cand[alive], elem_ok[alive]
+      stats['bb_lb'] += cand.size
+
       if cand.size:
+         stats['exact'] += cand.size
+         rows = int(elem_ok.sum())
+         stats['exact_rows'] += rows
          pend_i.append(np.full(cand.size, i, dtype=np.intp))
          pend_j.append(cand)
-         pend_rows += cand.size * n_perm
+         pend_mask.append(elem_ok)
+         pend_rows += rows
          if pend_rows >= _GRAPH_BATCH_ROWS:
             _flush()
    _flush()
-   stats['exact'] = stats['internal_lb']
+   stats['scan_s'] = time.perf_counter() - t_scan - stats['exact_s']
    if counters is not None:
       counters.update(stats)
-   return adj, adj_d
+   if out_i:
+      return np.concatenate(out_i), np.concatenate(out_j)
+   return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32)
 
 
-def get_butina_clusters(cgvdmbb_data, threshold, n_cg_atoms,
-                        cg_symm_perms=None, aa_bucket_parts=(),
-                        counters=None):
-   """Sphere-exclusion clustering of Stage-1 pose geometry.
+def neighbor_csr(n, qi, qj):
+   """Symmetric CSR neighbour lists from lexicographically sorted edges (qi < qj).
+
+   Returns int32 ``(indptr, indices)``. Each row's neighbours come out
+   ascending: the reverse edges are listed first, then the forward ones, and
+   scipy's coo->csr is a counting sort by row that keeps input order within a
+   row. That order is load-bearing -- Stage 2 walks a cluster's members in the
+   order Butina emits them -- and is pinned in tests/test_butina_clustering.py.
+   """
+   qi = np.asarray(qi, dtype=np.int32)
+   qj = np.asarray(qj, dtype=np.int32)
+   rows = np.concatenate([qj, qi])
+   cols = np.concatenate([qi, qj])
+   graph = sparse.coo_matrix(
+      (np.ones(rows.size, dtype=np.int8), (rows, cols)), shape=(n, n)).tocsr()
+   return graph.indptr.astype(np.int32), graph.indices.astype(np.int32)
+
+
+def butina_partition(indptr, indices):
+   """Sphere-exclusion partition of a CSR neighbour graph.
 
    Butina (1999) sphere exclusion -- the same rule as the GROMOS/Daura
-   conformational clustering algorithm: build the exact within-cutoff neighbour
-   graph, then repeatedly take the unassigned vdG with the most neighbours as a
-   representative and assign it together with its still-unassigned neighbours.
+   conformational clustering algorithm: repeatedly take the unassigned vertex
+   with the most neighbours as a representative and assign it together with
+   its still-unassigned neighbours. Returns a list of int32 member arrays, the
+   representative first, in the order clusters were formed.
 
-   Two properties follow, and both are why this replaced the moving-medoid
-   leader pass. Every discarded vdG is within `threshold` of the representative
-   that stands in for it, so the stored radius means something; and the result
-   does not depend on input order, so two fragments' cluster counts are
-   comparable.
+   Every member lies within the cutoff of its representative, and the result
+   does not depend on input order (ties on degree go to the lower index), so
+   two fragments' cluster counts are comparable. The guarantee is on the
+   *radius*, not the diameter: two members may be up to 2*cutoff apart.
+   """
+   n = indptr.size - 1
+   degree = np.diff(indptr)
+   order = np.argsort(-degree, kind='stable')
+   assigned = np.zeros(n, dtype=bool)
+   clusters = []
+   for seed in order.tolist():
+      if assigned[seed]:
+         continue
+      nbrs = indices[indptr[seed]:indptr[seed + 1]]
+      nbrs = nbrs[~assigned[nbrs]]
+      assigned[seed] = True
+      assigned[nbrs] = True
+      members = np.empty(nbrs.size + 1, dtype=np.int32)
+      members[0] = seed
+      members[1:] = nbrs
+      clusters.append(members)
+   return clusters
 
-   Note the guarantee is on the *radius*, not the diameter: two members of one
-   cluster may be up to 2*threshold apart.
 
-   Returns ``(clus_assignments, representatives, radii)``, all keyed by 1-based
-   cluster number, with `radii` giving each cluster's exact pose radius. Only
-   the partition is consumed downstream: Stage 2 re-partitions each cluster and
-   the stored row and radius come from `pose_minimax_prototype` on the resulting
-   subgroup. `representatives`/`radii` are kept because they are free -- both
-   fall out of the loop below -- and are what the sphere-exclusion guarantee
-   above is asserted against in tests/test_butina_clustering.py.
+def get_butina_clusters(cgvdmbb_data, threshold, n_cg_atoms, perm_group,
+                        counters=None):
+   """Stage-1 pose clustering of one bucket in a single process.
+
+   `stage1_edges` over every row, `neighbor_csr`, then `butina_partition`;
+   the driver splits the first of those across processes for large buckets
+   and this is the one-shot path for small ones and for tests. `perm_group`
+   is the caller's, built once per bucket (`build_perm_group`): every stage
+   must minimise over the same group, so no stage builds its own.
 
    Every Stage-1 atom is mandatory, so non-finite input raises here rather than
    being screened out: the fingerprint prefilter compares with ``<=``, which is
    False against NaN, so such a record would be pruned from every candidate list
    and emerge as a *singleton cluster* -- a plausible-looking result that is
    written to the library and only fails much later, inside `kabsch_ssd` at hit
-   finding. Generation already filters these upstream
-   (`clus_and_deduplicate_vdgs._has_complete_stage1_coords`); this makes the
-   invariant local to the algorithm that depends on it.
+   finding. Generation already filters these upstream; this makes the invariant
+   local to the algorithm that depends on it.
    """
    data = np.asarray(cgvdmbb_data, dtype=np.float32)
    n = len(data)
@@ -273,40 +362,11 @@ def get_butina_clusters(cgvdmbb_data, threshold, n_cg_atoms,
          f"{bad.size} of {n} records (first at index {int(bad[0])}); every "
          "Stage-1 atom is mandatory")
    if n == 0:
-      return {}, {}, {}
+      return []
    if n == 1:
-      return {1: [0]}, {1: 0}, {1: 0.0}
-
-   perm_group = build_perm_group(cg_symm_perms, n_cg_atoms, aa_bucket_parts)
-   adj, adj_d = _stage1_neighbor_graph(
-      data, threshold, n_cg_atoms, perm_group, counters=counters)
-
-   degree = np.fromiter((len(a) for a in adj), dtype=np.int64, count=n)
-   # Stable sort on descending degree: ties go to the lower index, so the
-   # partition is reproducible for a given bucket.
-   order = np.argsort(-degree, kind='stable')
-   assigned = np.full(n, -1, dtype=np.int64)
-   reps, members, radii = [], [], []
-   for seed in order.tolist():
-      if assigned[seed] >= 0:
-         continue
-      cnum = len(reps)
-      assigned[seed] = cnum
-      mem, radius = [seed], 0.0
-      for nbr, dist in zip(adj[seed], adj_d[seed]):
-         if assigned[nbr] < 0:
-            assigned[nbr] = cnum
-            mem.append(nbr)
-            if dist > radius:
-               radius = dist
-      reps.append(seed)
-      members.append(mem)
-      radii.append(radius)
-
-   clus_assignments = {c + 1: mem for c, mem in enumerate(members)}
-   representatives = {c + 1: r for c, r in enumerate(reps)}
-   cluster_radii = {c + 1: r for c, r in enumerate(radii)}
-   return clus_assignments, representatives, cluster_radii
+      return [np.zeros(1, dtype=np.int32)]
+   qi, qj = stage1_edges(data, threshold, n_cg_atoms, perm_group, counters=counters)
+   return butina_partition(*neighbor_csr(n, qi, qj))
 
 
 def pose_minimax_prototype(cgvdmbb_data, member_indices, n_cg_atoms,
@@ -764,7 +824,8 @@ def get_vdm_res_features(prody_obj, pdbpath, num_flanking):
       vdm_seg_chain_resnum_resname = get_res_iden(vdm_obj)
       if vdm_seg_chain_resnum_resname is None:
           continue
-      vdm_descript = [vdm_seg_chain_resnum_resname, bb_coords, flanking_seq_dict]
+      vdm_descript = [vdm_seg_chain_resnum_resname, bb_coords, flanking_seq_dict,
+                      get_bb_o_coords(vdm_obj)]
       vdm_AA = vdm_seg_chain_resnum_resname[-1]
       if vdm_resind in vdms_dict:
           raise ValueError(f"Duplicate vdM resindex {vdm_resind} encountered in vdG assembly.")
@@ -794,12 +855,14 @@ def reorder_vdg_subset(vdg_subset, vdms_dict, cg_coords, prody_obj):
    flanking_CA_coords_of_vdms_in_order = []
    seg_ch_res_of_vdms_in_order = []
    slot_flags_of_vdms_in_order = []
+   bb_o_coords_of_vdms_in_order = []
 
    for _vdmresind in vdg_subset:
       vdmAA, vdm_features = vdms_dict[_vdmresind]
-      vdm_seg_chain_resnum_resname, bb_coords, flanking_seq_dict = vdm_features
+      vdm_seg_chain_resnum_resname, bb_coords, flanking_seq_dict, bb_o = vdm_features
       seg_ch_res_of_vdms_in_order.append(vdm_seg_chain_resnum_resname)
       bb_coords_of_vdms_in_order.append(bb_coords)
+      bb_o_coords_of_vdms_in_order.append(bb_o)
 
       sorted_flank_indices = sorted(list(flanking_seq_dict.keys()))
       _vdg_seg, _vdg_ch, _vdg_resnum, _vdg_resname = vdm_seg_chain_resnum_resname
@@ -892,7 +955,8 @@ def reorder_vdg_subset(vdg_subset, vdms_dict, cg_coords, prody_obj):
    # (entries 0 and 1) is unaffected.
    super_list = [aas_of_vdms_in_order, bb_coords_of_vdms_in_order,
                  flankingseqs_of_vdms_in_order, flanking_CA_coords_of_vdms_in_order,
-                 seg_ch_res_of_vdms_in_order, slot_flags_of_vdms_in_order]
+                 seg_ch_res_of_vdms_in_order, slot_flags_of_vdms_in_order,
+                 bb_o_coords_of_vdms_in_order]
    return sort_vdGs_by_AA(super_list)
 
 def sort_vdGs_by_AA(super_list):

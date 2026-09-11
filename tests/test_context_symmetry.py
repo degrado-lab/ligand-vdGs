@@ -10,6 +10,7 @@ import numpy as np
 
 from ligand_vdgs.functions import align_and_cluster
 from ligand_vdgs.functions import utils
+from ligand_vdgs.functions.vdg_fp_utils import build_perm_group
 
 PHOSPHATE = "O=P(O)(O)O"  # slots: [O(=), P, O, O, O]
 
@@ -74,10 +75,9 @@ class ButinaWiringTests(unittest.TestCase):
         self.perms = _phosphate_perms()
 
     def _cluster(self, perms="default"):
-        clusters, _reps, _radii = align_and_cluster.get_butina_clusters(
-            self.data, 0.5, self.n_cg,
-            cg_symm_perms=self.perms if perms == "default" else perms,
-            aa_bucket_parts=["ALA"])
+        clusters = align_and_cluster.get_butina_clusters(
+            self.data, 0.5, self.n_cg, build_perm_group(
+                self.perms if perms == "default" else perms, self.n_cg, ["ALA"]))
         return clusters
 
     def test_the_relabelled_pair_merges(self):

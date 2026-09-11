@@ -5,12 +5,14 @@ These are deliberately crude: they compare residue numbers/names rather than
 geometry, to shrink the database cheaply before prepwizard/probe. Redundancy is
 refined properly later, during vdG generation.
 '''
+from ligand_vdgs.functions import parent_db
 
 
 def check_pdbnames(pdbfile1, pdbfile2):
     '''True if two PDB filenames share >=3 of their 4 accession characters,
     i.e. they were likely deposited as part of the same project.'''
-    pdbacc1, pdbacc2 = pdbfile1[:4], pdbfile2[:4]
+    pdbacc1 = parent_db.entry_of(parent_db.stem_of(pdbfile1))
+    pdbacc2 = parent_db.entry_of(parent_db.stem_of(pdbfile2))
     num_matches = sum(1 for c1, c2 in zip(pdbacc1, pdbacc2) if c1 == c2)
     return num_matches >= 3
 

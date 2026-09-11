@@ -97,9 +97,12 @@ def get_nr_res_interactions_with_ligs_in_pdb(ligand, atoms, dist_cutoff=4.8,
     return ligand_networks
 
 
-def add_pdb_to_nr_db_dict(database_dict, pdbpath, lig_bfactor_cutoff):
+def add_pdb_to_nr_db_dict(database_dict, pdbpath, lig_bfactor_cutoff, atoms=None):
     '''
     Select each ligand and determine what chains it interacts with. 
+
+    *atoms* is the parsed structure; when None it is parsed from pdbpath. s01 passes
+    it pre-parsed so that chain IDs are remapped first (see preprocessing/_chain_ids).
     
     Store the ligs (seg/chain/resnum) and interacting residues in a dict to further
     reduce the database size by making a guess at whether monomers within a pdb are redundant
@@ -120,7 +123,8 @@ def add_pdb_to_nr_db_dict(database_dict, pdbpath, lig_bfactor_cutoff):
         return database_dict
     
     # Identify ligand(s)
-    atoms = pr.parsePDB(pdbpath)
+    if atoms is None:
+        atoms = pr.parsePDB(pdbpath)
     if atoms is None:
         print('[ERROR] ProDy could not parse:', pdbpath)
         return database_dict

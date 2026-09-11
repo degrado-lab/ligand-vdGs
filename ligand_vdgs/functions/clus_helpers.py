@@ -4,140 +4,171 @@ import os
 import numpy as np
 from itertools import combinations
 import getpass
-from ligand_vdgs.functions.vdg_struct_utils import FLANK_UNCOMPARABLE
+from ligand_vdgs.functions.vdg_struct_utils import (FLANK_UNCOMPARABLE,
+    is_valid_backbone_coords)
 
-# Field layout of the per-vdG record lists passed to unpack_vdg_records.
-# The producer (clus_and_deduplicate_vdgs._load_bucket) builds records in this
-# order; both sides index through these names so adding a field can't silently
-# shift the positional reads below.
-VDG_FIELDS = ("cg_coords", "bbcoords", "flankseqs", "flankCAs", "pdbpath", "scrr",
-              "cg_names", "cg_elements", "cg_seg", "cg_chain", "cg_resnum",
-              "cg_resname", "slot_flags",
-              "cg_max_b", "cg_min_occ", "vdm_max_b", "vdm_min_occ")
-(F_CG_COORDS, F_BBCOORDS, F_FLANKSEQS, F_FLANKCAS, F_PDBPATH, F_SCRR,
- F_CG_NAMES, F_CG_ELEMENTS, F_CG_SEG, F_CG_CHAIN, F_CG_RESNUM,
- F_CG_RESNAME, F_SLOT_FLAGS,
- F_CG_MAX_B, F_CG_MIN_OCC, F_VDM_MAX_B, F_VDM_MIN_OCC) = range(len(VDG_FIELDS))
+# One AA-composition bucket is a set of equal-length columns, one row per vdG.
+# The Stage-1 array lives in its own .npy so clustering workers can mmap it;
+# everything else is one npz. Shards flushed by streaming workers hold all
+# columns in one npz and are concatenated at merge.
+STAGE1_FILE = "cgvdmbb.npy"
+COLUMNS_FILE = "columns.npz"
+COLUMN_DTYPES = {
+    "cgvdmbb": np.float32,      # (N, n_cg + 3*n_res, 3): CG | N,CA,C per slot
+    "flank_ca": np.float32,     # (N, n_res*(2*flank+1), 3), NaN where unreadable
+    "flank_seq": "U4",          # (N, n_res*(2*flank+1)) resname / '-' / '!' / 'vdm'
+    "biounit": "U32",           # (N,) parent stem (parent_db)
+    "scrr_seg": "U8", "scrr_chain": "U2", "scrr_resnum": np.int32, "scrr_resname": "U4",
+    "cg_names": "U4", "cg_elements": "U2",
+    "cg_seg": "U8", "cg_chain": "U2", "cg_resnum": np.int32, "cg_resname": "U4",
+    "slot_flags": np.int8,      # (N, n_res) SLOT_* codes
+    "quality": np.float32,      # (N, 4) cg_max_b, cg_min_occ, vdm_max_b, vdm_min_occ
+    "vdm_o": np.float32,        # (N, n_res, 3) backbone carbonyl O per slot, NaN when
+                                # absent. Not a Stage-1 atom: never in cgvdmbb / RMSD.
+}
 
-def unpack_vdg_records(_vdgs):
-    """Transpose per-vdG records into one list per VDG_FIELDS column.
 
-    Each ``_vdg`` is a list whose field order is ``VDG_FIELDS`` (indexed here
-    through the ``F_*`` constants, not literal positions):
+def stage1_record_is_complete(record, n_cg, n_res):
+    """Whether a streamed record has every mandatory finite Stage-1 atom."""
+    cg = np.asarray(record["cg_coords"], dtype=np.float32)
+    bb = np.asarray(record["bbcoords"], dtype=np.float32)
+    if cg.shape != (n_cg, 3) or not np.isfinite(cg).all():
+        return False
+    if bb.shape != (n_res, 3, 3):
+        return False
+    return all(is_valid_backbone_coords(res) for res in bb)
 
-        [cg_coords, bbcoords, flankseqs, flankCAs, pdbpath, scrr,
-         cg_names, cg_elements, cg_seg, cg_chain, cg_resnum, cg_resname,
-         slot_flags, cg_max_b, cg_min_occ, vdm_max_b, vdm_min_occ]
 
-    ``slot_flags`` is the per-vdM-slot provenance code (``SLOT_*`` in
-    vdg_struct_utils), stored in the same slot order as ``scrr``. The four
-    trailing quality fields are returned as one ``out_quality`` tuple per record,
-    so the output has one column fewer than ``VDG_FIELDS`` has fields.
+def records_to_columns(records):
+    """Columns from the per-vdG dicts a streaming worker buffers.
 
-    Interchangeable same-label vdM slots are **not** expanded into duplicate
-    records here. Stage-1 clustering minimises over slot orderings inside its
-    distance instead (``vdg_fp_utils.build_perm_group``), which keeps one
-    physical environment per record -- so a vdG cannot land in two clusters, and
-    no post-hoc union is needed to put the copies back together.
-
-    CG atoms remain in the SMARTS-slot order assigned upstream. Every per-vdG
-    sequence in the returned tuple is a fresh object, so no two output records
-    share a mutable list.
+    A record carries ``cg_coords`` (n_cg, 3), ``bbcoords`` (n_res, 3, 3),
+    ``flankseqs``/``flankCAs`` (n_res lists of 2*flank+1 tokens / coords),
+    ``biounit``, ``scrr`` (n_res of [seg, chain, resnum, resname]),
+    ``cg_names``, ``cg_elements``, ``cg_seg``, ``cg_chain``, ``cg_resnum``,
+    ``cg_resname``, ``slot_flags`` (n_res), ``quality`` (4) and ``bbo`` (n_res
+    carbonyl-O coords, NaN where absent). Every record in a
+    bucket has the same shape; a ragged one raises here rather than surfacing as
+    a broadcast error.
     """
-    for i, _vdg in enumerate(_vdgs):
-        if len(_vdg) != len(VDG_FIELDS):
-            raise ValueError(
-                f"vdG record {i} has {len(_vdg)} fields, expected "
-                f"{len(VDG_FIELDS)} ({', '.join(VDG_FIELDS)})")
+    n = len(records)
+    r0 = records[0]
+    n_cg, n_res = len(r0["cg_coords"]), len(r0["bbcoords"])
+    n_flank = n_res * len(r0["flankseqs"][0])
+    cols = {
+        "cgvdmbb": np.empty((n, n_cg + 3 * n_res, 3), dtype=np.float32),
+        "flank_ca": np.empty((n, n_flank, 3), dtype=np.float32),
+        "flank_seq": np.empty((n, n_flank), dtype="U4"),
+        "biounit": np.empty(n, dtype="U32"),
+        "scrr_seg": np.empty((n, n_res), dtype="U8"),
+        "scrr_chain": np.empty((n, n_res), dtype="U2"),
+        "scrr_resnum": np.empty((n, n_res), dtype=np.int32),
+        "scrr_resname": np.empty((n, n_res), dtype="U4"),
+        "cg_names": np.empty((n, n_cg), dtype="U4"),
+        "cg_elements": np.empty((n, n_cg), dtype="U2"),
+        "cg_seg": np.empty(n, dtype="U8"),
+        "cg_chain": np.empty(n, dtype="U2"),
+        "cg_resnum": np.empty(n, dtype=np.int32),
+        "cg_resname": np.empty(n, dtype="U4"),
+        "slot_flags": np.empty((n, n_res), dtype=np.int8),
+        "quality": np.empty((n, 4), dtype=np.float32),
+        "vdm_o": np.empty((n, n_res, 3), dtype=np.float32),
+    }
+    longest = {key: 0 for key, arr in cols.items() if arr.dtype.kind == "U"}
+    for k, rec in enumerate(records):
+        try:
+            cols["cgvdmbb"][k, :n_cg] = rec["cg_coords"]
+            cols["cgvdmbb"][k, n_cg:] = np.asarray(
+                rec["bbcoords"], dtype=np.float32).reshape(3 * n_res, 3)
+            cols["flank_ca"][k] = np.asarray(
+                rec["flankCAs"], dtype=np.float32).reshape(n_flank, 3)
+            tokens = [tok for res in rec["flankseqs"] for tok in res]
+            cols["flank_seq"][k] = tokens
+            longest["flank_seq"] = max(longest["flank_seq"], *map(len, tokens))
+            for j, (seg, chain, resnum, resname) in enumerate(rec["scrr"]):
+                cols["scrr_seg"][k, j] = seg
+                cols["scrr_chain"][k, j] = chain
+                cols["scrr_resnum"][k, j] = resnum
+                cols["scrr_resname"][k, j] = resname
+                longest["scrr_seg"] = max(longest["scrr_seg"], len(seg))
+                longest["scrr_chain"] = max(longest["scrr_chain"], len(chain))
+                longest["scrr_resname"] = max(longest["scrr_resname"], len(resname))
+            cols["cg_names"][k] = rec["cg_names"]
+            cols["cg_elements"][k] = rec["cg_elements"]
+            longest["cg_names"] = max(longest["cg_names"], *map(len, rec["cg_names"]))
+            longest["cg_elements"] = max(longest["cg_elements"],
+                                         *map(len, rec["cg_elements"]))
+            cols["slot_flags"][k] = rec["slot_flags"]
+            cols["quality"][k] = rec["quality"]
+            cols["vdm_o"][k] = np.asarray(rec["bbo"], dtype=np.float32).reshape(n_res, 3)
+        except ValueError as exc:
+            raise ValueError(f"vdG record {k} does not match record 0's shape "
+                             f"(n_cg={n_cg}, n_res={n_res}, flank={n_flank}): {exc}")
+        cols["cg_resnum"][k] = rec["cg_resnum"]
+        for key in ("biounit", "cg_seg", "cg_chain", "cg_resname"):
+            cols[key][k] = rec[key]
+            longest[key] = max(longest[key], len(rec[key]))
+    _check_widths(cols, longest)
+    return cols
 
-    total = len(_vdgs)
-    out_coords   = [None] * total
-    out_bb       = [None] * total
-    out_seqs     = [None] * total
-    out_CAs      = [None] * total
-    out_pdbs     = [None] * total
-    out_scrr     = [None] * total
-    out_names    = [None] * total
-    out_elements = [None] * total
-    out_seg      = [None] * total
-    out_chain    = [None] * total
-    out_resnum   = [None] * total
-    out_resname  = [None] * total
-    out_flags    = [None] * total
-    out_quality  = [None] * total
 
-    for idx, _vdg in enumerate(_vdgs):
-        out_coords[idx]   = np.array(_vdg[F_CG_COORDS], dtype=np.float32)
-        out_bb[idx]       = list(_vdg[F_BBCOORDS])
-        out_seqs[idx]     = list(_vdg[F_FLANKSEQS])
-        out_CAs[idx]      = list(_vdg[F_FLANKCAS])
-        out_pdbs[idx]     = _vdg[F_PDBPATH]
-        out_scrr[idx]     = list(_vdg[F_SCRR])
-        out_names[idx]    = list(_vdg[F_CG_NAMES])
-        out_elements[idx] = list(_vdg[F_CG_ELEMENTS])
-        # Scalars: one residue per CG, so a slot ordering cannot change them.
-        out_seg[idx]      = _vdg[F_CG_SEG]
-        out_chain[idx]    = _vdg[F_CG_CHAIN]
-        out_resnum[idx]   = _vdg[F_CG_RESNUM]
-        out_resname[idx]  = _vdg[F_CG_RESNAME]
-        out_flags[idx]    = list(_vdg[F_SLOT_FLAGS])
-        # Measured B-factor/occupancy over the atoms that enter this vdG, kept
-        # per record so a stricter cut can be applied without re-mining.
-        out_quality[idx]  = (float(_vdg[F_CG_MAX_B]), float(_vdg[F_CG_MIN_OCC]),
-                             float(_vdg[F_VDM_MAX_B]), float(_vdg[F_VDM_MIN_OCC]))
-
-    return (out_coords, out_bb, out_seqs, out_CAs, out_pdbs,
-            out_scrr, out_names, out_elements, out_seg, out_chain,
-            out_resnum, out_resname, out_flags, out_quality)
+def _check_widths(cols, longest):
+    """Fixed-width unicode assignment truncates silently, and a clipped biounit
+    stem or label cannot be told from a real one afterwards, so the raw string
+    lengths are checked against the dtype width."""
+    for key, length in longest.items():
+        width = cols[key].dtype.itemsize // 4
+        if length > width:
+            raise ValueError(f"column {key!r} holds a {length}-char value at "
+                             f"dtype width {width}; widen COLUMN_DTYPES")
 
 
-def combine_cg_and_vdmbb_coords(all_cg, all_vdmbb):
-    """Stack each vdG's CG coords and flattened vdM backbone into one (n, n_cg+n_bb, 3) array.
+def concat_columns(parts):
+    return {key: np.concatenate([part[key] for part in parts]) for key in parts[0]}
 
-    Atom counts are taken from record 0 and every other record must match it; a
-    ragged input is reported here rather than as a numpy broadcast error from the
-    assignment below.
-    """
-    if not all_cg:
-        return []
-    if len(all_vdmbb) != len(all_cg):
-        raise ValueError(
-            f"combine_cg_and_vdmbb_coords: {len(all_cg)} CG records vs "
-            f"{len(all_vdmbb)} vdM-backbone records")
-    n = len(all_cg)
-    n_cg = len(all_cg[0])
-    n_vdms = len(all_vdmbb[0])
-    n_bb = n_vdms * 3  # num_vdms × 3 backbone atoms (N, CA, C)
-    out = np.empty((n, n_cg + n_bb, 3), dtype=np.float32)
-    for i, (_cg, _vdmbb) in enumerate(zip(all_cg, all_vdmbb)):
-        if len(_cg) != n_cg or len(_vdmbb) != n_vdms:
-            raise ValueError(
-                f"combine_cg_and_vdmbb_coords: record {i} has {len(_cg)} CG atoms "
-                f"and {len(_vdmbb)} vdMs, expected {n_cg} and {n_vdms} (from record 0)")
-        out[i, :n_cg] = np.asarray(_cg, dtype=np.float32)
-        out[i, n_cg:] = np.asarray([atom for res in _vdmbb for atom in res], dtype=np.float32)
-    return out
 
-def flatten_flanking_CAs(cgvdmbb_clus_flankingCAs):
-    cgvdmbb_clus_flat_flankCAs = []
-    for vdg_flankingCAs in cgvdmbb_clus_flankingCAs:
-        # `vdg_flankingCAs` is a list of vdm residues, so flatten it
-        flat_flanking_CAs = []
-        for res in vdg_flankingCAs:
-            for CA_coord in res:
-                flat_flanking_CAs.append(np.asarray(CA_coord, dtype=np.float32))
-        cgvdmbb_clus_flat_flankCAs.append(flat_flanking_CAs)
-    return cgvdmbb_clus_flat_flankCAs
+def _replace_into(path, write):
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "wb") as handle:
+            write(handle)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
 
-def flatten_flanking_seqs(flankingCAs_clus_flankingseqs):
-    flattened_flankingseqs_for_vdgs_in_flankingCA_clus = []
-    for vdg_flankingseq in flankingCAs_clus_flankingseqs:
-        flat_vdg_flankingseq = []
-        for vdm_res in vdg_flankingseq:
-            flat_vdg_flankingseq += vdm_res
-        flattened_flankingseqs_for_vdgs_in_flankingCA_clus.append(
-            flat_vdg_flankingseq)
-    return flattened_flankingseqs_for_vdgs_in_flankingCA_clus
+
+def save_shard(path, cols):
+    """One npz holding every column; written whole or not at all."""
+    _replace_into(path, lambda handle: np.savez(handle, **cols))
+
+
+def load_shard(path):
+    with np.load(path) as data:
+        return {key: data[key] for key in data.files}
+
+
+def save_columns(bucket_dir, cols):
+    """The merged bucket: STAGE1_FILE as a bare .npy, the rest in COLUMNS_FILE."""
+    os.makedirs(bucket_dir, exist_ok=True)
+    _replace_into(os.path.join(bucket_dir, STAGE1_FILE),
+                  lambda handle: np.save(handle, cols["cgvdmbb"]))
+    rest = {key: arr for key, arr in cols.items() if key != "cgvdmbb"}
+    _replace_into(os.path.join(bucket_dir, COLUMNS_FILE),
+                  lambda handle: np.savez(handle, **rest))
+
+
+def load_stage1(bucket_dir, mmap=True):
+    return np.load(os.path.join(bucket_dir, STAGE1_FILE),
+                   mmap_mode="r" if mmap else None)
+
+
+def load_columns(bucket_dir, mmap_stage1=False):
+    cols = load_shard(os.path.join(bucket_dir, COLUMNS_FILE))
+    cols["cgvdmbb"] = load_stage1(bucket_dir, mmap=mmap_stage1)
+    return cols
+
 
 def calc_seq_similarity(list1, list2, missing_similarity=0.0):
     """Return coverage-adjusted percent identity for flanking residues.

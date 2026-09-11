@@ -35,6 +35,10 @@ Once your source PDBs are in the right layout, complete Steps 1–3 in order bef
 
 - **Step 1 (`s01_trim_database.py`) — Prune the database (optional, recommended).** Run [`ligand-vdGs/ligand_vdgs/preprocessing/s01_trim_database.py`](../ligand_vdgs/preprocessing/s01_trim_database.py) to filter by ligand b-factor and extract 20 Å binding-site regions (the `radius` constant; 20 Å is the smallest sphere that keeps a ligand's *third* coordination shell, which is what Step 2's protonation needs — 10 Å kept only 8% of it), reducing database size and removing redundant structures. It has no CLI: the input/output directories, b-factor cutoff and `skip_to_output_pdbs` switch are module-level constants at the top of the script. The dedup pass writes a database JSON that the trimming pass then reads, so a fresh database needs `skip_to_output_pdbs = False` on the first run. The pipeline works without this step, but skipping it means running on full PDB files (slower, larger, and noisier). If you run it, use the output as `-p` in Step 5 below; otherwise use the formatted database from above.
 
+  Before parsing each file, this step rewrites two-character chain IDs (columns 21-22) to unique single characters and turns peptide-bonded HETATM amino acids into ATOM records (`_chain_ids.remap_chain_ids`, `_prep_filters.embedded_amino_acid_hetatm_to_atom`); the chain mapping is kept as `REMARK 900` lines in the output. Both must happen on the text, before ProDy sees it -- see "Chain IDs are one column" in [`pitfalls.md`](pitfalls.md). A database trimmed before this fix can be repaired with `scripts/remap_chain_ids.py` (into a new directory; re-run Step 3 on the repaired files).
+
+  It also handles modified residues, which prepwizard used to rename to their parent amino acid (`_prep_filters.modified_residues_to_protein`): MSE/SEC become MET/CYS (keeping `SE`), and every other chain-bonded HETATM residue whose CCD type is `*PEPTIDE LINKING` (KCX, SEP, LLP, ...) becomes an ATOM record under its own resname, so it is neither mined as a ligand nor accepted as a slot; covalent cofactors (`NON-POLYMER`: PLP, HEM, SAM) stay HETATM ligands. This needs `resources/ccd_polymer_types.tsv`; regenerate it on a login node with `python scripts/fetch_ccd_polymer_types.py` if your database uses CCD entries newer than the table (s01 prints the resnames it did not find). Without the table s01 warns and only the renames happen. See "Modified residues" in [`pitfalls.md`](pitfalls.md).
+
   This step also drops the residues prepwizard mangles (`_prep_filters.drop_prepwizard_hazard_residues`): amino acid residues missing any of N, CA or C, and one-atom HET residues whose single heavy atom is carbon. Step 2 applies the same filter, so it holds even if you skip Step 1. Prepwizard cannot build an amino acid from a lone backbone N, and re-emits that orphan atom under a *ligand's* resname, chain and resnum, giving that ligand a stray atom tens of Å from the rest of the residue. See "Prepwizard relabels atoms it cannot build as part of a ligand" in [`pitfalls.md`](pitfalls.md).
 
 - **Step 2 (`s02_run_prepwizard.sh`) — Add hydrogens.** The pipeline requires hydrogens to be present in every PDB. This step re-applies the Step 1 filter (so it holds if you skipped Step 1) and, afterwards, restores any free ligand PrepWizard renamed into a protein residue — see [`pitfalls.md`](pitfalls.md). Use [Reduce2](https://github.com/cctbx/cctbx_project/tree/master/mmtbx/reduce) (open-source) or Schrödinger's PrepWizard (more accurate, requires a license). [`s02_run_prepwizard.sh`](../ligand_vdgs/preprocessing/s02_run_prepwizard.sh) is an array job that runs `_protonate_pdbs.py` in batches; the input/output directories and prepwizard path are module-level constants in `_protonate_pdbs.py` (its only CLI flag is `--batch_index`). **The batch count lives in two independent places and must be kept in sync by hand:** the array task count is positional `$1` to the shell script, while `num_batches_total = 15` is a constant in `_protonate_pdbs.py`. If they disagree the database is silently mis-partitioned — tasks either overlap or leave subdirectories unprotonated — so pass the same number:
@@ -232,7 +236,10 @@ Use [`extract_fragment_smiles.py`](../ligand_vdgs/generate_vdgs/extract_fragment
 to write a scheduler-agnostic one-column work list. It applies the same selection
 rule as the SGE path—in fact both call the same `select_fragments()`—and emits one
 fragment SMARTS per line, plus the alias map next to it as
-`<output stem>_aliases.tsv`:
+`<output stem>_aliases.tsv` (columns `alias`, `representative`, `kind`; `kind=promoted`
+marks a representative that is the charge-stripped SMARTS of its aliases and is not
+itself a frags-dict key — trace it with `scripts/lookup_fragment_key.py`; see
+docs/pitfalls.md "Protonation variants are collapsed"):
 
 ```bash
 python ligand_vdgs/generate_vdgs/extract_fragment_smiles.py \
@@ -328,6 +335,25 @@ the contacting residues' heavy atoms. Mining applies only a loose floor, so a
 stricter cut is a read-path decision rather than a reason to re-mine.
 
 These files are the input to the hit-finding step.
+
+#### When to run the H-class diagnostic
+
+Run [`h_class_diagnostic.py`](../ligand_vdgs/tools/h_class_diagnostic.py) after every
+full library build or rebuild, and again whenever the fragment key scheme changes,
+before deciding which `H0`/`!H0` key variants downstream code should pool at read
+time. It reads the per-observation H-class fields each bucket stores next to its
+row arrays -- `nr_cg_heavy_degree`, `nr_cg_num_h`, `mem_cg_heavy_degree`,
+`mem_cg_num_h` (int8, one column per CG atom); `--dry-run` only checks that a
+library carries them. Writer contract: an atom that could not be read gets a
+**negative** value in both fields; 0 is a real count and must never stand for
+"unreadable" (the diagnostic errors on any `heavy_degree == 0`). The writer also
+stores `nr_vdm_o_coords` (n_nr, num_vdms, 3), the backbone carbonyl O per vdM slot
+in the same frame as `nr_vdm_bb_coords` (NaN where absent), kept out of every RMSD; with it,
+`--contact-atoms N,CA,C,O` measures real C···O contacts.
+
+```bash
+python ligand_vdgs/tools/h_class_diagnostic.py --lib <vdg_library> --out h_class.tsv
+```
 
 ## Inspect the Library
 

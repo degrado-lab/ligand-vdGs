@@ -126,3 +126,103 @@ class PrepFilterTestCase(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ModifiedResidueTests(unittest.TestCase):
+    """Rebuild without prepwizard: modified residues must become protein records, not
+    ligands (see _prep_filters.modified_residues_to_protein)."""
+
+    CCD = {'KCX': 'L-PEPTIDE LINKING', 'DCY': 'D-PEPTIDE LINKING', 'PLP': 'NON-POLYMER',
+           'SAM': 'NON-POLYMER', '04C': 'peptide-like', 'HOH': 'NON-POLYMER'}
+
+    @staticmethod
+    def _res(serial, resname, chain, resnum, x0, names, het, extra=()):
+        """N, CA, C along x at 1.3 A so residue i's C is 1.3 A from residue i+1's N when
+        consecutive residues start 3.9 A apart; *extra* = [(name, element, dx, dy)]."""
+        lines = [_atom(serial + i, n, resname, chain, resnum, (x0 + 1.3 * i, 0.0, 0.0),
+                       n[0], het) for i, n in enumerate(names)]
+        for j, (n, el, dx, dy) in enumerate(extra):
+            lines.append(_atom(serial + len(names) + j, n, resname, chain, resnum,
+                               (x0 + dx, dy, 0.0), el, het))
+        return lines
+
+    def _structure(self):
+        from ligand_vdgs.preprocessing._prep_filters import modified_residues_to_protein
+        L = []
+        bb = ['N', 'CA', 'C']
+        # chain A: ALA - MSE(het) - KCX(het, carbamate on NZ) - ALA - SEC(het) - DCY(het)
+        L += self._res(1, 'ALA', 'A', 1, 0.0, bb, False)
+        L += self._res(10, 'MSE', 'A', 2, 3.9, bb, True, [('SE', 'SE', 1.3, 2.0)])
+        L += self._res(20, 'KCX', 'A', 3, 7.8, bb, True, [('NZ', 'N', 1.3, 4.0),
+                                                         ('CX', 'C', 1.3, 5.3)])
+        L += self._res(30, 'ALA', 'A', 4, 11.7, bb, False)
+        L += self._res(40, 'SEC', 'A', 5, 15.6, bb, True, [('SE', 'SE', 1.3, 2.0)])
+        L += self._res(50, 'DCY', 'A', 6, 19.5, bb, True, [('SG', 'S', 1.3, 2.0)])
+        # PLP covalently on KCX-adjacent lysine-like N: 1.5 A from KCX NZ, NON-POLYMER
+        L += [_atom(60, 'C4A', 'PLP', 'A', 301, (9.1, 5.5, 0.0), 'C', True),
+              _atom(61, 'N1', 'PLP', 'A', 301, (9.1, 6.8, 0.0), 'N', True)]
+        # SAM ligand with N/CA/C names, 1.6 A from ALA 4's C: cofactor, stays HETATM
+        L += self._res(70, 'SAM', 'A', 302, 14.3 + 1.6, ['N', 'CA', 'C'], True)
+        # free MSE ligand with OXT far away: selenomethionine ligand, stays HETATM
+        L += self._res(80, 'MSE', 'B', 1, 100.0, bb + ['OXT'], True,
+                       [('SE', 'SE', 1.3, 2.0)])
+        # free KCX ligand (not bonded to anything standard): stays HETATM
+        L += self._res(90, 'KCX', 'C', 1, 200.0, bb + ['OXT'], True)
+        # unknown resname bonded to ALA 1's N: left alone, reported
+        L += [_atom(99, 'C1', 'ZZZ', 'A', 401, (-1.5, 0.0, 0.0), 'C', True)]
+        # peptide-like ligand bonded to protein (covalent inhibitor): stays HETATM
+        L += [_atom(100, 'C1', '04C', 'A', 402, (1.3, -1.5, 0.0), 'C', True)]
+        L += [_atom(101, 'O', 'HOH', 'W', 1, (50.0, 50.0, 0.0), 'O', True)]
+        return L, modified_residues_to_protein(L, self.CCD)
+
+    def test_records_and_resnames(self):
+        _, (new, stats) = self._structure()
+        rec = {}
+        for l in new:
+            if l[:6] in ('ATOM  ', 'HETATM'):
+                rec[(l[21], int(l[22:26]))] = (l[:6].strip(), l[17:20], l[12:16].strip())
+        names = {k: set() for k in rec}
+        for l in new:
+            if l[:6] in ('ATOM  ', 'HETATM'):
+                names[(l[21], int(l[22:26]))].add(l[12:16].strip())
+        self.assertEqual(rec[('A', 2)][:2], ('ATOM', 'MET'))      # MSE bonded
+        self.assertIn('SE', names[('A', 2)])                       # SE kept, not SD
+        self.assertEqual(rec[('A', 3)][:2], ('ATOM', 'KCX'))      # own resname kept
+        self.assertEqual(rec[('A', 5)][:2], ('ATOM', 'CYS'))      # SEC bonded
+        self.assertEqual(rec[('A', 6)][:2], ('ATOM', 'DCY'))      # D-peptide linking
+        self.assertEqual(rec[('A', 301)][:2], ('HETATM', 'PLP'))  # cofactor
+        self.assertEqual(rec[('A', 302)][:2], ('HETATM', 'SAM'))  # N/CA/C names, non-polymer
+        self.assertEqual(rec[('B', 1)][:2], ('HETATM', 'MET'))    # free Se-Met ligand
+        self.assertEqual(rec[('C', 1)][:2], ('HETATM', 'KCX'))    # free ncAA ligand
+        self.assertEqual(rec[('A', 401)][:2], ('HETATM', 'ZZZ'))  # unknown
+        self.assertEqual(rec[('A', 402)][:2], ('HETATM', '04C'))  # peptide-like
+        self.assertEqual(rec[('W', 1)][:2], ('HETATM', 'HOH'))
+        self.assertEqual(stats, {'renamed': 3, 'amino_acids_to_atom': 2,
+                                 'modres_to_atom': 2, 'unknown_resnames': ['ZZZ']})
+
+    def test_only_record_and_resname_columns_change(self):
+        old, (new, _) = self._structure()
+        self.assertEqual(len(old), len(new))
+        for a, b in zip(old, new):
+            self.assertEqual(a[20:], b[20:])
+            self.assertEqual(a[6:17], b[6:17])
+
+    def test_missing_table_means_no_conversion_but_renames_still_happen(self):
+        from ligand_vdgs.preprocessing._prep_filters import (
+            load_ccd_polymer_types, modified_residues_to_protein)
+        self.assertEqual(load_ccd_polymer_types('/nonexistent/ccd.tsv'), {})
+        old, _ = self._structure()
+        new, stats = modified_residues_to_protein(old, {})
+        self.assertEqual(stats['renamed'], 3)
+        self.assertEqual(stats['modres_to_atom'], 0)
+        self.assertIn('KCX', stats['unknown_resnames'])
+        kcx = [l for l in new if l[17:20] == 'KCX' and l[21] == 'A']
+        self.assertTrue(all(l.startswith('HETATM') for l in kcx))
+
+    def test_nothing_to_do_returns_equal_lines(self):
+        from ligand_vdgs.preprocessing._prep_filters import modified_residues_to_protein
+        lines = self._res(1, 'ALA', 'A', 1, 0.0, ['N', 'CA', 'C'], False)
+        new, stats = modified_residues_to_protein(lines, self.CCD)
+        self.assertEqual(new, lines)
+        self.assertEqual(stats, {'renamed': 0, 'amino_acids_to_atom': 0,
+                                 'modres_to_atom': 0, 'unknown_resnames': []})

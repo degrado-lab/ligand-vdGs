@@ -6,9 +6,7 @@ from ligand_vdgs.functions import align_and_cluster
 from ligand_vdgs.functions import clus_helpers
 from ligand_vdgs.functions.vdg_struct_utils import (FLANK_CHAIN_BREAK,
     FLANK_MISSING, is_valid_backbone_coords)
-from ligand_vdgs.generate_vdgs.clus_and_deduplicate_vdgs import (
-    _has_complete_stage1_coords,
-)
+from ligand_vdgs.functions.clus_helpers import stage1_record_is_complete
 
 
 class MissingDataClusteringTests(unittest.TestCase):
@@ -106,23 +104,23 @@ class MissingDataClusteringTests(unittest.TestCase):
             [0.551, 1.422, 0.0],
         ], dtype=np.float32)
 
+        def rec(cg_coords, bb):
+            return {"cg_coords": cg_coords, "bbcoords": [bb]}
+
         self.assertTrue(is_valid_backbone_coords(backbone))
-        self.assertTrue(_has_complete_stage1_coords(
-            [cg, [backbone]], expected_n_cg=2, expected_num_vdms=1))
+        self.assertTrue(stage1_record_is_complete(rec(cg, backbone), 2, 1))
 
         collinear = backbone.copy()
         collinear[:, 1] = 0.0
         self.assertFalse(is_valid_backbone_coords(collinear))
-        self.assertFalse(_has_complete_stage1_coords(
-            [cg, [collinear]], expected_n_cg=2, expected_num_vdms=1))
+        self.assertFalse(stage1_record_is_complete(rec(cg, collinear), 2, 1))
 
         non_finite = backbone.copy()
         non_finite[0, 0] = np.nan
-        self.assertFalse(_has_complete_stage1_coords(
-            [cg, [non_finite]], expected_n_cg=2, expected_num_vdms=1))
+        self.assertFalse(stage1_record_is_complete(rec(cg, non_finite), 2, 1))
 
-        self.assertFalse(_has_complete_stage1_coords(
-            [cg[:1], [backbone]], expected_n_cg=2, expected_num_vdms=1))
+        self.assertFalse(stage1_record_is_complete(rec(cg[:1], backbone), 2, 1))
+        self.assertFalse(stage1_record_is_complete(rec(cg, backbone), 2, 2))
 
 
 if __name__ == "__main__":

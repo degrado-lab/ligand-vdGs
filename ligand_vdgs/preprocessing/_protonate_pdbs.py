@@ -29,7 +29,8 @@ import sys
 import subprocess
 import time
 import argparse
-from ligand_vdgs.functions.utils import valid_database_subdir_format, set_up_outdir
+from ligand_vdgs.functions import parent_db
+from ligand_vdgs.functions.utils import set_up_outdir
 from ligand_vdgs.preprocessing._prep_filters import (
     clean_pdb_file, snapshot_restorable_ligands, restore_renamed_ligands)
 
@@ -66,8 +67,9 @@ def main():
     
     # Ensure that the pdb database dir has subdirs formatted similarly to the RCSB
     # mirror format (see docs/database_generation.txt).
-    if not valid_database_subdir_format(input_pdb_database_dir):
-        sys.exit(1) # Error message handled internally
+    if not parent_db.is_mirror(input_pdb_database_dir):
+        sys.exit('Database structure must be similar to the RCSB mirror format; '
+                 'see docs/database_generation_guide.md')
 
     # Create output dir and handle whether the user specified to overwrite or not
     set_up_outdir(output_dir, overwrite)
@@ -93,16 +95,17 @@ def main():
             continue
         # Iterate over PDB files
         for pdbname in os.listdir(subdir_path):
-            inner_chars = pdbname[1:3]
-            output_path = os.path.join(output_dir, inner_chars, pdbname)
+            output_path = os.path.join(
+                output_dir, parent_db.shard(parent_db.stem_of(pdbname)), pdbname)
             # Skip if prepped pdb exists and overwrite == False
             if os.path.exists(output_path) and not overwrite:
                 continue
             # Otherwise, run prepwizard on the pdb
             input_pdbpath = os.path.join(subdir_path, pdbname)
             run_prepwizard(pdbname, input_pdbpath, prepwizard_bin_path, logpath, output_path)
-            if os.path.exists(f'{pdbname[:4]}.log'):
-                os.remove(f'{pdbname[:4]}.log')
+            prep_log = f'{parent_db.stem_of(pdbname)}.log'
+            if os.path.exists(prep_log):
+                os.remove(prep_log)
     with open(logpath, 'a') as file:
         file.write('Script successfully completed.') 
 

@@ -189,27 +189,32 @@ def precompute_internal_distance_descriptors(cgvdmbb_data, n_cg):
     return out
 
 
-def internal_distance_lower_bounds(query_index, target_indices, descriptors,
-                                   n_total, perm_group=None):
-    """Return symmetry-minimised RMSD lower bounds for one query vs targets.
+# Elements per (targets x group elements x descriptor width) temporary in
+# internal_distance_bound_matrix: ~32 MB of float64 per chunk.
+_BOUND_CHUNK_ELEMS = 4_000_000
 
-    For selected internal-distance changes ``delta`` over ``n_total`` atoms,
-    both ``||delta||_2 / n_total`` and ``max(abs(delta)) / sqrt(2*n_total)``
-    lower-bound the best-fit RMSD. The maximum of those is taken per group
-    element, then minimised over the group. A pair may therefore be rejected
-    when the returned value exceeds the RMSD cutoff, with no Kabsch fit.
+
+def internal_distance_bound_matrix(query_index, target_indices, descriptors,
+                                   n_total, perm_group=None):
+    """RMSD lower bounds for one query vs targets, one per group element.
+
+    Returns ``(n_targets, n_perm)`` float64. For selected internal-distance
+    changes ``delta`` over ``n_total`` atoms, both ``||delta||_2 / n_total`` and
+    ``max(abs(delta)) / sqrt(2*n_total)`` lower-bound the best-fit RMSD under
+    that element's atom correspondence; the entry is the larger of the two.
+    A ``(pair, element)`` whose entry exceeds the cutoff cannot be the group
+    element realising that pair's distance, so the exact fit may skip it. A
+    pair whose entries all exceed the cutoff is not within it at all.
 
     ``perm_group`` is the vdG's *full* symmetry group as ``(cg_perm, bb_perm)``
     index pairs -- CG automorphisms crossed with interchangeable vdM slot
-    orders. Minimising over all of it is what keeps the bound admissible: the
-    exact RMSD is itself a minimum over the same group, so a bound taken over
-    any subset could exceed the true distance and reject a real match.
+    orders. The exact RMSD is a minimum over the same group, so the column set
+    has to be the whole group for the per-pair minimum to stay admissible.
     """
     targets = np.asarray(target_indices, dtype=np.intp).reshape(-1)
-    if targets.size == 0:
-        return np.empty(0, dtype=np.float64)
     if not descriptors or 'cg_bb' not in descriptors:
-        return np.zeros(targets.size, dtype=np.float64)
+        n_perm = 1 if perm_group is None else len(perm_group)
+        return np.zeros((targets.size, n_perm), dtype=np.float64)
     if n_total <= 0:
         raise ValueError(f'n_total must be positive, got {n_total}')
 
@@ -222,33 +227,48 @@ def internal_distance_lower_bounds(query_index, target_indices, descriptors,
                        np.arange(n_bb, dtype=np.intp)),)
     else:
         perm_group = validate_perm_group(perm_group, n_cg, n_bb)
+    n_perm = len(perm_group)
+    if targets.size == 0:
+        return np.empty((0, n_perm), dtype=np.float64)
 
-    target_cg = cg_bb[targets].reshape(targets.size, -1)
     query_cg = cg_bb[query_index]
+    target = cg_bb[targets].reshape(targets.size, -1)
     bb_bb = descriptors.get('bb_bb')
     if bb_bb is not None:
         mask = descriptors['cross_mask']
-        target_cross = bb_bb[targets][:, mask]
         query_bb = bb_bb[query_index]
-
-    best = np.full(targets.size, np.inf, dtype=np.float64)
-    max_denom = math.sqrt(2.0 * n_total)
-    for cg_perm, bb_perm in perm_group:
-        query = np.asarray(query_cg[cg_perm][:, bb_perm],
-                           dtype=np.float64).reshape(-1)
-        delta = query - target_cg
-        sum_sq = np.sum(delta * delta, axis=1, dtype=np.float64)
-        max_abs = np.max(np.abs(delta), axis=1)
+        target = np.concatenate([target, bb_bb[targets][:, mask]], axis=1)
+    # One permuted copy of the query descriptor per group element, so the
+    # per-element bound is a single broadcast rather than a loop over elements.
+    query = np.empty((n_perm, target.shape[1]), dtype=np.float64)
+    for k, (cg_perm, bb_perm) in enumerate(perm_group):
+        row = query_cg[cg_perm][:, bb_perm].reshape(-1)
         if bb_bb is not None:
-            cross_delta = np.asarray(
-                query_bb[bb_perm][:, bb_perm][mask], dtype=np.float64) - target_cross
-            sum_sq += np.sum(cross_delta * cross_delta, axis=1, dtype=np.float64)
-            max_abs = np.maximum(max_abs,
-                                 np.max(np.abs(cross_delta), axis=1))
-        bound = np.maximum(np.sqrt(sum_sq) / n_total,
-                           max_abs / max_denom)
-        np.minimum(best, bound, out=best)
-    return best
+            row = np.concatenate([row, query_bb[bb_perm][:, bb_perm][mask]])
+        query[k] = row
+
+    out = np.empty((targets.size, n_perm), dtype=np.float64)
+    max_denom = math.sqrt(2.0 * n_total)
+    chunk = max(1, _BOUND_CHUNK_ELEMS // (n_perm * target.shape[1]))
+    for start in range(0, targets.size, chunk):
+        stop = min(start + chunk, targets.size)
+        delta = query[None, :, :] - target[start:stop, None, :].astype(np.float64)
+        sum_sq = np.einsum('ijk,ijk->ij', delta, delta)
+        max_abs = np.abs(delta, out=delta).max(axis=2)
+        out[start:stop] = np.maximum(np.sqrt(sum_sq) / n_total,
+                                     max_abs / max_denom)
+    return out
+
+
+def internal_distance_lower_bounds(query_index, target_indices, descriptors,
+                                   n_total, perm_group=None):
+    """Symmetry-minimised RMSD lower bound per target: the row minimum of
+    :func:`internal_distance_bound_matrix`."""
+    matrix = internal_distance_bound_matrix(
+        query_index, target_indices, descriptors, n_total, perm_group)
+    if matrix.shape[0] == 0:
+        return np.empty(0, dtype=np.float64)
+    return matrix.min(axis=1)
 
 
 def validate_descriptor_permutations(permutations, n_cg):

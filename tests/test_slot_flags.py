@@ -69,8 +69,9 @@ def classify(resname, extra_atoms=()):
     bb = np.array([_BACKBONE['N'], _BACKBONE['CA'], _BACKBONE['C']],
                   dtype=np.float32)
     scrr = ('', 'A', 1, resname)
-    vdms_dict = {0: [resname, [scrr, bb, {0: ['vdm', bb[1]]}]]}
-    aas, _bbs, _seqs, _cas, _scrr, flags = reorder_vdg_subset(
+    o = np.array(_BACKBONE['O'], dtype=np.float32)
+    vdms_dict = {0: [resname, [scrr, bb, {0: ['vdm', bb[1]]}, o]]}
+    aas, _bbs, _seqs, _cas, _scrr, flags, _os = reorder_vdg_subset(
         [0], vdms_dict, CG_COORDS, ag)
     return aas[0], flags[0]
 

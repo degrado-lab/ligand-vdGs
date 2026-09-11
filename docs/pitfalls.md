@@ -60,6 +60,66 @@ roughly doubles fragments per ligand with forms the structure doesn't have, and
 some tautomers dearomatize a ring. A tautomer decision belongs at the parent,
 once, before fragmentation — not a fan-out at match time.
 
+**H-stripping does pool donor and acceptor aromatic N (resolved by the rebuild's `D<n>` + carbon `H0`/`!H0` keys; evidence below).** The
+bracket-H regex writes pyrrole-type `[nH]` and pyridine-type `n` as the same
+bare `n`, and keys record no degree, so an N-substituted ring N (`n(R)`, neither
+role) matches too. Unlike the pyridone split above these are not tautomers of
+one another — pyridine vs. pyrrole is a fixed difference — so it violates the
+rule in the previous paragraph. Measured 2026-09-09 over the 29
+production-threshold keys (≥250 ligands) containing aromatic `n`, classifying
+each matched N site by the BioLiP CCD SMILES (79k sites; ~8% of ligands had no
+parsable SMILES): 15% `[nH]` donor, 54% acceptor, 31% N-substituted. Per key it
+runs from acceptor-dominated (`cc(n)[N;!R]`: 2/92/6%) to donor-dominated
+(`cc(n)=[O;!R]`: 63/5/32%); `cc(c)n` (9,896 ligands) is 21/56/22%. The cost
+falls mostly on statistics, not geometry — the protein side sorts the roles into
+different buckets and clusters, but `cluster_num_parents` and per-key totals are
+normalized over the mixed pool. Options, safest first: (1) degree in the key
+(`[n;D2]` vs `[n;D3]`) is graph-only and needs no H trust, but touches every `n`
+key (rebuild + `fragment_keys_equivalent`); (2) record each CG atom's H count
+per observation from the protonated mirror at mining time (cf. `nr_slot_flag`)
+and filter at read time — reversible, no library split; (3) `[nH]`/`[n;H0]` in
+the key — splits genuine tautomers (imidazole N1/N3) and inherits prepwizard's
+and the CCD's H placement, which the pipeline otherwise refuses to trust.
+
+The substituted share is one instance of a general gap: keys record no degree,
+so any heteroatom on a fragment's boundary has unknown substitution. Same
+measurement over all 178 production keys: 47 have a boundary heteroatom whose
+substitution is genuinely mixed (5–95% of sites) — phenol vs. aryl ether
+`cc(c)[O;!R]` (63% substituted, 11,129 ligands), aniline `cc(c)[N;!R]` (90%),
+carboxylic acid vs. ester `[C;!R][C;!R](=[O;!R])[O;!R]` (21%), primary vs.
+higher amine `[C;!R][C;!R]([C;!R])[N;!R]` (70%), sulfonamide N
+`c[S;!R]([N;!R])(=[O;!R])=[O;!R]` (68%). Option (1) generalizes to `D<n>` on
+every heteroatom. Caveat: SMARTS `D` counts *explicit* connections, so both
+matchers must see H-free graphs — the miner reads the protonated mirror through
+OpenBabel, where H's are real atoms (cf. the `r<n>` disagreement below). Unlike `r<n>`, the two toolkits agree on what
+`D` means; only the input differs, so `DeleteHydrogens()` before `Match` is a
+complete fix (it renumbers atoms — check anything mapping match indices back to
+block order). Vocabulary cost of `D<n>`, same 178 keys, splitting each key's
+ligands by degree signature: non-carbon atoms → median 2 variants/key, 196
+variant keys keep ≥250 ligands, 28 original keys lose every variant; all atoms →
+median 9 (max 68), 263 keep ≥250, 70 lose every variant. Non-carbon preserves
+the vocabulary; all-atom fragments it.
+Carbon measured separately (2026-09-09, `uncapped_profile`,
+`[C;!R][C;!R](=[O;!R])[O;!R]`, bb/ASP/GLU, 4,425 obs): H-bearing boundary carbons
+sit ≤3.5 Å from an acceptor O in 15–24% of observations vs 9–11% for no-H carbons
+(bb: 12–25% vs 3%), with the O in the H hemisphere 55–68% vs 11–25% — a real
+C–H···O signal, and 18% of clusters mix the classes. Heavy degree is the wrong
+carbon primitive (D3 conflates sp3 C–H, 24%, with sp2 no-H, 11%; 1/2/3 H don't
+order); a binary `H0`/`!H0` captures it at 50 of 178 keys losing every ≥250
+variant (vs 28 for non-carbon `D` alone, 74 for full carbon H count). Confirmed
+on `frag_lib` (16 keys chosen for balanced H/no-H classes across alkyl-N/O/S,
+aromatic c–n/s/o, substituted aromatic, carbonyl-α, ring sp3; 34k obs): on `bb`,
+H-bearing > no-H with the bootstrap CI clear of 0 at 40 of 45 slots where both
+classes have ≥30 obs; ASP/GLU 28 of 44 (the 5 `bb` misses: three same-sign CIs
+grazing 0, one underpowered, one acyl-phosphate vs CH2–O–P class confound; none
+is a confident reversal). Pooled over `bb`: CH2 14%, sp3 CH 9%, sp2 no-H 5%,
+quaternary sp3 4% within 3.5 Å of backbone O, so the no-H signal is not just C=O. The
+earlier alkyl C–O null was underpowered (now +0.07 [0.01, 0.12] on both C–O
+carbons). Ligand Cα-like positions are ≥94% H-bearing, so the flag is
+single-class there and never hides a Cα–H···O contact. Scripts and tables:
+`~/docking/scratch/carbon_degree_test/` (`keys_fraglib_ranked.txt`,
+`obs_fraglib_summary.tsv`, `report/carbon_flag_report.pdf` with forest plots).
+
 Formal charge comes from the same place but is pinned by sanitization, not by the
 template's drawing: `MolFromPDBBlock` and the template's `MolFromSmiles` both
 sanitize (only the final H-strip is `sanitize=False`, which preserves charges).
@@ -195,6 +255,25 @@ Over-inclusion is safe: the prefilter only decides which probe lines are
 #limit (`cg_slot_occupancy` raises past it; ~20x headroom vs. the largest fragment
 #at 5 atoms). Readers use only the *order* and distinctness of CG occupancies,
 #never the value.
+
+#### Chain IDs are one column; two-character chains are remapped, never read as-is
+
+Every reader in the pipeline takes the chain from PDB column 22 alone (ProDy,
+probe, vdG-miner's `line[12:26]` hash and its HETATM ligand scan). Source files
+for large assemblies write two-character chain IDs across columns 21-22
+(`ASPA4  66` = chain `A4`), so chain `A4` reads as chain `4` and residue 66 of
+both chains merges into one residue. ProDy 2.6 gives the merged atoms a single
+resindex, and `writePDB` round-trips the collision with column 21 blanked, so
+parsing before fixing hides it. In the 2026-09 database 670 of 65,600 structures
+had such chains and vdG-miner dropped all of them whole (probe and PDB lines
+hash differently). s01 fixes the text before parsing
+(`preprocessing/_chain_ids.remap_chain_ids`: first free character from
+`CHAIN_POOL`, mapping recorded as `REMARK 900 CHAIN ID REMAPPED` lines) and
+skips structures with more chains than characters. The same source segments are
+written as HETATM, so `embedded_amino_acid_hetatm_to_atom` runs in the same
+pass: otherwise the remap alone would let the miner scan protein residues as
+ligands. Don't compare library chain IDs for these structures against the
+deposited entry without the REMARK mapping.
 
 #### Output PDB names parse from the right, not the left
 
@@ -459,6 +538,38 @@ a ligand (a composition change, not a fix). Renamed *atoms* (`6a0s` `HSE`:
 `N`→`NA`) aren't restored — matching and per-name selection read the same file,
 so internal consistency suffices.
 
+#### Modified residues are protein records, decided by CCD type, not by atom names
+
+Without prepwizard, a modified residue stays `HETATM` under its own resname
+(`KCX`, `SEP`, `LLP`, `MSE`). vdG-miner then rejects it as a slot (20-resname
+whitelist in `vdg.py`) *and* scans it as a ligand (`cg.py` reads `HETATM` only),
+so a phospho-serine would be mined as a phosphate CG. s01 therefore runs
+`_prep_filters.modified_residues_to_protein` on the text before parsing:
+
+- `MSE`→`MET`, `SEC`→`CYS` (`MODIFIED_RESIDUE_RENAMES`), atom names unchanged;
+  `SE` is admitted by `_ALTERNATE_HEAVY_ATOMS`, so these are full slots. In the
+  2026-09 database MSE is 4881 residues, 1148 near a ligand.
+- Every other `HETATM` residue whose CCD `_chem_comp.type` ends in
+  `PEPTIDE LINKING` and has a heavy atom within 1.8 Å of a standard amino acid
+  becomes an `ATOM` record with its own resname: neither slot nor ligand.
+- `NON-POLYMER` residues bonded to the chain (PLP, HEM, HEC, FAD, SAM) stay
+  `HETATM` and are mined as ligands, as today.
+
+**Backbone atom names are not the test.** 353 chain-bonded cofactor residues in
+the audited database (SAM, SAH, NXL, 0G6) carry `N`/`CA`/`C`, and 23
+peptide-linking residues do not. The CCD type table is
+`resources/ccd_polymer_types.tsv` (`scripts/fetch_ccd_polymer_types.py`, login
+node only: compute nodes have no network). Resnames absent from the table are
+left as written and listed once at the end of s01; a chain-bonded modified amino
+acid among them would be mined as a ligand, so refresh the table if the list is
+not empty. Known small loss: a peptide-linking ncAA bonded to a *standard*
+residue of a peptide ligand is converted too (85 chain-bonded peptide-linking
+residues in 65,600 structures, 15 near a ligand, 10 of them `SEC`).
+
+Prepwizard-era databases differ: there the modification sits on a parent-named
+residue (`LYS` with PLP atoms), which is what the `X` slot label was built for.
+`X` stays as the safety net for anything either path misses.
+
 ### Job generation
 
 #### `make_sge_scripts_for_hit_finder.py` treats `--ref-pdb` as global
@@ -608,6 +719,21 @@ charge-loose SMARTS `cC(=O)O` matches both benzoate and benzoic acid in the
 prepwizard-protonated mirror, so the anion's library would be a strict subset.
 The alias map goes to `fragment_aliases.tsv` (library root) or
 `<work list stem>_aliases.tsv`.
+
+**A representative need not be a frags-dict key.** When two or more charged
+spellings share a charge-stripped form and the dict holds no neutral twin
+(aromatic nitro: RDKit writes `c[N+](=O)[O-]` or `c[N+](=O)O`, never neutral),
+the charge-stripped SMARTS itself is *promoted* to representative and names the
+library directory. Looking that key up in `database_frags_dict.pkl` by string
+finds nothing, and no CCD ligand is drawn that way; that is expected, not a
+missing fragment. The alias file marks these rows `kind=promoted`, and
+`scripts/lookup_fragment_key.py KEY` lists the dict keys a key covers (exact,
+reordered, or charge-variant). On the 2026-09 dict there are 11 promoted groups
+(nitro, azides, isonitrile, nitrone, N-oxide); only nitro clears the threshold.
+A lone charged spelling with no twin is *not* promoted: nothing would pool, and
+the key that exists in the dict is the more useful directory name. The
+2026-09-06 library predates this rule and holds both nitro spellings as two
+nested libraries.
 
 **Settled: the query side reaches the collapsed library without the table.** Hit
 finding no longer derives a query key to look up — it matches the library's own

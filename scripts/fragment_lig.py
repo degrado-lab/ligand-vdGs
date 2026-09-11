@@ -2,8 +2,7 @@ import os
 import sys
 from rdkit import Chem            
 import pickle as pkl
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'ligand_vdgs', 'functions'))
-import Frags
+from ligand_vdgs.functions import Frags, utils
 
 #smiles = 'C[C@]1([C@H]2C[C@H]2OC(=N1)N)c3cc(ccc3F)NC(=O)c4cnc(cn4)OC' # EJ7 (6c2i)
 #smiles = 'CCCCn1c(cn2c1nc3c2C(=O)NC(=O)N3C)c4ccccc4C' # L87 (4gk3)
@@ -79,8 +78,25 @@ def main():
 
     # Convert SMILES to RDKit molecule and remove H's
     orig_mol = Chem.MolFromSmiles(smiles, sanitize=False)
-    mol, smiles_no_Hs = Frags.manually_remove_Hs(orig_mol) # rdkit's remove H methods 
-                                                     # don't work 
+    if orig_mol is None:
+        print('could not parse SMILES:', smiles)
+        sys.exit(1)
+    # Perceive aromaticity before fragmenting: unsanitized, a Kekule-written ring
+    # keys as [C;r6]=[C;r6](...) instead of cc(...), which silently matches nothing
+    # in the database. fragment_database_ligs sanitizes at the same point.
+    try:
+        Chem.SanitizeMol(orig_mol)
+    except Exception as e:
+        print('sanitization failed:', e, smiles)
+        sys.exit(1)
+
+    results = Frags.manually_remove_Hs(orig_mol, 'single') # rdkit's remove H methods
+                                                     # don't work
+    if results is None:
+        print('could not remove Hs / canonicalize:', smiles)
+        sys.exit(1)
+    mol_info, _ = results   # 2nd element is the annotated SMARTS key, not SMILES
+    mol, _ = mol_info
 
     # Make sure there's at least a C, O, or N (rule out Fe-S clusters, ions, etc.)
     if not Frags.is_organic(mol):
@@ -92,8 +108,9 @@ def main():
     # aryl (C,c vs. [#6]). Fragment on bond radii `bond_radius` AND the postive 
     # integers less than `bond_radius`, because for example, drugs containing 
     # sulfonamide might produce only 6-atom sulfonamides and not CS(N)(=O)=O.
+    # get_fragments returns {sub_smiles: [site groups]}; only the keys are needed here.
     filtered_frags = Frags.get_fragments(bond_radius, mol, min_frag_size, max_frag_size)
-    for (sub, sub_smiles) in filtered_frags:
+    for sub_smiles in filtered_frags:
         if sub_smiles not in frags:
             frags.append(sub_smiles)
 
@@ -112,21 +129,16 @@ def is_in_database_frags(lig_frags):
     ran_and_finished = []
     not_database =[]
 
-    for lig_smiles in lig_frags: 
-        lig_smiles_mol = Chem.MolFromSmarts(lig_smiles)
-        # check against all database frags
+    for lig_smiles in lig_frags:
+        # check against all database frags. Fragment keys are ring-annotated
+        # SMARTS, so they must be compared with fragment_keys_equivalent -- a
+        # direct `==` or mutual HasSubstructMatch is not even reflexive on them
+        # (an `r5` primitive cannot be satisfied on the acyclic graph a key
+        # parses to), and would report every ring fragment as absent.
         found_dict_match = False
         for _dict_smiles in dict_smiles:
-            if 'K' in _dict_smiles:
-                continue
-            dict_smiles_mol = Chem.MolFromSmarts(_dict_smiles)
-
-            if _dict_smiles == lig_smiles:
+            if utils.fragment_keys_equivalent(_dict_smiles, lig_smiles):
                 found_dict_match = _dict_smiles
-                break
-            elif lig_smiles_mol.HasSubstructMatch(dict_smiles_mol
-                ) and dict_smiles_mol.HasSubstructMatch(lig_smiles_mol): 
-                found_dict_match = _dict_smiles 
                 break
         if found_dict_match:
             # Was this fragment run/completed?

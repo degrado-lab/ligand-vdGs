@@ -213,6 +213,21 @@ def get_bb_coords(obj):
     return bb_coords if is_valid_backbone_coords(bb_coords) else None
 
 
+def get_bb_o_coords(obj):
+    """Backbone carbonyl O of one residue, float32 (3,), NaN-filled when absent.
+
+    Not a Stage-1 atom: it is stored beside N/CA/C (``nr_vdm_o_coords``) so
+    contact statistics can see the acceptor, and never enters an RMSD."""
+    try:
+        atom_obj = obj.select('name O')
+        if atom_obj is None or len(atom_obj) == 0:
+            return np.full(3, np.nan, dtype=np.float32)
+        return np.asarray(_pick_best_altloc(atom_obj).getCoords(),
+                          dtype=np.float32).reshape(3)
+    except Exception:
+        return np.full(3, np.nan, dtype=np.float32)
+
+
 def get_cg_atoms(prody_obj, pdbpath):
     """Ordered CG atoms of one vdG.
 
@@ -293,11 +308,12 @@ _TERMINAL_HEAVY_ATOMS = {'OXT', 'OT1', 'OT2'}
 
 BACKBONE_HEAVY_ATOMS = {'N', 'CA', 'C', 'O'}
 
-# Alternate heavy atoms a canonical resname legitimately carries. Se-Met is often
-# renamed MSE -> MET by prep pipelines while keeping SE in place of SD; calling it 
-# non-canonical would discard
-# real MET observations (~51% of every `X` slot in the pre-change library).
-_ALTERNATE_HEAVY_ATOMS = {'MET': {'SE'}}
+# Alternate heavy atoms a canonical resname legitimately carries. Se-Met is
+# renamed MSE -> MET (by prepwizard, and by s01 via
+# _prep_filters.MODIFIED_RESIDUE_RENAMES) while keeping SE in place of SD; calling
+# it non-canonical would discard real MET observations (~51% of every `X` slot in
+# the pre-change library). Selenocysteine is renamed SEC -> CYS the same way.
+_ALTERNATE_HEAVY_ATOMS = {'MET': {'SE'}, 'CYS': {'SE'}}
 
 # Label for a residue slot whose non-canonical atoms contact the CG. Not a
 # resname (the true residue is in nr_scrr_resname). Unreachable by hit finding,

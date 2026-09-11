@@ -1,6 +1,7 @@
 import os
 import argparse
 import subprocess
+from ligand_vdgs.functions import parent_db
 
 def parse_args():
     '''
@@ -18,17 +19,10 @@ def main():
     input_pdb = args.input_pdb
     outdir = args.outdir
 
-    basename = os.path.basename(input_pdb)
-    for ext in (".pdb.gz", ".pdb"):
-        if basename.endswith(ext):
-            basename = basename[:-len(ext)]
-            break
-    # Keep the full stem (`1abc` or `1abc_1`) and lowercase the middle-two
-    # subdir: this is the layout the miner reads back (vdg.py builds
-    # probe_dir/<stem[1:3].lower()>/<stem>.probe.gz).
-    out_filename = basename + '.probe'
-    out_subdir = os.path.join(outdir, basename[1:3].lower())
-    out_path = os.path.join(out_subdir, out_filename)
+    # Written uncompressed, then gzipped below into the name the miner reads.
+    out_path = parent_db.probe_path(outdir, parent_db.stem_of(input_pdb))
+    out_path = out_path[:-len('.gz')]
+    out_subdir = os.path.dirname(out_path)
     if not os.path.exists(out_subdir):
         os.makedirs(out_subdir)
           

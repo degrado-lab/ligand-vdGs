@@ -269,8 +269,8 @@ class Float32PaddingTests(unittest.TestCase):
         cutoff = 0.5
         data = np.zeros((2, 4, 3), dtype=np.float32)
         perm_group = build_perm_group(None, 1, ['ALA'])
-        adj, _ = ac._stage1_neighbor_graph(data, cutoff, 1, perm_group)
-        self.assertEqual(sorted(adj[0]), [1])
+        qi, qj = ac.stage1_edges(data, cutoff, 1, perm_group)
+        self.assertEqual(list(zip(qi.tolist(), qj.tolist())), [(0, 1)])
 
 
 if __name__ == '__main__':

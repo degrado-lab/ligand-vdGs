@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ligand-vdgs"
+version = "0.1.0"
+description = "Analysis and prediction of docked ligand poses using van der Graphs (vdGs)"
+requires-python = ">=3.10"
+# Dependencies are managed by environment.yml (the source of truth); this file
+# exists so `pip install -e .` makes `ligand_vdgs.*` importable from anywhere.
+dependencies = []
+
+[tool.setuptools]
+# Explicit list: keeps bak/ and generated script dirs out of the package.
+packages = [
+    "ligand_vdgs",
+    "ligand_vdgs.functions",
+    "ligand_vdgs.generate_vdgs",
+    "ligand_vdgs.identify_bioisosteres",
+    "ligand_vdgs.preprocessing",
+    "ligand_vdgs.score_poses",
+    "ligand_vdgs.tools",
+]

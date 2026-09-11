@@ -12,12 +12,22 @@ Usage:
 cd $YOUR_LIGAND-VDGS_DIR
 python ligand_vdgs/preprocessing/s01_trim_database.py
 
-NOTE: the reason this script takes forever for BioLiP2 is because there are a lot of 
-"ligands" that are like ALAA, ALAB, ALA1, ALA2, etc. and are not actually
-ligands; they're amino acids, but the pdb files are so large that there are not
-enough chain columns that they run into each other. TODO: filter out those PDBs.
+NOTE: large assemblies in BioLiP2 carry two-character chain IDs written across PDB
+columns 21-22 (``ASPA4  66`` = chain A4). Every reader downstream sees only column
+22, so chains ``A4`` and ``4`` merge residue by residue and vdG-miner drops the
+structure whole. _chain_ids.remap_chain_ids rewrites them to single characters
+before ProDy parses the file (parsing first would bake the merge in silently);
+the mapping is recorded as REMARK lines in the output PDB.
+
+NOTE: modified residues are handled here too: MSE/SEC become
+MET/CYS, and other chain-bonded HETATM residues of CCD type `*PEPTIDE LINKING`
+become ATOM records under their own resname, so they are neither mined as ligands
+nor accepted as slots. Needs resources/ccd_polymer_types.tsv
+(scripts/fetch_ccd_polymer_types.py). See _prep_filters.modified_residues_to_protein.
 '''
 
+import gzip
+import io
 import os
 import traceback
 import json
@@ -26,7 +36,11 @@ import prody as pr
 
 from ligand_vdgs.functions.interactions import add_pdb_to_nr_db_dict
 from ligand_vdgs.functions.utils import set_up_outdir
-from ligand_vdgs.preprocessing._prep_filters import drop_prepwizard_hazard_residues
+from ligand_vdgs.functions import parent_db
+from ligand_vdgs.preprocessing._prep_filters import (
+    drop_prepwizard_hazard_residues, load_ccd_polymer_types, modified_residues_to_protein)
+from ligand_vdgs.preprocessing._chain_ids import (ChainIdOverflow, remap_chain_ids,
+                                                  remap_remarks)
 
 origin_dir = '/home/sophia/DockDesign/databases/consolidated_BioLiP2_split'
 target_dir = '/home/sophia/DockDesign/databases/consolidated_BioLiP2_trimmed'
@@ -47,6 +61,32 @@ pdbs_already_done = 'log_processed_pdbs.txt'
 previous_checkpoint_dict = 'checkpoint.pkl'
 
 
+def parse_pdb_with_single_char_chains(pdbpath, ccd_types):
+    '''ProDy AtomGroup for *pdbpath* after the textual fixes that must precede parsing:
+    multi-character chain IDs remapped to single characters, MSE/SEC renamed to MET/CYS,
+    HETATM amino acids and chain-bonded modified residues made ATOM records
+    (_prep_filters.modified_residues_to_protein; *ccd_types* from
+    load_ccd_polymer_types). Returns (atoms, {old: new} chain mapping, stats dict from
+    modified_residues_to_protein). Raises ChainIdOverflow if the structure has more
+    chains than single characters.'''
+    opener = gzip.open if pdbpath.endswith('.gz') else open
+    with opener(pdbpath, 'rt') as f:
+        lines = f.readlines()
+    lines, mapping = remap_chain_ids(lines)
+    lines, stats = modified_residues_to_protein(lines, ccd_types)
+    atoms = pr.parsePDBStream(io.StringIO(''.join(lines)))
+    return atoms, mapping, stats
+
+
+def write_pdb_with_remap_remarks(output_path, atoms, mapping):
+    '''pr.writePDB, with the chain remap recorded as REMARK lines up front.'''
+    buf = io.StringIO()
+    pr.writePDBStream(buf, atoms)
+    with open(output_path, 'w') as f:
+        f.writelines(remap_remarks(mapping))
+        f.write(buf.getvalue())
+
+
 def main():
 
     checkpoint_name = output_database_dict_name + '.checkpoint'
@@ -61,7 +101,12 @@ def main():
     #                                                      list of interacting residues 
     #                                                      (segment, chain, rensum, resname)
     # See interactions.add_pdb_to_nr_db_dict() for more details.
-    database_dict = {} 
+    database_dict = {}
+
+    # CCD types decide which chain-bonded HETATM residues are modified amino acids
+    # (-> ATOM records) rather than covalent cofactors (stay ligands).
+    ccd_types = load_ccd_polymer_types()
+    unknown_resnames = set()
 
     #if restart: # the name restart could be confusng bc now it should be reload
     #    with open(pdbs_already_done) as inF:
@@ -86,6 +131,8 @@ def main():
                 try:
 
                     pdbpath = os.path.join(subdir_path, pdbfile)
+                    atoms, _, stats = parse_pdb_with_single_char_chains(pdbpath, ccd_types)
+                    unknown_resnames.update(stats['unknown_resnames'])
 
                     # Add the ligand(s) and interacting residues to the ligand dict
                     # if nonredundant. 
@@ -93,7 +140,9 @@ def main():
                     # cheap); it is refined later in the vdG creation process.
                     database_dict = add_pdb_to_nr_db_dict(
                         database_dict, pdbpath,
-                        lig_bfactor_cutoff=lig_avg_bfactor_cutoff)
+                        lig_bfactor_cutoff=lig_avg_bfactor_cutoff, atoms=atoms)
+                except ChainIdOverflow as e:
+                    print(f'[ERROR] Skipping {pdbfile}: {e}')
                 except Exception as e:
                     print(f'[ERROR] PDB failed: {pdbfile}')
                     print(e)
@@ -135,7 +184,7 @@ def main():
     for pdb_name, list_ligs in bindingsite_dict.items():
         # First, determine if this pdb was already written out in a previous run (if this script is
         # resuming from a previous incomplete run).
-        original_pdb_subdir = pdb_name[1:3]
+        original_pdb_subdir = parent_db.shard(parent_db.stem_of(pdb_name))
         output_subdir = os.path.join(target_dir, original_pdb_subdir)
         output_path = os.path.join(output_subdir, pdb_name)
         if not overwrite_pdbs and os.path.exists(output_path):
@@ -144,7 +193,11 @@ def main():
         # Load pdb
         original_pdbpath = os.path.join(origin_dir, original_pdb_subdir, pdb_name)
         try:
-            parsed = pr.parsePDB(original_pdbpath)
+            # Same remap as the dict-building pass, so the seg/chain/resnum keys in
+            # database_dict refer to the remapped chains.
+            parsed, chain_mapping, stats = parse_pdb_with_single_char_chains(
+                original_pdbpath, ccd_types)
+            unknown_resnames.update(stats['unknown_resnames'])
             if parsed is None:
                 print(f'[ERROR] Could not parse {original_pdbpath}')
                 continue
@@ -172,14 +225,21 @@ def main():
             # Write out PDB
             if not os.path.isdir(output_subdir):
                 os.makedirs(output_subdir)
-            pr.writePDB(output_path, around_lig)
+            write_pdb_with_remap_remarks(output_path, around_lig, chain_mapping)
             print(output_path)
+        except ChainIdOverflow as e:
+            print(f'[ERROR] Skipping {output_path}: {e}')
         except Exception as e:
             print('--------------------------------------')
             print(f'[ERROR] Failed to output {output_path}')
             print(e)
             traceback.print_exc()
             print('--------------------------------------')
+    if unknown_resnames:
+        print(f'[WARNING] {len(unknown_resnames)} HETATM resname(s) not in the CCD type '
+              f'table were left as written (a chain-bonded modified amino acid among '
+              f'them would be mined as a ligand); refresh with '
+              f'scripts/fetch_ccd_polymer_types.py: {sorted(unknown_resnames)}')
     # Check number of PDBs that were actually output
     num_output_pdbs = 0
     for pdb_output_subdir in os.listdir(target_dir):

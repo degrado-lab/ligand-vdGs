@@ -152,24 +152,39 @@ def charge_normalized_fragment(fragment):
 def group_protonation_variants(qualifying):
     """Split ``{fragment SMARTS: ligand-name set}`` into representatives and aliases.
 
-    A group collapses only when its own charge-free form is present among the
-    fragments: that SMARTS is strictly looser, so the charged variants' jobs are
-    duplicate compute and their buckets duplicate observations already in the
-    looser library. Where it is absent nothing is merged, since promoting a
-    charged form would change which structures get mined.
+    Charged spellings that share a charge-free form are one group. The group's
+    representative is that charge-free SMARTS: it is strictly looser, so it
+    matches every member's structures, and the members' jobs would be duplicate
+    compute mining nested subsets of the same structures. Two cases:
 
-    The charge-free form is matched to a fragment by ``fragment_keys_equivalent``,
-    not by string equality. Charge-stripping edits the text in place, so it keeps
-    the *charged* form's atom order, and the neutral twin is often written in a
-    different but equivalent order: on the production fragment dict, exact
-    matching collapses 431 groups and misses 60 more (e.g.
+    * the charge-free form is itself a fragment in the dict (the *neutral twin*,
+      e.g. ``CC(=O)O`` for ``CC(=O)[O-]``): it is the representative and the
+      charged spellings become aliases;
+    * no twin exists but two or more charged spellings share the form (aromatic
+      nitro: ``c[N+;!R](=[O;!R])[O;!R]`` and ``c[N+;!R](=[O;!R])[O-;!R]``, which
+      RDKit never writes neutral): the charge-free SMARTS is *promoted* to
+      representative even though it appears in no CCD drawing. Every member
+      becomes an alias; the ligand set is the union. Without this the 2026-09-06
+      build mined both nitro spellings, one nested in the other.
+
+    A lone charged spelling with no twin is left as its own representative:
+    promoting it would change nothing about what gets mined and would only
+    replace a key that exists in the dict with one that does not.
+
+    Forms are compared by ``fragment_query_mols_equivalent``, not string
+    equality. Charge-stripping edits the text in place, so it keeps each charged
+    spelling's atom order, and both a twin and a sibling spelling are often
+    written in a different but equivalent order: on the production fragment
+    dict, exact matching collapses 431 groups and misses 60 more (e.g.
     ``[C-;!R][C;r5]([C;r5])[N+;r5]`` normalizes to ``[C;!R][C;r5]([C;r5])[N;r5]``
     while the dict holds ``[C;r5][C;r5]([C;!R])[N;r5]``). A missed group is not
     cosmetic: the variant gets its own job mining a nested subset of the same
     structures, and no alias row, so hit finding can never resolve it.
 
     Returns ``(representatives, aliases)``, aliases mapping each collapsed
-    variant to the representative that now covers it.
+    variant to the representative that now covers it. A promoted representative
+    is recognisable as one absent from the input; ``resolve_fragment_key`` and
+    ``scripts/lookup_fragment_key.py`` map it back to the dict keys it covers.
     """
     # Atom count is a cheap necessary condition for equivalence, so it keeps the
     # equivalence scan off the whole fragment list for each charged key.
@@ -191,23 +206,39 @@ def group_protonation_variants(qualifying):
                 return cand
         return None
 
-    groups = {}
-    for smiles in qualifying:
-        key = charge_normalized_fragment(smiles)
-        if key is not None and key != smiles:
-            key = _qualifying_twin(key)
-        groups.setdefault(smiles if key is None else key, []).append(smiles)
-
+    # Group charged spellings by their charge-free form, compared as queries so
+    # that differently ordered spellings of one form meet. Each group:
+    # [normalized SMARTS of the first member seen, its query mol, members].
     representatives, aliases = {}, {}
-    for key, members in groups.items():
-        if len(members) > 1 and key in members:
-            representatives[key] = set().union(*(qualifying[m] for m in members))
-            for member in members:
-                if member != key:
-                    aliases[member] = key
+    charge_groups = []
+    for smiles in sorted(qualifying):
+        normalized = charge_normalized_fragment(smiles)
+        mol = fragment_key_query_mol(normalized) if normalized is not None else None
+        if mol is None:
+            representatives[smiles] = qualifying[smiles]
+            continue
+        for group in charge_groups:
+            if (group[1].GetNumAtoms() == mol.GetNumAtoms()
+                    and fragment_query_mols_equivalent(group[1], mol)):
+                group[2].append(smiles)
+                break
         else:
-            for member in members:
-                representatives[member] = qualifying[member]
+            charge_groups.append([normalized, mol, [smiles]])
+
+    for normalized, _, members in charge_groups:
+        twin = _qualifying_twin(normalized)
+        if twin is not None:
+            rep, pooled = twin, [twin] + members
+        elif len(members) > 1:
+            # Promoted: sorted iteration above makes the spelling deterministic,
+            # which matters because it becomes a directory name.
+            rep, pooled = normalized, members
+        else:
+            representatives[members[0]] = qualifying[members[0]]
+            continue
+        representatives[rep] = set().union(*(qualifying[m] for m in pooled))
+        for member in members:
+            aliases[member] = rep
     return representatives, aliases
 
 
@@ -309,7 +340,8 @@ def select_fragments(frags_dict, counts_threshold, max_size, return_aliases=Fals
             problems.append(
                 f"absent from the fragment dict even up to equivalent atom "
                 f"ordering, so they have no vdG sites to mine -- check the "
-                f"annotated-SMARTS spelling, ring primitives included: {absent}")
+                f"annotated-SMARTS spelling, ring primitives included, with "
+                f"scripts/lookup_fragment_key.py: {absent}")
         raise ValueError(
             f"{len(unresolved)} requested fragment(s) could not be selected. "
             + "; ".join(problems))
@@ -399,20 +431,74 @@ def resolve_include_fragments(include, prepared):
     return resolved, unresolved
 
 
-def write_fragment_aliases(path, aliases):
-    """Write ``alias<TAB>representative`` rows, one per collapsed variant.
+def fragment_dict_keys(frags_dict):
+    """Every fragment SMARTS in a ``{elements: {smarts: ligands}}`` frags dict."""
+    return {smiles for smiles_dict in frags_dict.values() for smiles in smiles_dict}
+
+
+def alias_kind(representative, dict_keys):
+    """``neutral_twin`` if the representative is a key of the frags dict, else
+    ``promoted`` (a charge-stripped SMARTS that appears in no CCD drawing)."""
+    return 'neutral_twin' if representative in dict_keys else 'promoted'
+
+
+def write_fragment_aliases(path, aliases, dict_keys):
+    """Write ``alias<TAB>representative<TAB>kind`` rows, one per collapsed variant.
 
     Consumers that hold a charged fragment name -- saved hit-finder scripts,
     existing analysis paths -- resolve it through this file instead of finding
-    no library directory.
+    no library directory. *dict_keys* (``fragment_dict_keys``) decides ``kind``:
+    a ``promoted`` representative exists only as a library key, so looking it
+    up in the frags dict finds nothing; ``scripts/lookup_fragment_key.py`` maps
+    it back to the dict keys it covers.
     """
     out_dir = os.path.dirname(path)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
     with open(path, 'w') as f:
-        f.write('# alias\trepresentative\n')
+        f.write('# alias\trepresentative\tkind\n')
+        f.write('# kind=promoted: the representative is the charge-stripped SMARTS of '
+                'its aliases and is NOT a key of the fragment dict (no CCD ligand is '
+                'drawn that way); use scripts/lookup_fragment_key.py to find the '
+                'dict keys it covers.\n')
         for alias in sorted(aliases):
-            f.write(f'{alias}\t{aliases[alias]}\n')
+            rep = aliases[alias]
+            f.write(f'{alias}\t{rep}\t{alias_kind(rep, dict_keys)}\n')
+
+
+def resolve_fragment_key(key, candidates):
+    """Which of *candidates* the fragment key *key* names, and how.
+
+    Returns ``[(candidate, how), ...]`` with ``how`` one of ``exact`` (same
+    string), ``equivalent`` (same annotated query, different atom order) or
+    ``charge_variant`` (the candidate's charge-stripped form is equivalent to
+    *key*'s, so *key* is the looser query that covers it). This is the search
+    a promoted representative needs to be traced back to dict keys, and the one
+    a human should run before concluding a key "is not in the dict".
+    """
+    query = fragment_key_query_mol(key)
+    loose_key = charge_normalized_fragment(key) or key
+    loose = fragment_key_query_mol(loose_key)
+    found = []
+    for cand in candidates:
+        if cand == key:
+            found.append((cand, 'exact'))
+            continue
+        cand_mol = fragment_key_query_mol(cand)
+        if cand_mol is None:
+            continue
+        if query is not None and fragment_query_mols_equivalent(query, cand_mol):
+            found.append((cand, 'equivalent'))
+            continue
+        if loose is None:
+            continue
+        cand_loose_key = charge_normalized_fragment(cand)
+        cand_loose = (fragment_key_query_mol(cand_loose_key)
+                      if cand_loose_key is not None else cand_mol)
+        if fragment_query_mols_equivalent(loose, cand_loose):
+            found.append((cand, 'charge_variant'))
+    order = {'exact': 0, 'equivalent': 1, 'charge_variant': 2}
+    return sorted(found, key=lambda pair: (order[pair[1]], pair[0]))
 
 
 def main():
@@ -444,10 +530,16 @@ def main():
             f.write(f"{smiles}\n")
 
     alias_path = os.path.splitext(args.output)[0] + '_aliases.tsv'
-    write_fragment_aliases(alias_path, aliases)
+    dict_keys = fragment_dict_keys(frags_dict)
+    write_fragment_aliases(alias_path, aliases, dict_keys)
     if aliases:
+        reps = set(aliases.values())
+        promoted = sorted(r for r in reps if alias_kind(r, dict_keys) == 'promoted')
         print(f'Collapsed {len(aliases)} protonation variant(s) into '
-              f'{len(set(aliases.values()))} representative(s); wrote {alias_path}.')
+              f'{len(reps)} representative(s); wrote {alias_path}.')
+        if promoted:
+            print(f'{len(promoted)} representative(s) are promoted charge-stripped keys '
+                  f'absent from the fragment dict (see {alias_path}): {promoted}')
 
     print(f'Wrote {len(smiles_to_run)} fragments to {args.output}.')
 
