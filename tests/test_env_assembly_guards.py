@@ -1,37 +1,8 @@
-"""The two environment-assembly guards in _get_atomgroup_for_env.
+"""Environment-assembly guards whose failures become silent downstream.
 
-Both exist because a vdG can come out looking well formed while being wrong, so
-nothing downstream can detect the failure.
-
-1. A CG atom name matching two atoms in one residue. Some prepared parent PDBs
-   carry a residue with duplicated heavy-atom names (2y1x SAH A:1001 has two named
-   N, 51 atoms against 46 in its other three copies, the spurious N 53 A from CA).
-   The spurious atom is really THR D:478's backbone N: prepwizard cannot build an
-   amino acid modelled with an N and no CA, so it re-emits the orphan under a
-   ligand's resname/chain/resnum. _prep_filters.drop_prepwizard_hazard_residues (run from
-   both s01 and s02) now removes the cause, but prepwizard also renames HET residues to a standard
-   amino acid (CYT -> CYS in 5buv), which no input filter can prevent, so this guard
-   is still load-bearing.
-   Disambiguating by proximity -- what fingerprint_helpers._pick_atom_by_com did --
-   can pick the wrong atom and write coordinates that contradict the record's own
-   recorded identity.
-
-2. A vdM with no heavy atoms at all, which the gate cannot have measured. There is
-   deliberately no distance test here any more: membership is decided upstream by
-   buried SASA of the CG atoms, under which a residue legitimately buries CG surface
-   out to ~6.5 A. The 4.5 A heavy-atom guard that used to live here re-dropped
-   exactly those members, and it discarded the whole environment when any one slot
-   failed.
-
-   The heavy-atom side still reads the element *and* the atom name, because a blank
-   element column (common in older and hand-edited PDBs) makes a plain
-   `not element H D` selection keep every hydrogen, so an all-hydrogen residue would
-   look like it had heavy atoms.
-
-3. A CG whose atoms are not one bonded component. The atom set comes from
-   OpenBabel's perception of the parent, which nothing else checks against geometry;
-   a SMARTS match is a connected subgraph, so atoms tens of A apart mean the match
-   was resolved onto the wrong atoms.
+The cases cover duplicate CG atom names, vdMs with no heavy atoms, and CGs whose
+OpenBabel-resolved atoms violate connectivity or the provisional SMARTS-edge
+geometry envelope. Residue membership remains the upstream SASA gate's decision.
 """
 import os
 import tempfile
@@ -39,33 +10,22 @@ import unittest
 
 import numpy as np
 import prody as pr
+from rdkit import Chem
 
-from ligand_vdgs.generate_vdgs.clus_and_deduplicate_vdgs import _get_atomgroup_for_env
+from ligand_vdgs.generate_vdgs.clus_and_deduplicate_vdgs import (
+    _cg_bond_components, _cg_bond_length_violations, _cg_smarts_bond_class,
+    _get_atomgroup_for_env)
+from tests.vacuity import assert_discriminates
 
 BIOUNIT = "1abc"
 CG_NAME = "_test_cg_"          # must not be a key in vdg_miner constants.cg_atoms
 CG_ATOM_NAMES = ["C1", "C2", "C3"]
 
-
 def _atomgroup(duplicate_name=None, vdm_offset=3.0, tail_atom=False,
                split_cg=False, blank_element_h=False, second_vdm=False,
-               only_blank_element_h=False):
-    """Ligand LIG A:900 (3 CG atoms) beside protein ALA A:10, close enough to pair.
-
-    With duplicate_name set, a fourth ligand atom is added carrying that name, so
-    the name matches two atoms -- the malformed case.
-
-    vdm_offset slides ALA away along x. tail_atom adds a non-CG ligand atom near
-    ALA, so the ligand *residue* still falls inside the 5 A environment selection
-    while the CG atoms themselves do not contact it -- the large-cofactor case
-    (a residue touching one end of FAD, a CG matched at the other).
-
-    split_cg moves the third CG atom out of bonding range of the other two, the
-    shape a CG atom resolved onto the wrong atom produces. blank_element_h gives
-    ALA a hydrogen close to the CG whose element column is empty;
-    only_blank_element_h makes that hydrogen ALA's *only* atom, so the residue
-    has no heavy atom at all and a name-blind filter would still admit it.
-    """
+               only_blank_element_h=False, bridged_wrong_bond=False,
+               collapsed_bond=False):
+    """Build a synthetic three-atom ligand and nearby protein environment."""
     # Kept off the origin: align_coords_sanity_check rejects a zero-norm row, so a
     # CG atom at (0, 0, 0) would fail the frame check for reasons unrelated to this
     # test.
@@ -73,6 +33,12 @@ def _atomgroup(duplicate_name=None, vdm_offset=3.0, tail_atom=False,
     coords = [(10.0, 10.0, 10.0), (11.5, 10.0, 10.0), (10.75, 11.3, 10.0)]
     if split_cg:
         coords[2] = (10.75, 25.0, 10.0)
+    if bridged_wrong_bond:
+        # C3 is 3.8 A from its real SMARTS neighbour C1, but 2.3 A from C2.
+        # The old all-pairs connectivity test therefore accepted this row.
+        coords[2] = (13.8, 10.0, 10.0)
+    if collapsed_bond:
+        coords[1] = (10.3, 10.0, 10.0)
     resnames, resnums, elements = ["LIG"] * 3, [900] * 3, ["C"] * 3
 
     if duplicate_name is not None:
@@ -118,7 +84,6 @@ def _atomgroup(duplicate_name=None, vdm_offset=3.0, tail_atom=False,
     ag.setAltlocs([" "] * len(names))
     return ag
 
-
 def _vdm_resnums(atomgroup):
     """Resnums the assembled atomgroup actually offers as vdM slots.
 
@@ -129,25 +94,25 @@ def _vdm_resnums(atomgroup):
     sel = atomgroup.select("occupancy > 1.5 and occupancy < 2.5")
     return set() if sel is None else set(int(r) for r in sel.getResnums())
 
-
-def _run(**kwargs):
-    second = kwargs.get("second_vdm", False)
+def _run(row_rejections=None, **kwargs):
     environment = [(BIOUNIT, "", "A", 900, 1), (BIOUNIT, "", "A", 10, 1)]
-    if second:
+    if kwargs.get("second_vdm", False):
         environment.append((BIOUNIT, "", "A", 11, 1))
     pdb_dir = tempfile.gettempdir()
-    pdb_file = os.path.join(pdb_dir, BIOUNIT[1:3].lower(), BIOUNIT + ".pdb")
-    cg_match_dict = {(BIOUNIT, "", "A", "900", "LIG"): [CG_ATOM_NAMES]}
     with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as fh:
         logfile = fh.name
     try:
         return _get_atomgroup_for_env(
-            environment, pdb_dir, CG_NAME, cg_match_dict,
+            environment, pdb_dir, CG_NAME,
+            {(BIOUNIT, "", "A", "900", "LIG"): [CG_ATOM_NAMES]},
             align_atoms=[0, 1, 2], logfile=logfile,
-            pdb_cache={pdb_file: _atomgroup(**kwargs)})
+            pdb_cache={os.path.join(pdb_dir, BIOUNIT[1:3].lower(), BIOUNIT + ".pdb"):
+                       _atomgroup(**kwargs)},
+            cg_bonds=((0, 1, 'single_or_aromatic'),
+                      (0, 2, 'single_or_aromatic')),
+            expected_elements=('C', 'C', 'C'), row_rejections=row_rejections)
     finally:
         os.unlink(logfile)
-
 
 class DuplicateAtomNameTests(unittest.TestCase):
     def test_wellformed_residue_is_accepted(self):
@@ -163,9 +128,8 @@ class DuplicateAtomNameTests(unittest.TestCase):
         # not grounds to discard the environment.
         self.assertIsNotNone(_run(duplicate_name="C9"))
 
-
 class CgBondPlausibilityTests(unittest.TestCase):
-    """The mined CG atoms must form one bonded component."""
+    """Every SMARTS edge must have chemically plausible deposited geometry."""
 
     def test_bonded_cg_is_accepted(self):
         self.assertIsNotNone(_run())
@@ -175,6 +139,54 @@ class CgBondPlausibilityTests(unittest.TestCase):
         # like this, so the atom set came from a bad perception/name resolution.
         self.assertIsNone(_run(split_cg=True))
 
+    def test_wrong_geminal_edge_is_rejected(self):
+        # Falsifier: the buggy component check accepts C1--C2--C3 through the
+        # non-SMARTS C2--C3 proximity edge.
+        self.assertEqual(_cg_bond_components(
+            _atomgroup(bridged_wrong_bond=True).getCoords()[:3]), [[0, 1, 2]])
+        self.assertIsNone(_run(bridged_wrong_bond=True))
+
+    def test_collapsed_smarts_bond_is_rejected(self):
+        self.assertEqual(_cg_bond_components(
+            _atomgroup(collapsed_bond=True).getCoords()[:3]), [[0, 1, 2]])
+        self.assertIsNone(_run(collapsed_bond=True))
+
+    def test_radius_gate_is_non_vacuous_at_both_bounds(self):
+        def accepted(distance):
+            return not _cg_bond_length_violations(
+                np.array([[0.0, 0.0, 0.0], [distance, 0.0, 0.0]]),
+                ('C', 'C'), ((0, 1, 'single'),))
+        assert_discriminates(
+            accepted, [1.50], [0.30, 2.30], 'SMARTS C-C bond-length gate')
+
+    def test_smarts_bond_class_is_preserved(self):
+        def bond_class(smarts):
+            mol = Chem.MolFromSmarts(smarts)
+            self.assertIsNotNone(mol)
+            self.assertEqual(mol.GetNumBonds(), 1)
+            return _cg_smarts_bond_class(mol.GetBondWithIdx(0))
+
+        self.assertEqual(bond_class('[C]-[N]'), 'single')
+        self.assertEqual(bond_class('[C]=[N]'), 'double')
+        self.assertEqual(bond_class('[C]#[N]'), 'triple')
+        self.assertEqual(bond_class('[c]:[n]'), 'aromatic')
+        self.assertEqual(bond_class('[C][N]'), 'single_or_aromatic')
+        self.assertEqual(bond_class('[C]~[N]'), 'ambiguous')
+
+    def test_ambiguous_bond_uses_conservative_fallback(self):
+        def accepted(distance):
+            return not _cg_bond_length_violations(
+                np.array([[0.0, 0.0, 0.0], [distance, 0.0, 0.0]]),
+                ('C', 'C'), ((0, 1, 'ambiguous'),))
+        assert_discriminates(
+            accepted, [1.50], [0.30, 2.30],
+            'ambiguous SMARTS bond uses broad covalent envelope')
+
+    def test_multiple_bad_edges_count_as_one_rejected_row(self):
+        rejections = {}
+        self.assertIsNone(_run(split_cg=True, collapsed_bond=True,
+                               row_rejections=rejections))
+        self.assertEqual(rejections, {'cg_bond_geometry': 1})
 
 class NoWriterSideDistanceGateTests(unittest.TestCase):
     """Membership is the SASA gate's decision; the writer must not re-litigate it.
@@ -222,7 +234,6 @@ class NoWriterSideDistanceGateTests(unittest.TestCase):
                   only_blank_element_h=True)
         self.assertIsNotNone(ag)
         self.assertEqual(_vdm_resnums(ag), {11})
-
 
 if __name__ == "__main__":
     unittest.main()

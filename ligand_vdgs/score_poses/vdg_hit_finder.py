@@ -18,10 +18,14 @@ from ligand_vdgs.functions.utils import convert_time_elapsed
 from ligand_vdgs.score_poses.hit_finder_core import init_worker, process_work_item
 
 RESULT_FIELDS = [
-    "pdbfile", "struct_id", "frag", "query_frag", "subset_size", "bsr_combo",
-    "aa_bucket", "vdg_index", "vdg_cluster_id", "vdg_cluster_size", "vdg_rmsd",
+    "pdbfile", "struct_id", "lig_instance", "frag", "query_frag", "subset_size", "bsr_combo",
+    "aa_bucket", "charge_sign", "vdg_index", "vdg_cluster_id", "vdg_cluster_num_parents", "vdg_rmsd",
     "rmsd_threshold", "aa_perm_idx", "q_site_idx", "q_cg_perm_idx", "q_atom_indices",
     "R00", "R01", "R02", "R10", "R11", "R12", "R20", "R21", "R22", "t0", "t1", "t2",
+    # Backbone-only fit (query CG held out of the Kabsch objective). Measure CG
+    # placement error with these, not R/t -- R/t were fitted to the query CG.
+    "Rbb00", "Rbb01", "Rbb02", "Rbb10", "Rbb11", "Rbb12", "Rbb20", "Rbb21", "Rbb22",
+    "tbb0", "tbb1", "tbb2",
 ]
 
 

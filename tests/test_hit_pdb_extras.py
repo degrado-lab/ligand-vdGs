@@ -35,7 +35,7 @@ T_HIT = np.array([2.0, -1.0, 3.0])
 
 
 def _write_bucket(lib_dir, parent_pdb_dir):
-    path = vdg_npz.vdg_npz_path(lib_dir, FRAG, 1, "ALA")
+    path = vdg_npz.vdg_npz_path(lib_dir, FRAG, 1, "neut", "ALA")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     np.savez_compressed(
         path,
@@ -49,7 +49,8 @@ def _write_bucket(lib_dir, parent_pdb_dir):
         nr_parent_biounit=np.array([BIOUNIT]),
         parent_pdb_dir=np.array(parent_pdb_dir),
         aa_bucket_parts=np.array(["ALA"]),
-        cluster_id=np.array([0]), cluster_size=np.array([3]))
+        cluster_id=np.array([0]), cluster_size=np.array([3]),
+        schema=np.array('{"schema_version": 4}'), charge_sign=np.array("neut"))
     return path
 
 
@@ -68,10 +69,14 @@ def _write_mirror(root):
     pr.writePDB(os.path.join(sub, BIOUNIT + ".pdb"), ag)
 
 
-def _write_tsv(path):
-    cols = ["pdbfile", "frag", "bsr_combo", "subset_size", "aa_bucket", "vdg_index",
+def _write_tsv(path, include_charge_sign=True):
+    cols = ["pdbfile", "frag", "bsr_combo", "subset_size", "aa_bucket", "charge_sign",
+            "vdg_index",
             "aa_perm_idx", "vdg_rmsd"]
-    vals = ["query.pdb", FRAG, ":A:10", 1, "ALA", 0, 0, 0.42]
+    vals = ["query.pdb", FRAG, ":A:10", 1, "ALA", "neut", 0, 0, 0.42]
+    if not include_charge_sign:
+        cols.remove("charge_sign")
+        vals.remove("neut")
     for i in range(3):
         for j in range(3):
             cols.append(f"R{i}{j}")
@@ -121,6 +126,16 @@ class HitPdbExtrasTests(unittest.TestCase):
         np.testing.assert_allclose(ag.getCoords()[-1],
                                    RES_COORDS[4] @ R_HIT + T_HIT, atol=1e-2)
         self.assertNotIn("WARNING", said)
+
+    def test_refuses_a_flat_pre_charge_sign_hit_tsv(self):
+        old_tsv = _write_tsv(os.path.join(self.tmp.name, "old_hits.tsv"),
+                             include_charge_sign=False)
+        argv = ["write_vdg_hit_pdbs.py", "--hits-tsv", old_tsv,
+                "--vdg-lib-dir", self.lib, "--outdir", self.out]
+        with mock.patch.object(sys, "argv", argv):
+            with self.assertRaises(SystemExit) as ctx:
+                whp.main()
+        self.assertIn("missing fields", str(ctx.exception))
 
     def test_carbonyl_is_opt_in_and_lands_with_the_sidechain(self):
         _write_bucket(self.lib, self.mirror)

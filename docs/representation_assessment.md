@@ -67,28 +67,3 @@ contact lets its CH2 chain reach the same position by many paths. Net: a
 residue-dependent caveat for cross-residue `cluster_size` comparisons in
 `identify_bioisosteres`, not a reason to change the clustering metric.
 
----
-
-## 3. CG-to-vdM contact cutoff
-
-`clus_and_deduplicate_vdgs.CG_VDM_CONTACT_CUTOFF` (4.5 Å) rejects a vdM whose
-nearest heavy atom is farther than that from every CG atom. Real contacts sit
-well inside it — over 2,503 sampled nr vdGs, CG-to-nearest-heavy-atom distance:
-
-| p50 | p75 | p90 | p95 | p99 | p99.9 | max |
-|---|---|---|---|---|---|---|
-| 3.50 | 3.76 | 3.98 | 4.12 | 4.30 | 5.87 | 9.05 |
-
-The distribution has a hard edge around 4.4 Å and then a sparse tail; nothing
-in 4.5–10 Å trades away real data. This guard backstops two independent
-mechanisms that used to slip vdMs 12+ Å from the CG into the library: (1) a vdM
-selected by proximity to the whole ligand rather than to the CG specifically
-(large cofactors — FAD, HEM, GSH — where a contact near one end got attributed
-to a CG matched at the other), and (2) duplicate atom names in prepwizard
-output, the mechanism `docs/pitfalls.md` documents under "Prepwizard relabels
-atoms it cannot build as part of a ligand." The guard runs per vdM slot and
-fails the whole environment on a miss, so at subset size 2 one non-contacting
-slot can discard a genuine partner — measured at 0.133% of size-2 nr vdGs, and
-not worth a partial-slot rewrite at that rate (the contacting slot is not lost:
-size-1 vdGs are enumerated independently). Revisit if `MAX_SUBSET_SIZE` rises,
-since the odds of at least one bad slot grow with subset size.

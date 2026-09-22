@@ -22,7 +22,7 @@ import shlex
 
 template = 'resources/vdg_hit_finder_sge_template.sh' 
 out_dir_for_sge_scripts = 'ligand_vdgs/score_poses/hit_finder_submit_scripts/'
-vdg_lib_dir = '/wynton/home/degradolab/skt/docking/frag_lib'
+vdg_lib_dir = '/wynton/home/degradolab/skt/docking/frag_lib_annot1'
 models_to_run_file = 'resources/validation_set.csv'
 log_dir = '/wynton/home/degradolab/skt/logs/hit_finder_logs'
 vdg_hit_outdir = '/wynton/home/degradolab/skt/docking/vdg_hits' 

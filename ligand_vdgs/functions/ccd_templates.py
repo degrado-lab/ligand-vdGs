@@ -47,6 +47,15 @@ def template_db_path():
 def components_path():
     return os.path.join(ccd_dir(), COMPONENTS_NAME)
 
+def store_identity():
+    """Stable provenance for the exact CCD template store read by this process."""
+    connection()
+    path = os.path.abspath(template_db_path())
+    stat = os.stat(path)
+    return {'version': 1, 'ccd_dir': os.path.abspath(ccd_dir()),
+            'template_db': path, 'parser_version': TEMPLATE_PARSER_VERSION,
+            'template_db_size': stat.st_size,
+            'template_db_mtime_ns': stat.st_mtime_ns}
 
 def split_cif_row(line):
     """Split an mmCIF loop row into values, honouring quoted fields.

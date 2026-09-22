@@ -37,11 +37,8 @@ def add_vdg_miner_paths():
         sys.path.append(path)
 
 
-# --min-instances thresholds the OCCURRENCE count, which is overdispersed (one
-# structure carries many sites/NCS copies): observed SD is 2.6-9.5x the naive
-# binomial estimate over five seeds. At n=3000, ~41% of the selected-fragment set
-# is seed-dependent (resolve_include_fragments/--include covers this); raise
-# --sample-size if the boundary matters more than runtime.
+# This estimates mining cost, not fragment membership. Structure counts size jobs;
+# occurrence counts determine whether a fragment is worth mining.
 DEFAULT_SAMPLE_SIZE = 3000
 
 # Above this share of the sample lost to unreadable or erroring structures, the
@@ -187,24 +184,16 @@ def _init_worker(fragments):
 
 
 def _count_one(pdb_path):
-    """({fragment index: CG occurrences}, unparsable blocks, file was unreadable).
-
-    Occurrences, not presence: a fragment hit at 3 sites (or 3 NCS copies) is 3x
-    the cost. `GetUMapList` dedupes only the pattern's own symmetry, so a symmetric
-    CG counts once per site. Not cg.count_matching_structures, which stops at the
-    first hit per pattern.
-    """
+    """Return occurrence counts and read/perception failure statistics."""
     from cg import (match_satisfies_ring_sizes, read_ligand_blocks,
                     suppress_stdout_stderr)
-    from ligand_vdgs.functions.ligand_perception import perceive_ligand_instance
+    from ligand_vdgs.functions.ligand_perception import (
+        perceive_ligand_instance, phantom_atom_indices)
     ligands = read_ligand_blocks(pdb_path)
     if ligands is None:
-        # Unreadable after retries -- distinct from "no ligands", which would stay
-        # in the denominator and bias every count downward (the direction that
-        # gets jobs killed).
-        return {}, 0, True
+        return {}, 0, True, False
     if not ligands:
-        return {}, 0, False
+        return {}, 0, False, False
     counts = {}
     read_failures = 0
     with suppress_stdout_stderr():
@@ -217,15 +206,17 @@ def _count_one(pdb_path):
                 read_failures += 1
                 continue
             mol = perceived.obmol
+            phantoms = phantom_atom_indices(mol)
             for i in _prefilter_candidates(mol):
                 pattern = _WORKER_FRAGMENTS[i]
                 if pattern.Match(mol):
                     constraints = _WORKER_RING_CONSTRAINTS[i]
                     n = sum(1 for m in pattern.GetUMapList()
-                            if match_satisfies_ring_sizes(mol, m, constraints))
+                            if match_satisfies_ring_sizes(mol, m, constraints)
+                            and phantoms.isdisjoint(m))
                     if n:
                         counts[int(i)] = counts.get(int(i), 0) + n
-    return counts, read_failures, False
+    return counts, read_failures, False, read_failures == len(ligands)
 
 
 def _consume_result(pdb_path, get_result, tally, errored):
@@ -268,8 +259,6 @@ def estimate_fragment_counts(fragments, pdb_dir, sample_size=DEFAULT_SAMPLE_SIZE
     struct_hits = [0] * len(fragments)
     occurrences = [0] * len(fragments)
     add_vdg_miner_paths()
-    # Compiled once in the parent to surface a bad fragment clearly; the same
-    # failure inside a worker initializer surfaces as BrokenProcessPool instead.
     from cg import check_ring_constraints, compile_smarts_patterns, ring_size_constraints
     patterns = compile_smarts_patterns(fragments)
     for smarts, pattern in zip(fragments, patterns):
@@ -277,21 +266,20 @@ def estimate_fragment_counts(fragments, pdb_dir, sample_size=DEFAULT_SAMPLE_SIZE
 
     failures = [0]
     unreadable = [0]
+    all_failed = [0]
     errored = []
 
     def _tally(result):
-        matched, n_failed, was_unreadable = result
+        matched, n_failed, was_unreadable, was_all_failed = result
         failures[0] += n_failed
         unreadable[0] += bool(was_unreadable)
+        all_failed[0] += bool(was_all_failed)
         for i, n in matched.items():
             struct_hits[i] += 1
             occurrences[i] += n
 
     if num_procs > 1:
         ctx = mp.get_context("spawn")
-        # ProcessPoolExecutor, not mp.Pool: mp.Pool silently respawns a worker the
-        # OOM killer takes and never reports the lost task (bpo-22393); the
-        # executor marks the pool broken and raises instead.
         pool = concurrent.futures.ProcessPoolExecutor(
             max_workers=num_procs, mp_context=ctx,
             initializer=_init_worker, initargs=(fragments,))
@@ -305,37 +293,33 @@ def estimate_fragment_counts(fragments, pdb_dir, sample_size=DEFAULT_SAMPLE_SIZE
                 f'usual cause is the OOM killer; re-run with fewer --num-procs or '
                 f'a larger -l mem_free (which is PER SLOT under -pe smp).') from exc
         finally:
-            # cancel_futures: without it, __exit__ drains every queued structure
-            # before a systematic failure surfaces.
             pool.shutdown(wait=True, cancel_futures=True)
     else:
         _init_worker(fragments)
         for pdb_path in sample:
             _consume_result(pdb_path, lambda p=pdb_path: _count_one(p),
                             _tally, errored)
-    # Loud: these depress every count uniformly, so a large number means
-    # selection and tiers are built on fewer ligands than the sample size suggests.
     if failures[0]:
         print(f'[WARNING] OpenBabel failed to read {failures[0]} ligand block(s) '
               f'in the {len(sample)}-structure sample; their fragments are '
               f'undercounted.', file=sys.stderr)
-    # Must also leave the denominator, or counts get scaled against structures
-    # nothing was counted from.
     if errored:
         print(f'[WARNING] {len(errored)} of {len(sample)} sampled structures raised '
               f'while being counted and were excluded; e.g. '
               f'{errored[0][0]}: {errored[0][1]}', file=sys.stderr)
-    read_ok = len(sample) - unreadable[0] - len(errored)
+    read_ok = len(sample) - unreadable[0] - len(errored) - all_failed[0]
     if unreadable[0]:
         print(f'[WARNING] {unreadable[0]} of {len(sample)} sampled structures were '
               f'unreadable; extrapolating from the {read_ok} that were read.',
               file=sys.stderr)
+    if all_failed[0]:
+        print(f'[WARNING] {all_failed[0]} of {len(sample)} sampled structures had '
+              f'every ligand fail perception; extrapolating from the {read_ok} that '
+              f'were read.', file=sys.stderr)
     if read_ok == 0:
         raise RuntimeError(
             f'none of the {len(sample)} sampled structures under {pdb_dir} could be '
             'read; refusing to emit an all-zero estimate.')
-    # A handful of failures is normal; losing a large share means the estimate no
-    # longer samples what it claims to.
     lost = len(sample) - read_ok
     if lost > MAX_LOST_SAMPLE_FRACTION * len(sample):
         raise RuntimeError(
@@ -364,8 +348,13 @@ def sampling_upper_bound(est_count, scale, z=2.0):
     size on the upper end: `est_count / scale` recovers the raw sampled count
     (relative SE ~1/sqrt(raw), Poisson), inflated by `z` of those. Raw 0 gets no
     bound -- make_sge_scripts_for_frags' --include tier floor handles those.
+
+    `scale == 1` (a --census run with no read failures) is a fifth no-op case:
+    `est_count` is then an exact count, not one draw from a random sample, so there
+    is no sampling error to widen against -- doing it anyway inflated a raw=4 count
+    by +100% across ~10^3 jobs on the exhaustive 2026-09 pass (B3).
     """
-    if not est_count or not scale or scale <= 0:
+    if not est_count or not scale or scale <= 0 or scale == 1.0:
         return est_count
     raw = est_count / scale
     if raw <= 0:
@@ -383,6 +372,10 @@ def parse_args():
     parser.add_argument('--pdb-dir', required=True, help="Parent database.")
     parser.add_argument('--sample-size', default=DEFAULT_SAMPLE_SIZE, type=int,
                         help=f"Structures to sample. Default: {DEFAULT_SAMPLE_SIZE}.")
+    parser.add_argument('--census', action='store_true',
+                        help="Use every structure under --pdb-dir instead of "
+                             "--sample-size, so counting a growing mirror never "
+                             "silently degrades into a sample.")
     parser.add_argument('--num-procs', default=10, type=int, help="Worker processes.")
     parser.add_argument('--seed', default=0, type=int, help="Sampling seed.")
     parser.add_argument('--output', default='resources/frag_cost_estimate.tsv',
@@ -415,8 +408,35 @@ def read_estimate_header(path):
     return header
 
 
+def require_key_schema(header, path):
+    """Raise unless `header` declares the key vocabulary this code writes.
+
+    Fatal when ABSENT as well as when mismatched, which is deliberately stricter
+    than DR-6's treatment of `max_size`. DR-6 kept `max_size` a warning because a
+    mismatch there can be legitimate -- a larger recorded `max_size` leaves a
+    usable superset. Absence is never benign here, whereas
+    mismatch can be benign there. The governing principle is still DR-6's.
+
+    `extract_fragment_smiles.load_frags_dict` raises on the same condition for the
+    fragment dict; two artifacts generated from each other must not disagree on
+    severity, because it would be stale against the code.
+    """
+    from ligand_vdgs.functions import Frags
+    recorded = header.get('key_schema')
+    if recorded is None:
+        raise ValueError(
+            f'{path} carries no key_schema line, so it predates the annotated-key '
+            f'vocabulary ({Frags.KEY_SCHEMA}). Regenerate it with '
+            f'estimate_frag_cost.py against a current database_frags_dict.pkl.')
+    if recorded != Frags.KEY_SCHEMA:
+        raise ValueError(
+            f'{path} was written under key_schema {recorded!r}, but this code emits '
+            f'{Frags.KEY_SCHEMA!r}. Regenerate it with estimate_frag_cost.py.')
+
+
 def read_estimate_tsv(path):
-    """({fragment: structure count}, {fragment: CG occurrences}) from this CLI's TSV."""
+    "({fragment: structure count}, {fragment: CG occurrences}) from this CLI's TSV."
+    require_key_schema(read_estimate_header(path), path)
     structures, occurrences = {}, {}
     with open(path) as handle:
         for line in handle:
@@ -435,42 +455,40 @@ def read_estimate_tsv(path):
 
 
 def main():
-    import pickle as pkl
-    from ligand_vdgs.generate_vdgs.extract_fragment_smiles import select_fragments
+    from ligand_vdgs.functions import Frags
+    from ligand_vdgs.generate_vdgs.extract_fragment_smiles import (load_frags_dict,
+                                                                   select_fragments)
 
     args = parse_args()
-    with open(args.frags_dict, 'rb') as handle:
-        frags_dict = pkl.load(handle)
-    # Every candidate, not a pre-thresholded subset -- selection is applied
-    # against this estimate, so it must exist first.
+    frags_dict, _support, _meta = load_frags_dict(args.frags_dict)
     fragments = select_fragments(frags_dict, 0, args.max_size)
+    frags_dict_sha256 = file_sha256(args.frags_dict)
+    pdb_db_identity = identity_of(args.pdb_dir)['sha256']
     structures, occurrences = estimate_fragment_counts(
-        fragments, args.pdb_dir, sample_size=args.sample_size,
+        fragments, args.pdb_dir, sample_size=None if args.census else args.sample_size,
         num_procs=args.num_procs, seed=args.seed)
 
     parent = os.path.dirname(args.output)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    # tmp + rename: a killed run would otherwise leave a truncated TSV that
-    # read_estimate_tsv parses cleanly but silently covers only part of the set.
     tmp_output = args.output + '.tmp'
     with open(tmp_output, 'w') as handle:
-        handle.write(f'# fragment\tstructures\tCG occurrences, estimated from a '
-                     f'{args.sample_size}-structure sample of {args.pdb_dir}\n')
-        # Pins the TSV to the dict it was computed from -- a membership check
-        # alone would miss a representative silently demoted to an alias.
-        handle.write(f'# frags_dict\t{os.path.abspath(args.frags_dict)}\n')
-        handle.write(f'# frags_dict_sha256\t{file_sha256(args.frags_dict)}\n')
-        handle.write(f'# max_size\t{args.max_size}\n')
-        handle.write(f'# pdb_dir\t{os.path.abspath(args.pdb_dir)}\n')
-        # Identity (not path) survives copying the DB between machines, so
-        # that's what the consumer compares (functions/db_identity).
-        handle.write(f'# pdb_db_identity\t{identity_of(args.pdb_dir)["sha256"]}\n')
-        handle.write(f'# sample_size\t{args.sample_size}\n')
-        handle.write(f'# seed\t{args.seed}\n')
+        estimate_kind = (f'a census of every structure' if args.census else
+                         f'a {args.sample_size}-structure sample')
+        headers = [
+            f'# fragment\tstructures\tCG occurrences, estimated from {estimate_kind} '
+            f'in {args.pdb_dir}',
+            f'# frags_dict\t{os.path.abspath(args.frags_dict)}',
+            f'# frags_dict_sha256\t{frags_dict_sha256}',
+            f'# key_schema\t{Frags.KEY_SCHEMA}',
+            f'# max_size\t{args.max_size}',
+            f'# pdb_dir\t{os.path.abspath(args.pdb_dir)}',
+            f'# pdb_db_identity\t{pdb_db_identity}',
+            f'# sample_size\t{"census" if args.census else args.sample_size}',
+            f'# seed\t{args.seed}',]
         scale = _LAST_SAMPLE_SCALE[0]
-        # None only when fragments is empty (returns before sampling).
-        handle.write(f'# sample_scale\t{"n/a" if scale is None else f"{scale:.6f}"}\n')
+        headers.append(f'# sample_scale\t{"n/a" if scale is None else f"{scale:.6f}"}')
+        handle.write('\n'.join(headers) + '\n')
         for fragment in fragments:
             handle.write(f'{fragment}\t{structures[fragment]}\t'
                          f'{occurrences[fragment]}\n')

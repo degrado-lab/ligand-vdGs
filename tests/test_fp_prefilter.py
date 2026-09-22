@@ -4,8 +4,9 @@
 the RMSD threshold. That is a correctness claim, not a tuning choice: if it is
 wrong, clustering and hit finding silently drop true matches without ever
 computing the fit that would have found them. These tests pin the closed form,
-show it is not exceeded, show it is tight (so it is not loose enough to be
-useless), and check that tightening it does not move any cluster.
+show it is not exceeded, and show it is tight (so it is not loose enough to be
+useless). Stage-1 clustering no longer uses it -- `prefilter_query_indices_*` in
+hit finding does; Stage-1's pivot bound is covered by `test_pivot_prefilter.py`.
 """
 
 import math
@@ -13,9 +14,8 @@ import unittest
 
 import numpy as np
 
-from ligand_vdgs.functions import align_and_cluster as ac
 from ligand_vdgs.functions.utils import kabsch_ssd
-from ligand_vdgs.functions.vdg_fp_utils import (FP_SAFETY_FACTOR, build_perm_group, fp_tolerances,
+from ligand_vdgs.functions.vdg_fp_utils import (FP_SAFETY_FACTOR, fp_tolerances,
                                                 precompute_bucket_fingerprints)
 
 
@@ -118,51 +118,6 @@ class AdmissibilityTests(unittest.TestCase):
         got2 = abs(fingerprints(X2, n_cg)[2] - fingerprints(X2 + D2, n_cg)[2])
         self.assertLessEqual(rmsd(X2, X2 + D2), T + 1e-6)
         self.assertGreater(got2 / (tol[2] / FP_SAFETY_FACTOR), 0.97)
-
-
-class ClusteringUnchangedTests(unittest.TestCase):
-    """Tightening an admissible prefilter must not move a single cluster."""
-
-    def _cluster(self, data, n_cg, threshold, disabled):
-        # Patch the name in align_and_cluster, not in vdg_fp_utils: the module
-        # imports it directly, so patching the source has no effect. If that
-        # import style ever changes, this patch stops firing and the comparison
-        # below goes vacuous -- test_the_prefilter_is_actually_doing_work is the
-        # guard for that.
-        original = ac.fp_tolerances
-        if disabled:
-            ac.fp_tolerances = lambda t, n, ncg, nres: (1e9,) * (1 if nres == 1 else 3)
-        try:
-            clusters = ac.get_butina_clusters(
-                data, threshold, n_cg, build_perm_group(None, n_cg, ['ARG', 'bb']))
-            return [members.tolist() for members in clusters]
-        finally:
-            ac.fp_tolerances = original
-
-    def test_derived_tolerance_matches_no_prefilter(self):
-        rng = np.random.default_rng(5)
-        n_cg, n_res = 4, 2
-        n = n_cg + 3 * n_res
-        # Several loose groups so the prefilter has both accepts and rejects.
-        centers = rng.normal(scale=6.0, size=(6, n, 3))
-        data = np.concatenate(
-            [c + rng.normal(scale=0.25, size=(25, n, 3)) for c in centers]
-        ).astype(np.float32)
-        for threshold in (0.65, 1.0):
-            with self.subTest(threshold=threshold):
-                self.assertEqual(self._cluster(data, n_cg, threshold, False),
-                                 self._cluster(data, n_cg, threshold, True))
-
-    def test_the_prefilter_is_actually_doing_work(self):
-        # Guards the test above from passing because nothing is ever rejected.
-        rng = np.random.default_rng(6)
-        n_cg, n_res, T = 4, 2, 0.65
-        n = n_cg + 3 * n_res
-        data = rng.normal(scale=6.0, size=(120, n, 3)).astype(np.float32)
-        fps = precompute_bucket_fingerprints(data, n_cg)
-        tol = fp_tolerances(T, n, n_cg, n_res)
-        rejected = (np.abs(fps['fp2'][:, None] - fps['fp2'][None, :]) > tol[2])
-        self.assertGreater(rejected.mean(), 0.1)
 
 
 if __name__ == '__main__':

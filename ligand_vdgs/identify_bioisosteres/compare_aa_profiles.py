@@ -1,8 +1,7 @@
 '''
 Compare AA interaction profiles across CGs to identify bioisosteres. See
 docs/bioisostere_identification.md for the full methodology (modes, metrics,
-quality filters) and output reference. visualize_bioisosteres.py handles all
-plotting downstream of this script's output.
+quality filters) and output reference. 
 
 Input: .npz files from compute_aa_profiles.py, in pair mode (default,
 *_aa_pair_freq*.npz) or single-AA mode (--single-aa, *_single_aa_freq*.npz;
@@ -280,12 +279,8 @@ def build_sim_matrix(profiles, metric, min_shared, mode='pair',
                     profiles[i][1], profiles[i][2],
                     profiles[j][1], profiles[j][2])
 
-            if metric == 'spearman':
-                r, p = _spearman(va, vb, min_shared)
-                sim[i, j] = sim[j, i] = r
-                pval[i, j] = pval[j, i] = p
-            elif metric == 'pearson':
-                r, p = _pearson(va, vb, min_shared)
+            if metric in ('spearman', 'pearson'):
+                r, p = (_spearman if metric == 'spearman' else _pearson)(va, vb, min_shared)
                 sim[i, j] = sim[j, i] = r
                 pval[i, j] = pval[j, i] = p
             elif metric == 'jaccard':
@@ -471,9 +466,8 @@ def main():
                   'Consider using files from a single norm method only.')
         seen[lbl] = i
 
-    any_explicit = args.spearman or args.pearson or args.jaccard
-    metrics = []
-    if args.spearman or not any_explicit:
+    metrics = ['spearman'] if not (args.spearman or args.pearson or args.jaccard) else []
+    if args.spearman:
         metrics.append('spearman')
     if args.pearson:
         metrics.append('pearson')

@@ -1,449 +1,211 @@
 # Database Setup Guide
 
-This guide explains how to generate a van der Graph (vdG) database for small molecule functional groups. If you prefer to use a pre-generated vdG database, you may skip the instructions below and download our database [here](insert-url-here).
+Builds a current-schema vdG library from a protonated PDB database. Run from repo root;
+editable install exposes `ligand_vdgs.*`.
 
-> **All commands in this guide assume you are running from the root directory of the `ligand-vdGs` package.**
+## Install
 
-## Installation
+```bash
+conda env create -f environment.yml
+conda activate lig_vdgs
+```
 
-1. **Set up the Python environment.** A conda environment file is provided at `environment.yml`:
+Installs the repo (`pip install -e .`). Requires OpenBabel Python bindings
+(`from openbabel import openbabel`); the CLI executable alone is insufficient.
 
-   ```bash
-   conda env create -f environment.yml
-   conda activate lig_vdgs
-   ```
+## 1. Prepare the parent database
 
-2. **Run scripts by path, from the repository root.**
+Layout: `<pdb-dir>/<lowercase inner two chars>/XXXX.pdb` (biounits `XXXX_1.pdb` also read).
+`scripts/format_parent_database.py` copies/validates standard filenames; biounit mirrors are
+laid out by hand.
 
-   `environment.yml` also installs the repo itself in editable mode
-   (`pip install -e .`), which is what makes `ligand_vdgs.*` imports resolve; run
-   that command manually from the repository root if you set the environment up
-   some other way. `environment.yml` remains the single source of truth for
-   dependencies.
+**Optional trim/repair:** `preprocessing/s01_trim_database.py` (module-level settings, no CLI)
+deduplicates structures and extracts 20 Å binding sites. Use `skip_to_output_pdbs = False` on a
+fresh database. It remaps two-column chain IDs to unique one-column IDs (as `REMARK 900`) and
+converts peptide-linked HETATM residues to ATOM; repair a database trimmed before this fix with
+`scripts/remap_chain_ids.py`. Modified residues are classified via
+`resources/ccd_polymer_types.tsv` (MSE/SEC→MET/CYS, other PEPTIDE LINKING→ATOM,
+NON-POLYMER→HETATM ligand); regenerate with `scripts/fetch_ccd_polymer_types.py` for newer CCD
+entries. Both s01 and s02 drop amino acids missing N/CA/C and one-heavy-atom carbon HET residues.
 
-> **Note on OpenBabel:** The vdG-miner component requires OpenBabel *with Python bindings* (`from openbabel import openbabel`), not just the command-line tool.
-
-## Prerequisites: Set Up a Parent Database
-
-Before running any pipeline steps, you need a preprocessed PDB database to extract vdGs from. You can use any collection of PDB structures — your own custom set or a mirror of the RCSB PDB.
-
-**Directory layout.** Structures must be organized in RCSB mirror format: each file is named `XXXX.pdb` (4-character code) or `XXXX_N.pdb` (biounit assembly N) and placed in a subdirectory named after the inner 2 characters of the code, **lowercased**: `1ABC.pdb` → `ab/1ABC.pdb`. Every reader lowercases those two characters when it looks a structure up. Use [`ligand-vdGs/scripts/format_parent_database.py`](../scripts/format_parent_database.py) to reformat an existing directory; it copies (the source is left intact) and validates every file name before touching anything.
-
-> **Biounits:** the pipeline reads `XXXX_N.pdb` fine — `_pdb_id_from_path` splits the assembly suffix off, and the npz stores the biounit stem. Only `format_parent_database.py` is stricter (4 characters exactly), so lay biounit mirrors out by hand.
-
-Once your source PDBs are in the right layout, complete Steps 1–3 in order before moving on to Steps 4–5.
-
-- **Step 1 (`s01_trim_database.py`) — Prune the database (optional, recommended).** Run [`ligand-vdGs/ligand_vdgs/preprocessing/s01_trim_database.py`](../ligand_vdgs/preprocessing/s01_trim_database.py) to filter by ligand b-factor and extract 20 Å binding-site regions (the `radius` constant; 20 Å is the smallest sphere that keeps a ligand's *third* coordination shell, which is what Step 2's protonation needs — 10 Å kept only 8% of it), reducing database size and removing redundant structures. It has no CLI: the input/output directories, b-factor cutoff and `skip_to_output_pdbs` switch are module-level constants at the top of the script. The dedup pass writes a database JSON that the trimming pass then reads, so a fresh database needs `skip_to_output_pdbs = False` on the first run. The pipeline works without this step, but skipping it means running on full PDB files (slower, larger, and noisier). If you run it, use the output as `-p` in Step 5 below; otherwise use the formatted database from above.
-
-  Before parsing each file, this step rewrites two-character chain IDs (columns 21-22) to unique single characters and turns peptide-bonded HETATM amino acids into ATOM records (`_chain_ids.remap_chain_ids`, `_prep_filters.embedded_amino_acid_hetatm_to_atom`); the chain mapping is kept as `REMARK 900` lines in the output. Both must happen on the text, before ProDy sees it -- see "Chain IDs are one column" in [`pitfalls.md`](pitfalls.md). A database trimmed before this fix can be repaired with `scripts/remap_chain_ids.py` (into a new directory; mine from the repaired files).
-
-  It also handles modified residues, which prepwizard used to rename to their parent amino acid (`_prep_filters.modified_residues_to_protein`): MSE/SEC become MET/CYS (keeping `SE`), and every other chain-bonded HETATM residue whose CCD type is `*PEPTIDE LINKING` (KCX, SEP, LLP, ...) becomes an ATOM record under its own resname, so it is neither mined as a ligand nor accepted as a slot; covalent cofactors (`NON-POLYMER`: PLP, HEM, SAM) stay HETATM ligands. This needs `resources/ccd_polymer_types.tsv`; regenerate it on a login node with `python scripts/fetch_ccd_polymer_types.py` if your database uses CCD entries newer than the table (s01 prints the resnames it did not find). Without the table s01 warns and only the renames happen. See "Modified residues" in [`pitfalls.md`](pitfalls.md).
-
-  This step also drops the residues prepwizard mangles (`_prep_filters.drop_prepwizard_hazard_residues`): amino acid residues missing any of N, CA or C, and one-atom HET residues whose single heavy atom is carbon. Step 2 applies the same filter, so it holds even if you skip Step 1. Prepwizard cannot build an amino acid from a lone backbone N, and re-emits that orphan atom under a *ligand's* resname, chain and resnum, giving that ligand a stray atom tens of Å from the rest of the residue. See "Prepwizard relabels atoms it cannot build as part of a ligand" in [`pitfalls.md`](pitfalls.md).
-
-- **Step 2 (`s02_run_prepwizard.sh`) — Add hydrogens.** The pipeline requires hydrogens to be present in every PDB. This step re-applies the Step 1 filter (so it holds if you skipped Step 1) and, afterwards, restores any free ligand PrepWizard renamed into a protein residue — see [`pitfalls.md`](pitfalls.md). Use [Reduce2](https://github.com/cctbx/cctbx_project/tree/master/mmtbx/reduce) (open-source) or Schrödinger's PrepWizard (more accurate, requires a license). [`s02_run_prepwizard.sh`](../ligand_vdgs/preprocessing/s02_run_prepwizard.sh) is an array job that runs `_protonate_pdbs.py` in batches; the input/output directories and prepwizard path are module-level constants in `_protonate_pdbs.py` (its only CLI flag is `--batch_index`). **The batch count lives in two independent places and must be kept in sync by hand:** the array task count is positional `$1` to the shell script, while `num_batches_total = 15` is a constant in `_protonate_pdbs.py`. If they disagree the database is silently mis-partitioned — tasks either overlap or leave subdirectories unprotonated — so pass the same number:
+**Required protonation:** every input PDB needs hydrogens (Reduce2 or Schrödinger PrepWizard via
+`preprocessing/s02_run_prepwizard.sh`). Its array task count must match `num_batches_total = 15`:
 
 ```bash
 qsub -t 1-15 ligand_vdgs/preprocessing/s02_run_prepwizard.sh 15
 ```
- Run this on the output of Step 1, or the formatted database above if you skipped trimming.
 
-## Step 4: Build the Fragment Dictionary
+s02 reapplies the orphan filter and restores free ligands PrepWizard relabeled as protein. Its
+output is the `--pdb-dir` used below.
 
-Build a fragment dictionary from your database ligands by running [`ligand_vdgs/generate_vdgs/fragment_database_ligs.py`](../ligand_vdgs/generate_vdgs/fragment_database_ligs.py). This script outputs `database_frags_dict.pkl`, which enumerates all qualifying chemical fragments across your ligand set.
+## 2. Build the fragment dictionary
 
-### Option A: RCSB PDB ligands (default)
-
-The wwPDB Chemical Component Dictionary (CCD) file is already provided at `resources/Components-smiles-cactvs.smi` and is the default input. Run with no arguments:
-
-```bash
-python ligand_vdgs/generate_vdgs/fragment_database_ligs.py
-```
-
-Output: `resources/database_frags_dict.pkl`
-
-### Option B: Custom database ligands
-
-Prepare a **tab-delimited** file (`.smi` or `.tsv`) with 2–3 columns:
-
-| Column | Required | Content |
-|--------|----------|---------|
-| 1 | yes | SMILES string |
-| 2 | yes | Short ligand identifier (e.g. your internal compound ID) |
-| 3 | no | Ligand name — not used by the script |
-
-**The identifier in column 2 must match the residue name used in your PDB files**, as it is propagated into the fragment library and used during hit-finding.
-
-Then run:
+Both passes read the parent PDB database (support = distinct parent biounits; a SMILES-only
+ligand can't qualify).
 
 ```bash
+python ligand_vdgs/generate_vdgs/build_ligand_roster.py \
+  --pdb-dir <protonated-pdb-dir> --out resources/ligand_roster.pkl --num-procs 8
 python ligand_vdgs/generate_vdgs/fragment_database_ligs.py \
-    --ccd <path/to/your_ligands.tsv> \
-    --outdir <output_dir>
+  --roster resources/ligand_roster.pkl --outdir <output-dir> --num-procs 8
 ```
 
-The output `<output_dir>/database_frags_dict.pkl` is used in the next step.
+Enumerates connected induced subgraphs (4–5 heavy atoms default), writes
+`<output-dir>/database_frags_dict.pkl`, excludes ligands without a CCD template (after OpenBabel
+fallback perception), and uses CCD chemistry throughout. No `--ccd`/`--bond-radius` mode — a
+non-CCD ligand needs a CCD-style template with the exact PDB residue name, then a rebuilt
+roster/dict.
 
-## Step 5: Generate the vdG Database
+## 3. Select and generate vdGs
 
-This step requires your protonated PDB database from Step 2 (use the trimmed version from Step 1 if you ran it). `database_frags_dict.pkl` from Step 4 is read only by the job schedulers below, which decide *which* fragments to run.
-
-A qualifying fragment is one that:
-
-- carries no element from `UNDESIRED_ELEMENTS` (`fragment_database_ligs.py`: metals, lanthanides, noble gases, plus Si/Se/As/Te) and passes `Frags.is_organic` — this is applied at Step 4, so a disqualified element never reaches the fragment dict. **Boron is deliberately not excluded**: boronic acids and boronate esters are real covalent warheads and worth mining.
-- has at most 5 heavy atoms,
-- is not a halogen oxyanion (a crystallization salt, not a binding moiety), and
-- has at least `--min-instances` (default 250) estimated CG occurrences in the parent database — SMARTS matches summed over every ligand copy in the database, i.e. candidate vdG sites, not CCD ligand counts and not structure counts — after protonation-state variants are pooled onto one representative (`select_fragments` in `extract_fragment_smiles.py`).
-
-The occurrence count comes from the same sampling pass as the per-fragment cost estimate (`estimate_frag_cost.estimate_fragment_counts`), which also returns the structure count that sizes each job's SGE slots. The core operation is running [`ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py`](../ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py) once per qualifying fragment SMILES. This calls the `vdG-miner` package to extract and cluster vdGs for that fragment; full usage is in the script header.
+A fragment qualifies if it passes `Frags.is_organic`, has no `UNDESIRED_ELEMENTS` (metals,
+lanthanides, noble gases, Si/Se/As/Te; boron allowed), ≤5 heavy atoms, is not a halogen
+oxyanion, and has support ≥ `--min-support` (distinct parent biounit stems, pooled across
+protonation variants, computed over the full dictionary). `--min-support` has no default and
+replaces `--min-instances`; lower thresholds via `--include-only`, raising one requires a
+rebuild.
 
 ```bash
 python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py \
-    -s "<SMILES>" \
-    -p <path/to/pdb_database/> \
-    -o <path/to/vdg_library/> \
-    --num-procs <n>
+  -s "<SMARTS>" -p <protonated-pdb-dir> -o <vdg-library> --num-procs <n>
 ```
 
-`-c` is optional — use it to customize the output subdirectory name (see flag table below). Defaults to `-s`. The wrapper encodes it with `utils.smiles_to_filename` (`/` → `_fs_`, `\` → `_bs_`) and passes the *encoded* label to every subprocess, so a SMILES containing `/` (e.g. `C/C=C/O`) works whether given explicitly or reached via the `-s` default.
+`-s` is parsed with RDKit `MolFromSmarts` (no sanitization/valence checking/H inference).
 
-| Flag | Description |
-|------|-------------|
-| `-s` | Fragment SMILES, interpreted as a SMARTS pattern for substructure matching |
-| `-c` | Chemical group label. Encoded with `utils.smiles_to_filename` and used as the output subdirectory name under `-o`; `/` and `\` are handled for you. Defaults to `-s` if omitted. |
-| `-p` | Path to your protonated PDB database (Step 2). Use the trimmed version from Step 1 if you ran that optional step. |
-| `-o` | Root output directory for the vdG library |
-| `--num-procs` | Number of parallel processes per job |
-| `--subset-sizes` | Which vdG subset sizes to generate; only `1` and `2` are accepted (default: `1 2`) |
-| `--no-profile-compute` | Skip the per-phase timing sidecar (`<cg_label>_compute_profile.json`), which is written by default |
-| `-m`, `--max-num-vdgs-to-clus` | **Debugging only.** Cap on distinct PDB IDs per AA bucket (one PDB can still contribute several vdGs), to bound the RMSD step for a quick test run. Never set it for a production build: a capped run silently yields an incomplete library. |
+| Option | Meaning |
+|---|---|
+| -s, --smarts | Required fragment SMARTS |
+| -c, --cg | Output label (default -s; encoded via `utils.smiles_to_filename`) |
+| -p, --pdb-dir | Required protonated parent database |
+| -o, --out-dir | Required library root; fragment subdir must be empty/absent |
+| --num-procs | Processes (default 10) |
+| --subset-sizes 1 2 | Only 1/2 accepted; default both |
+| --no-profile-compute | Skip `<cg>_compute_profile.json` sidecar |
+| -m, --max-num-vdgs-to-clus | Debug cap on PDB IDs/bucket; never production |
 
-The requested subset sizes share one environment-reconstruction pass and are
-clustered independently into `nr_vdgs/<subset_size>/`.
+Outputs cluster under `nr_vdgs/<subset-size>/<pos|neut|neg|unreadable>/`. No overwrite/resume
+flag.
 
-Clustering runs in two stages. **Stage 1** groups vdGs on pose — CG atoms plus
-each vdM's N/CA/C — by sphere-exclusion clustering (Butina 1999; equivalently the
-GROMOS algorithm of Daura et al. 1999): the exact within-cutoff neighbour graph is
-built, then the unassigned vdG with the most neighbours is repeatedly taken as a
-cluster seed along with its unassigned neighbours. Every member is therefore within
-the cutoff of the vdG that represents it, and the partition does not depend on
-input order. The distance is minimised over the fragment's CG automorphisms *and*
-over orderings of interchangeable same-label vdM slots, so one physical environment
-is one record. **Stage 2** subdivides each pose cluster by flanking-sequence and
-flanking-CA similarity; each subgroup stores its own pose-minimax member, and the
-exact pose radius of that choice is recorded in `cluster_pose_radius`.
+**Geometry/symmetry:** Stage 1 does deterministic sphere-exclusion (Butina/GROMOS) clustering on
+CG atoms plus each vdM's N/CA/C; stage 2 subdivides by flanking sequence and CA similarity. Pose
+distance minimizes over the CG automorphism group and interchangeable same-label vdM slots
+(stored atom order is not authoritative). Fragment-generation symmetry intentionally differs
+from hit-finder `CalcRMS` symmetry. Each SMARTS bond must satisfy the Cordero envelope
+`0.70 <= d/(r_cov,i+r_cov,j) <= 1.25` or that row is rejected (`stream_skipped_cg_bond_geometry`;
+calibrated per-element bounds are deferred). Automorphism normalization: terminal N/O/S atoms on
+one B/C/N/O/P/S/Cl/Br/I center may exchange within element (not substituted/bridging/aromatic
+atoms; ≥4 terminal atoms with mixed charges keep charge distinctions) — recorded in
+`cg_symmetry.npz`, never hand-derived. Environments are reconstructed once per fragment for all
+requested subset sizes.
 
-Fragment strings are substructure queries, not standalone molecules. They are
-parsed directly with RDKit `MolFromSmarts`, without SMILES sanitization, valence
-checking, or hydrogen inference. Keep fragment definitions free of explicit H
-atom nodes. Hydrogens in the prepared PDB database are a separate concern, and
-no longer affect contact membership at all.
-
-Exact automorphisms cover ordinary graph symmetry for every atom type. On top of
-that, resonance groups are normalized so that their drawn bond order and charge do
-not split symmetric atoms: amidine/guanidine C-N, N-O, S-N and conjugated N-N
-groups, plus charge/H on nitrogens within one aromatic component. The main rule is
-the terminal-atom one, which ignores untrusted bond order, formal charge, and
-proton placement: two or more terminal N, O, or S atoms on a shared
-B/C/N/O/P/S/Cl/Br/I center are treated as one set of interchangeable positions.
-Thus the two carboxylate oxygens, the two neutral carboxylic-acid oxygens, terminal
-phosphate `P=O`/`O-`/`OH` positions, sulfinic-acid oxygens, and dithioacid
-sulfurs can exchange. Each element forms its own set, so a terminal O is never
-mapped onto a terminal S (in `OP(O)(=S)[S-]` the O pair and S pair permute
-independently). Substituted and bridging atoms remain distinguished by
-heavy-atom connectivity, and aromatic terminal atoms are excluded because a
-truncated ring atom is a real ring position rather than a resonance form. One
-carve-out trusts the drawing: a center with four or more terminal atoms drawn
-with all-single bonds but mixed charges keeps its charges, so
-`[O-]S([O-])([O-])O` permutes its three anionic oxygens and leaves the hydroxyl
-fixed.
-
-CG coordinates and atom names are stored in the fragment SMARTS's slot order;
-generation does not relabel each record from its geometry. That order is an
-indexing convention, not a unique correspondence for symmetric atoms. Clustering
-and every atom-correspondence-dependent downstream comparison must minimize over
-the complete recorded automorphism group.
-
-Fragment selection also discards halogen oxyanions (perchlorate, chlorate,
-periodate, bromate). These are crystallization and cryoprotectant salts, not
-ligand chemistry. A generated dictionary never contains the free ions, because
-carbon-free ligands are dropped before fragmentation; the filter catches their
-esters and any hand-written work list.
-
-Since the wrapper must be run once per qualifying fragment, use your cluster's scheduler to parallelize — see below.
-
-### SGE (e.g., Wynton)
-
-[`make_sge_scripts_for_frags.py`](../ligand_vdgs/generate_vdgs/make_sge_scripts_for_frags.py) extracts qualifying fragments from `database_frags_dict.pkl` and writes one ready-to-submit SGE script per fragment. It samples `--pdb-dir` to estimate each fragment's cost (or reads `--frag-cost-estimate`) and tiers slots and `h_rt` per fragment, clamped by `--max-h-rt`, which is required. It also writes `<--vdg-lib-dir>/fragment_aliases.tsv`, the map from each collapsed protonation variant to the representative that was mined. Default paths are set for Wynton. Non-Wynton users must pass `--vdg-lib-dir`, `--pdb-dir`, and `--log-dir` explicitly:
+### SGE (Wynton)
 
 ```bash
 python ligand_vdgs/generate_vdgs/make_sge_scripts_for_frags.py \
-    --max-h-rt <HH:MM:SS> \
-    --vdg-lib-dir  <path/to/vdg_library/> \
-    --pdb-dir      <path/to/pdb_database/> \
-    --log-dir      <path/to/logs/> \
-    --sge-out-dir  <path/to/empty/script_dir/>
+  --max-h-rt <HH:MM:SS> --vdg-lib-dir <library> --pdb-dir <pdb-dir> \
+  --log-dir <logs> --sge-out-dir <empty-script-dir> \
+  --frags-dict resources/database_frags_dict.pkl
+for script in <empty-script-dir>/*.sh; do qsub "$script"; done
 ```
 
-Then submit all generated scripts:
+`--max-h-rt` is required; cost (from `--pdb-dir` or `--frag-cost-estimate`) only sizes jobs.
+Fragment prep is memoized under `$VDG_SCRATCH/prepared_fragments/`; submission order is
+descending `-pe smp` slot count.
 
 ```bash
-for script in <path/to/empty/script_dir/>/*.sh; do
-    qsub "$script"
-done
+MIN_SUPPORT=<n> ./run_production_frags.sh --mode threshold-plus-include --no-submit
+MIN_SUPPORT=<n> MAX_H_RT=36:00:00 ./run_production_frags.sh --mode threshold-plus-include
 ```
 
-[`run_production_frags.sh`](../run_production_frags.sh) at the repository root is the driver that does all of the above in one step, and is the only path that gets the submission order right: it clears `--sge-out-dir`, regenerates the fleet, and qsubs **longest estimated job first**, because SGE will not schedule a job whose `h_rt` reaches past the maintenance boundary, so the runway for a long request shrinks by an hour every hour. `--mode` is required (`threshold-plus-include` for a full build, `include-only` for a top-up); `--dry-run` generates and prints the order without submitting. Because the generated scripts use `#$ -cwd` with repo-relative paths, submit from the repository root either way.
-
-```bash
-./run_production_frags.sh --mode threshold-plus-include --dry-run   # inspect first
-MAX_H_RT=36:00:00 ./run_production_frags.sh --mode threshold-plus-include
-```
-
-It requires `resources/frag_cost_estimate.tsv`; regenerate it with [`estimate_frag_cost.py`](../ligand_vdgs/generate_vdgs/estimate_frag_cost.py) whenever `database_frags_dict.pkl` changes (the TSV records the dict's path and SHA-256, and `make_sge_scripts_for_frags.py` warns — it does not refuse — when that hash no longer matches `--frags-dict`):
+`threshold-plus-include` requires an empty library and builds the threshold set plus INCLUDE;
+`include-only` requires an existing library and builds only INCLUDE. `--no-submit` still updates
+aliases. Requires `resources/frag_cost_estimate.tsv`, regenerated after the dictionary changes:
 
 ```bash
 python ligand_vdgs/generate_vdgs/estimate_frag_cost.py \
-    --pdb-dir <path/to/pdb_database/> \
-    --output  resources/frag_cost_estimate.tsv
+  --pdb-dir <pdb-dir> --output resources/frag_cost_estimate.tsv
 ```
 
-> **Counts come from `--pdb-dir`, not from the CCD.** The estimate is a SMARTS
-> pass over a sample of the parent database, so a fragment whose ligands are
-> not in that database estimates 0 occurrences and is dropped by
-> `--min-instances` with no job written. When adding novel ligands beyond the
-> CCD, get their structures into the parent database you pass as `--pdb-dir`
-> and regenerate the TSV before generating the fleet; force in a wanted
-> fragment that still scores low with `--include`/`--include-file`.
+Estimates are SMARTS passes over `--pdb-dir`, not CCD counts. Force a wanted low-count fragment
+with INCLUDE/`--include`.
 
-### SLURM and other schedulers
+If an SGE job was killed mid-fragment, rerun script generation with `--resume --clear-partial`
+and the same inputs: `--resume` skips completed fragments, `--clear-partial` removes unfinished
+directories after checking `qstat` (otherwise remove the partial directory by hand first).
 
-Use [`extract_fragment_smiles.py`](../ligand_vdgs/generate_vdgs/extract_fragment_smiles.py)
-to write a scheduler-agnostic one-column work list. It applies the same selection
-rule as the SGE path—in fact both call the same `select_fragments()`—and emits one
-fragment SMARTS per line, plus the alias map next to it as
-`<output stem>_aliases.tsv` (columns `alias`, `representative`, `kind`; `kind=promoted`
-marks a representative that is the charge-stripped SMARTS of its aliases and is not
-itself a frags-dict key — trace it with `scripts/lookup_fragment_key.py`; see
-docs/pitfalls.md "Protonation variants are collapsed"):
+### SLURM or another scheduler
 
 ```bash
 python ligand_vdgs/generate_vdgs/extract_fragment_smiles.py \
-    --pdb-dir    <path/to/pdb_database/> \
-    --frags-dict <path/to/database_frags_dict.pkl> \
-    --output     <path/to/fragment_work_list.txt>
+  --frags-dict resources/database_frags_dict.pkl --output <fragment-work-list.txt>
 ```
 
-Only the SMARTS varies per job. Paths (`-p`, `-b`, `-o`) and run settings belong
-in the submission script. SGE, Slurm, and bare-shell runs all invoke the same
-wrapper, which derives exact automorphisms from that SMARTS and writes them to
-`nr_vdgs/cg_symmetry.npz` — no scheduler-provided classes or serialized mappings.
-`-c` can be omitted: the wrapper defaults it to the SMARTS and applies the same
-`utils.smiles_to_filename` encoding `make_sge_scripts_for_frags.py` does, so both
-paths land in the same library directory even for the work list's SMARTS
-containing `/` (e.g. `C/C=C/O`):
+Pass `--vdg-lib-dir` so aliases land at `<vdg-lib-dir>/fragment_aliases.tsv` (otherwise a
+`<stem>_aliases.tsv` is written beside the list and library readers won't find it). Submit one
+wrapper invocation per line:
 
 ```bash
 while IFS= read -r smarts; do
-    args=(-s "$smarts" \
-          -p "$PDB_DIR" -o "$OUT_DIR" \
-          --num-procs "$NPROCS" --subset-sizes 1 2)
-    # replace with sbatch/qsub/srun or a bare call
-    your-submit-command python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py "${args[@]}"
-done < fragment_work_list.txt
+  your-submit-command python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py \
+    -s "$smarts" -p "$PDB_DIR" -o "$OUT_DIR" --num-procs "$NPROCS" --subset-sizes 1 2
+done < fragment-work-list.txt
 ```
 
-[`resources/frag_sge_template.sh`](../resources/frag_sge_template.sh) shows how the wrapper is invoked inside a real job, if you want a reference for the non-fragment-specific arguments.
+## 4. Validate the library
 
-### Expected output
-
-Once all jobs complete, the vdG library directory (`-o`) contains one subdirectory per fragment SMILES, each with non-redundant vdGs stored as NPZ files:
-
-```
-<vdg_library>/
-  fragment_aliases.tsv        # SGE path only: collapsed variant -> representative
-  <cg_label>/                 # utils.smiles_to_filename(-c), not the raw SMILES
-    <cg_label>_log
-    <cg_label>_matches.pkl    # SMARTS match lists, left by smarts_to_cgs.py
-    <cg_label>_ligands.sdf
-    <cg_label>_compute_profile.json   # unless --no-profile-compute
-    nr_vdgs/
-      cg_symmetry.npz         # cg_smarts + cg_automorphisms; load_cg_symmetry reads this
-      1/                      # single-residue vdGs
-        <aa_bucket>.npz
-      2/                      # two-residue vdGs
-        <aa_bucket>.npz
+```text
+<library>/fragment_aliases.tsv
+<library>/<cg_label>/<cg_label>_log
+<library>/<cg_label>/nr_vdgs/cg_symmetry.npz
+<library>/<cg_label>/nr_vdgs/{1,2}/{pos,neut,neg,unreadable}/<aa_bucket>.npz
 ```
 
-`cg_symmetry.npz` is not optional: it is the only record of which SMARTS the
-automorphism group was derived from, and consumers must read the group from there
-rather than re-deriving it from the directory name. It also defines the slot order
-used by stored CG coordinate and atom-name columns.
+Buckets hold disjoint `nr_*` rows (coordinate-bearing cluster representatives) and `mem_*` rows
+(identity only, linked by `mem_cluster_id`): observations = nr+mem, clusters = nr.
+`cluster_size` is raw observations; `cluster_num_parents` is distinct PDB
+entries/depositions (not support or cluster size); selection support is distinct biounit stems.
+`aa_bucket_parts` is the only slot-permutability source; `bb` is a backbone role, `X` is
+noncanonical. Parent records store a biounit stem and `parent_pdb_dir` — use
+`vdg_npz_utils.resolve_parent_pdb_path` for a copied library and
+`vdg_npz_utils.rederive_member_coords` for member coordinates. H-class fields use negative values
+for unreadable atoms (zero is a real count). Carbonyl-O coordinates are separate and excluded
+from RMSD.
 
-`aa_bucket` encodes the slot labels of the interacting residues, sorted and joined with `_` (e.g., `ASP_bb.npz`, `SER_bb.npz`). A label is a resname, the backbone label `bb`, or `X`; none contains `_`, so the file name splits back apart unambiguously. Each fragment directory also contains a `<cg_label>_log` file; downstream tools treat a fragment whose log is missing or incomplete as absent from the library. A fragment directory cannot be re-run in place: the wrapper refuses a non-empty `<-o>/<cg_label>`, and there is no overwrite or resume flag.
-
-#### What a bucket npz contains
-
-Each bucket holds **two disjoint blocks of arrays**, plus per-cluster columns.
-Every vdG appears in exactly one block.
-
-| prefix | one row per | holds |
-|---|---|---|
-| `nr_*` | non-redundant vdG (one per cluster) | CG and vdM-backbone coordinates, CG and vdM identity, slot flag, measured quality |
-| `mem_*` | clustered vdG that is *not* the nr vdG | identity only, no coordinates; tied back by `mem_cluster_id` |
-
-A *member* is an observation that is not the nr vdG, so
-
-```
-cluster_size == 1 + (number of mem_ rows for that cluster)
-```
-
-Per-cluster columns: `cluster_id`, `cluster_size` (raw observations),
-`cluster_num_parents` (distinct parent structures — the figure to do statistics
-on, since NCS copies and homologous entries inflate `cluster_size`),
-`cluster_pose_radius` (greatest symmetry-aware RMSD from any member to the stored
-row), and `first_stage_cluster_id` / `second_stage_cluster_id`.
-
-Bucket-level columns: `aa_bucket_parts` (the label of each vdM slot — this, not
-`nr_scrr_resname`, is what says which slots may be permuted), `cg_elements`, and
-`parent_pdb_dir`.
-
-Member rows carry no coordinates by design: they are re-derived from the parent
-PDB on demand (`vdg_npz_utils.rederive_member_coords`). Parent structures are
-stored as a biounit stem plus one directory scalar, and
-`resolve_parent_pdb_path` rebuilds the path — pass `pdb_dir=` to point a copied
-library at a different parent database.
-
-Quality is recorded per row rather than only filtered on: `nr_cg_max_b`,
-`nr_cg_min_occ`, `nr_vdm_max_b`, `nr_vdm_min_occ` (and the `mem_` equivalents)
-are measured over the atoms that actually enter the vdG — the CG's own atoms and
-the contacting residues' heavy atoms. Mining applies only a loose floor, so a
-stricter cut is a read-path decision rather than a reason to re-mine.
-
-These files are the input to the hit-finding step.
-
-#### When to run the H-class diagnostic
-
-Run [`h_class_diagnostic.py`](../ligand_vdgs/tools/h_class_diagnostic.py) after every
-full library build or rebuild, and again whenever the fragment key scheme changes,
-before deciding which `H0`/`!H0` key variants downstream code should pool at read
-time. It reads the per-observation H-class fields each bucket stores next to its
-row arrays -- `nr_cg_heavy_degree`, `nr_cg_num_h`, `mem_cg_heavy_degree`,
-`mem_cg_num_h` (int8, one column per CG atom); `--dry-run` only checks that a
-library carries them. Writer contract: an atom that could not be read gets a
-**negative** value in both fields; 0 is a real count and must never stand for
-"unreadable" (the diagnostic errors on any `heavy_degree == 0`). The writer also
-stores `nr_vdm_o_coords` (n_nr, num_vdms, 3), the backbone carbonyl O per vdM slot
-in the same frame as `nr_vdm_bb_coords` (NaN where absent), kept out of every RMSD; with it,
-`--contact-atoms N,CA,C,O` measures real C···O contacts.
+After the fleet drains:
 
 ```bash
-python ligand_vdgs/tools/h_class_diagnostic.py --lib <vdg_library> --out h_class.tsv
+python scripts/check_library_after_build.py --vdg-lib-dir <library>
+python ligand_vdgs/tools/h_class_diagnostic.py --lib <library> --out h_class.tsv
 ```
 
-## Inspect the Library
+The first checks aliases, charged-forward resolution, completion markers, and H-class fields. A
+directory's existence doesn't prove completion — direct walkers must call
+`Frags.check_vdg_job_status` (as `load_vdg_bucket` does). Run the H-class diagnostic after every
+full build/rebuild and whenever fragment keys change.
 
-[`materialize_vdg_pdbs.py`](../ligand_vdgs/generate_vdgs/materialize_vdg_pdbs.py)
-writes library vdGs out as PDB files for visual inspection in PyMOL. Two flags are
-required: `-c/--cg-nr-vdgs-root` (a fragment's `nr_vdgs/` directory, not the library
-root) and `-o/--out-dir`, which must be empty or absent — `fresh_dir` refuses a
-populated one, so a partial earlier run has to be cleared by hand.
+Optional, for troubleshooting: the H-class check above only runs `h_class_diagnostic.py
+--dry-run` internally and reports pass/fail. If it fails, or you want to see which buckets are
+affected, run the same check standalone for detail:
+
+```bash
+python ligand_vdgs/tools/h_class_diagnostic.py --lib <library> --dry-run
+```
+
+## 5. Inspect selected vdGs
+
+`materialize_vdg_pdbs.py` writes PDBs for PyMOL. `-c` must be a fragment's `nr_vdgs/` directory;
+`-o` must be empty or absent:
 
 ```bash
 python ligand_vdgs/generate_vdgs/materialize_vdg_pdbs.py \
-    -c <path/to/vdg_library/><cg_label>/nr_vdgs/ \
-    -o <path/to/empty/output_dir/> \
-    --top-clusters 10
+  -c <library>/<cg_label>/nr_vdgs/ -o <empty-output-dir> --top-clusters 10
 ```
 
-It has two modes, and one selection vocabulary shared by both: `--aa-buckets` and
-`--subset-sizes` say where to look, `--top-clusters N` or `--clusters ID...` say which
-clusters. The default writes **nr vdGs** — one frame per selected cluster's stored row,
-with `--min-cluster-size` dropping the sparse tail. Adding `--members` switches to
-**members** mode, which writes each selected cluster's nr vdG *and* the individual
-vdGs inside it, one directory per cluster, and requires `--top-clusters` or
-`--clusters`; it is the only consumer of the `mem_*` arrays in the npz;
-`--reps` caps how many structures are written per cluster **including the nr vdG**,
-so `--reps 20` is the nr vdG plus 19 randomly sampled members.
+Use `--aa-buckets`/`--subset-sizes` to filter. Default mode writes nr vdGs; `--members` adds
+individual members and requires `--top-clusters` or `--clusters`; `--reps` includes the nr vdG in
+its cap.
 
-### Output file names
-
-Names are built by joining fields with a **single `_`**, so they can be parsed
-programmatically. Both this script and
-[`write_vdg_hit_pdbs.py`](../ligand_vdgs/tools/write_vdg_hit_pdbs.py) share the naming
-code in `functions/vdg_pdb_io.py`.
-
-```
-nr vdGs (default) — every file directly in <out_dir>
-    O=S(=O)(O)O_ASP_bb_clus1_size4_2ldb__A_46_ASP__A_43_GLY__A_4_SO4.pdb.gz
-    └─ frag ──┘ └bucket┘ └cluster┘ └src┘ └vdM tags──────────┘└lig tag─┘
-
-members (--members)
-  <out_dir>/<subset_size>/<AA_BUCKET>/clus<id>_size<size>/
-    O=S(=O)(O)O_NR_clus1_size6_1yp2__D_370_ASP__D_2003_SO4.pdb.gz
-    O=S(=O)(O)O_1yp3__C_370_ASP__C_1002_SO4.pdb.gz
-```
-
-A **residue tag** is always exactly four `_`-separated fields,
-`seg_chain_resnum_resname`. The segment field is kept even when the entry has no
-segment, which is the usual case — hence the leading empty field that makes
-`_D_370_ASP` look like it starts with a doubled underscore. Keeping it is what fixes
-the field count; a field that would otherwise contain `_` (a stray `/`, `\`, or space)
-becomes `-` for the same reason.
-
-Every name carries exactly **`1 + subset_size` tags — one per vdM slot in slot
-order, then the ligand last**:
-
-| subset size | tags |
-|---|---|
-| 1 | `<res1>_<lig>` |
-| 2 | `<res1>_<res2>_<lig>` |
-
-A vdG is one CG cut out of **one** ligand residue plus its vdM residues, so there is
-always exactly one ligand tag. The npz stores the CG's `seg`/`chain`/`resnum`/
-`resname` once per record for exactly that reason, and the invariant is enforced at
-mining time: `vdg_struct_utils.get_cg_atoms` reports and skips a CG whose atoms span
-more than one residue, since that would mean fragment matching crossed a residue
-boundary. Measured before the schema change, it never happened: 0 of 5,973,427
-nr vdG records across a full 349-fragment library.
-
-**Parse from the right.** The head of the name is not positionally parseable: `<frag>`
-is a sanitized SMILES (`smiles_to_filename` encodes `/` as `_fs_`) and `<AA_BUCKET>`
-joins its labels with `_`, so both contribute a variable number of fields. Before
-splitting, strip:
-
-| strip | when |
-|---|---|
-| `.pdb.gz` | always |
-| `~<n>` | when two files would otherwise share a name — see below |
-
-Then take the last `4 × (subset_size + 1)` fields and cut them into groups of 4:
-
-```python
-stem   = re.sub(r"~\d+$", "", basename.removesuffix(".pdb.gz"))
-fields = stem.split("_")[-4 * (subset_size + 1):]
-tags   = ["_".join(fields[i:i + 4]) for i in range(0, len(fields), 4)]
-vdms, lig = tags[:-1], tags[-1]
-```
-
-**Getting `subset_size`.** Members mode puts it in the directory path. A nr vdGs
-run has no subset-size directory — that read as a second "size" next to the
-cluster's `_size<n>` — so recover it from the AA bucket label, which sits between
-the fragment and `_clus<id>` and has one token per vdM slot (`ASP` → 1, `ASP_bb` → 2).
-You know `<frag>`, since you ran the script against one fragment's `nr_vdgs`:
-
-```python
-rest   = stem[len(frag) + 1:]                       # drop "<frag>_"
-bucket = re.match(r"(.+?)_clus\d+_size\d+_", rest).group(1)
-subset_size = len(bucket.split("_"))
-```
-
-Don't try to infer it by counting fields from the right instead: `<source>` is a
-biounit stem that may itself contain `_` (`1f8s` vs `1f8s_1`), so the field count
-after the cluster anchor is not a fixed function of subset size.
-
-Hit files from `write_vdg_hit_pdbs.py` follow the same rule with `subset_size` tags
-and no ligand tag — the CG there is the query's own, and the query is already named
-at the front of the file. Their tags are **not** the last fields, though: the name
-ends `..._<vdM tags>_<rmsd>`, so drop one trailing field before counting from the
-right. If two files in one run would get the same name, they are numbered `~1`, `~2`, ….
+Output names have variable heads — parse from the right: strip `.pdb.gz` and any `~<n>` suffix,
+then take the final `4 * (subset_size + 1)` underscore-separated fields as four-field residue
+tags (infer subset_size from AA-bucket tokens in nr mode, from the path in members mode). Hit
+files use the same residue-tag rule but have no ligand tag and end with an RMSD.

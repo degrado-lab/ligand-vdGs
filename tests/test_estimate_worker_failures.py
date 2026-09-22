@@ -52,7 +52,7 @@ class WorkerFailureTests(unittest.TestCase):
             calls['n'] += 1
             if calls['n'] == 1:
                 raise RuntimeError('boom')
-            return {0: 1}, 0, False
+            return {0: 1}, 0, False, False
 
         structures, occurrences = self._run(fake)
         # 19 of 20 counted, and the scale divides by 19, not 20 -- so a fragment
@@ -70,7 +70,7 @@ class WorkerFailureTests(unittest.TestCase):
             calls['n'] += 1
             if calls['n'] <= 2:
                 raise RuntimeError('boom')
-            return {0: 1}, 0, False
+            return {0: 1}, 0, False, False
 
         structures, _ = self._run(fake)
         self.assertEqual(structures[FRAG], 20)
@@ -84,7 +84,7 @@ class WorkerFailureTests(unittest.TestCase):
             calls['n'] += 1
             if calls['n'] % 2:
                 raise RuntimeError('boom')
-            return {0: 1}, 0, False
+            return {0: 1}, 0, False, False
 
         with self.assertRaisesRegex(RuntimeError, 'refusing to emit an estimate'):
             self._run(fake)
@@ -102,8 +102,8 @@ class WorkerFailureTests(unittest.TestCase):
         def fake(path):
             calls['n'] += 1
             if calls['n'] <= 2:
-                return {}, 0, True  # read_ligand_blocks returned None
-            return {0: 1}, 0, False
+                return {}, 0, True, False  # read_ligand_blocks returned None
+            return {0: 1}, 0, False, False
 
         structures, _ = self._run(fake)
         self.assertEqual(structures[FRAG], 20)
@@ -116,12 +116,28 @@ class WorkerFailureTests(unittest.TestCase):
         def fake(path):
             calls['n'] += 1
             if calls['n'] <= 10:
-                return {}, 0, False
-            return {0: 1}, 0, False
+                return {}, 0, False, False
+            return {0: 1}, 0, False, False
 
         structures, _ = self._run(fake)
         self.assertEqual(structures[FRAG], 10)
 
+    def test_all_failed_structures_leave_the_denominator(self):
+        # Unlike the ligandless case above (kept in the denominator), a structure
+        # whose every ligand failed perception must be excluded -- otherwise it
+        # extrapolates as a real zero and biases every count downward (B8). Only 2
+        # of 20 (10%), within MAX_LOST_SAMPLE_FRACTION, so the pass proceeds rather
+        # than refusing (that refusal path is covered separately).
+        calls = {'n': 0}
+
+        def fake(path):
+            calls['n'] += 1
+            if calls['n'] <= 2:
+                return {}, 1, False, True
+            return {0: 1}, 0, False, False
+
+        structures, _ = self._run(fake)
+        self.assertEqual(structures[FRAG], 20)
 
 class ConsumeResultTests(unittest.TestCase):
     """_consume_result is what both branches use, so cover it directly."""

@@ -26,6 +26,7 @@ from ligand_vdgs.generate_vdgs.make_sge_scripts_for_frags import (
     PROVENANCE_FILENAME, check_estimate_header, check_provenance, write_provenance)
 
 from ligand_vdgs.functions.db_identity import identity_of
+from ligand_vdgs.functions.utils import file_sha256
 
 
 def _mirror(root, structures):
@@ -61,13 +62,14 @@ class ProvenancePolicyTests(unittest.TestCase):
         return argparse.Namespace(
             frag_cost_estimate=os.path.join(self.tmp, 'est.tsv'),
             frags_dict=frags_dict or self.frags, pdb_dir=pdb_dir, max_size=max_size,
-            include_only=include_only, min_instances=100)
+            include_only=include_only, min_support=100)
 
     def _header(self, **over):
         """An estimate TSV header recorded against self.old at --max-size 10."""
         path = os.path.join(self.tmp, 'est.tsv')
         fields = {'pdb_dir': self.old, 'max_size': '10',
-                  'pdb_db_identity': identity_of(self.old)['sha256']}
+                  'pdb_db_identity': identity_of(self.old)['sha256'],
+                  'frags_dict_sha256': file_sha256(self.frags)}
         fields.update(over)
         with open(path, 'w') as f:
             for k, v in fields.items():
@@ -125,8 +127,7 @@ class ProvenancePolicyTests(unittest.TestCase):
     def test_the_same_database_at_the_same_path_is_silent(self):
         """Path spelling must not produce noise: --pdb-dir's own default carries a
         trailing slash."""
-        from ligand_vdgs.functions.utils import file_sha256
-        complete = self._header(frags_dict_sha256=file_sha256(self.frags))
+        complete = self._header()
         for spelling in (self.old, self.old + '/', os.path.join(self.old, 'ab', '..')):
             out = self._warnings(lambda: check_estimate_header(
                 complete, self._args(pdb_dir=spelling)))
@@ -169,19 +170,19 @@ class ProvenancePolicyTests(unittest.TestCase):
             check_provenance(self.lib, self._args(max_size=99, include_only=True))
         self.assertIn('max-size', str(cm.exception))
 
-    # --- unknown, not mismatched --------------------------------------------------
+    # --- old incomplete records are unsupported ----------------------------------
 
-    def test_a_record_written_before_identities_existed_warns_instead_of_raising(self):
+    def test_a_record_without_identity_is_refused(self):
         header = self._header()
         header.pop('pdb_db_identity')
-        out = self._warnings(lambda: check_estimate_header(
-            header, self._args(pdb_dir=self.other)))
-        self.assertIn('no parent-database identity', out)
+        with self.assertRaises(SystemExit) as cm:
+            check_estimate_header(header, self._args(pdb_dir=self.other))
+        self.assertIn('missing parent-database identity', str(cm.exception))
 
-    def test_a_missing_provenance_file_does_not_block_an_older_library(self):
-        out = self._warnings(
-            lambda: check_provenance(self.lib, self._args(include_only=True)))
-        self.assertIn('WARNING', out)
+    def test_a_missing_provenance_file_is_refused(self):
+        with self.assertRaises(SystemExit) as cm:
+            check_provenance(self.lib, self._args(include_only=True))
+        self.assertIn('is missing', str(cm.exception))
 
     def test_provenance_round_trips_and_a_matching_run_is_silent(self):
         write_provenance(self.lib, self._args())

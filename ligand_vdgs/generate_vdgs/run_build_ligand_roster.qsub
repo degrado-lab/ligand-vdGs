@@ -1,0 +1,38 @@
+#!/bin/bash
+#$ -S /bin/bash
+#$ -cwd
+#$ -N lig_roster
+#$ -l h_rt=1:00:00
+#$ -l mem_free=4G
+#$ -l scratch=4G
+#$ -pe smp 8
+#$ -o logs/build_ligand_roster.$JOB_ID.sge.log
+#$ -j y
+
+source ~/.bashrc
+conda activate lig_vdgs
+
+# $JOB_ID in -o above is necessary: SGE APPENDS to an existing -o file,
+# so a fixed name silently interleaves runs. 
+
+# STEP 1 of the vocabulary chain: roster -> fragment dict -> cost estimate ->
+# SGE scripts -> library build.
+#
+# -cwd + relative paths: submit from the repo root, or --out/--logfile resolve
+# against the wrong directory.
+#
+python ligand_vdgs/generate_vdgs/build_ligand_roster.py \
+    --pdb-dir /wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2_repaired \
+    --out resources/ligand_roster.pkl \
+    --logfile logs/build_ligand_roster.log \
+    --num-procs 8
+STATUS=$?
+
+[[ -n "$JOB_ID" ]] && qstat -j "$JOB_ID"
+
+if [ "$STATUS" -eq 0 ]; then
+    echo "DONE"
+else
+    echo "FAILED (exit $STATUS)" >&2
+fi
+exit "$STATUS"

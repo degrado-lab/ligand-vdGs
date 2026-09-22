@@ -32,7 +32,7 @@ BB_MODE_TAG = {'per-residue': '_bbPR', 'pooled': '_bbPOOL', 'off': '_bbOFF'}
 
 
 def profile_suffix(norm_method, bb_mode):
-    return NORM_SUFFIX[norm_method] + BB_MODE_TAG[bb_mode]
+    return f'{NORM_SUFFIX[norm_method]}{BB_MODE_TAG[bb_mode]}'
 
 
 def parse_args():
@@ -183,10 +183,7 @@ def plot_bar_chart(propensities, cg, norm_method, outdir, counts=None, extras=No
     ax.set_xticks(np.arange(len(aas)))
     # One line, not two: the labels are rotated 90 deg, so a second line sits
     # *beside* the first and the two collide once there are 39 of them.
-    if counts:
-        xlabels = [f'{aa} (N={counts.get(aa, 0)})' for aa in aas]
-    else:
-        xlabels = aas
+    xlabels = [f'{aa} (N={counts.get(aa, 0)})' for aa in aas] if counts else aas
     ax.set_xticklabels(xlabels, rotation=90, fontsize=5)
     ax.tick_params(axis='x', length=0)
     for spine in ('top', 'right'):
@@ -256,7 +253,7 @@ def _write_log(text, log_path, label):
 def _report_list(items, header, skip_log, label):
     if not items:
         return
-    _write_log('\n'.join([header] + [f'  {i}' for i in items]), skip_log, label)
+    _write_log('\n'.join((header, *(f'  {i}' for i in items))), skip_log, label)
 
 
 def report_skipped(skipped, skip_log):
@@ -266,7 +263,7 @@ def report_skipped(skipped, skip_log):
 
 def main():
     args = parse_args()
-    norm_methods = args.norm_methods if args.norm_methods else ['bg_weighted']
+    norm_methods = args.norm_methods or ['bg_weighted']
 
     # 'none' has no size term, so a 4-atom backbone category has no defensible
     # prior against a whole sidechain. Fail loudly instead of inventing one.
@@ -278,9 +275,6 @@ def main():
     if not os.path.isdir(args.vdglib_dir):
         print(f'[ERROR] vdglib-dir not found: {args.vdglib_dir}')
         return
-
-    plot_single_aa_bars = args.plot_single_aa
-    run_pairs = not args.skip_pairs
 
     print(f'vdglib-dir:   {args.vdglib_dir}')
     print(f'norm methods: {norm_methods}')
@@ -303,23 +297,19 @@ def main():
         cg = dirname
         nr_vdgs_dir = os.path.join(args.vdglib_dir, cg, 'nr_vdgs')
 
-        # Preload single-AA bucket counts once per CG (reused across all norm_methods)
         single_dir = os.path.join(nr_vdgs_dir, '1')
         if not os.path.isdir(single_dir):
             skipped_low_count.append((cg, 0))
             continue
         preloaded_single, single_extras = load_bucket_counts(single_dir,
                                                              bb_mode=args.bb_mode)
-        # Keep the filtering denominator consistent with the profile and NPZ
-        # output: whatever --bb-mode admits is part of the total cluster count.
         total_count = sum(preloaded_single.values())
         if total_count < args.min_clusters:
             skipped_low_count.append((cg, total_count))
             continue
 
-        # Preload pair bucket counts once per CG
         preloaded_pair, pair_extras = None, {}
-        if run_pairs:
+        if not args.skip_pairs:
             pair_dir = os.path.join(nr_vdgs_dir, '2')
             if os.path.isdir(pair_dir):
                 preloaded_pair, pair_extras = load_bucket_counts(
@@ -332,7 +322,6 @@ def main():
 
         print(f'Processing: {cg}  (N={total_count})')
         for norm_method in norm_methods:
-            # Single-AA: always compute and save NPZ; optionally plot bar chart.
             try:
                 single_props, single_counts = calc_single_aa_propensities(
                     nr_vdgs_dir, norm_method, preloaded_single,
@@ -344,13 +333,13 @@ def main():
             if single_props:
                 save_single_aa_npz(single_props, single_counts, cg, norm_method, outdir,
                                    single_extras, args.bb_mode)
-                if plot_single_aa_bars:
+                if args.plot_single_aa:
                     plot_bar_chart(single_props, cg, norm_method, outdir, single_counts,
                                    single_extras, args.bb_mode)
-            elif plot_single_aa_bars:
+            elif args.plot_single_aa:
                 print(f'  [WARNING] No qualifying single-AA vdGs ({norm_method}); skipping bar chart.')
 
-            if run_pairs and preloaded_pair is not None:
+            if not args.skip_pairs and preloaded_pair is not None:
                 pair_props = calc_aa_pair_propensities(
                     nr_vdgs_dir, norm_method, preloaded_pair,
                     bb_mode=args.pair_bb_mode)

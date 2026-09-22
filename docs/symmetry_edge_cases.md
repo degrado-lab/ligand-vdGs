@@ -27,7 +27,8 @@ fragment's automorphism computation. But its `True` branch never fires for a
 fragment that actually reaches a production library, because
 `select_fragments()` (`extract_fragment_smiles.py` /
 `make_sge_scripts_for_frags.py`) filters the fragment dict to the
-`--min-instances` (default 250 estimated CG occurrences in the parent database) *before* any per-fragment vdG
+`--min-support` (distinct parent biounits containing the fragment with every atom
+observed, DR-5; 250 on the annot-1 build) *before* any per-fragment vdG
 generation runs, and hit finding reads the stored group from `cg_symmetry.npz`
 rather than re-deriving it. So at default settings, no production run has ever
 exercised the behavior its docstring example describes, even though the code

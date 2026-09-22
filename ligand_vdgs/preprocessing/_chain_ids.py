@@ -1,16 +1,20 @@
 '''Force single-character chain IDs on parent PDBs before anything parses them.
 
 The PDB fixed-column format gives the chain ID one column (22). Every reader in
-this pipeline honours that: ProDy (``line[21]``), probe, vdG-miner's line hashing
+this pipeline honours that: ProDy (``line[21]``), vdG-miner's line hashing
 (``line[12:26]``) and its ligand scan (``line[21]``). Some sources (BioLiP
 receptor files of large assemblies) write a two-character chain ID across
 columns 21-22 instead, e.g. ``HETATM 1440  N   ASPA4  66`` for chain ``A4``.
 Column 21 is then dropped by every reader, so chain ``A4`` is read as chain ``4``
 and its residue 66 merges with residue 66 of the real chain ``4``. ProDy >= 2.x
 gives the merged atoms a single resindex, so the collision survives
-parsePDB/writePDB with no trace in the output text. In the 2026-09 database this
-affected 99 structures, all of which vdG-miner then dropped whole (probe and PDB
-lines no longer hash to the same key).
+parsePDB/writePDB with no trace in the output text. In the 9/10/26 database this
+affected 99 structures, all of which vdG-miner then dropped whole. (The measured
+loss is from the retired Probe-based contact detection, where the probe and PDB
+lines no longer hashed to the same key; the collision itself is a parsing defect
+upstream of contact detection, so retiring Probe does not make it harmless.)
+Future versions of ligand-vdGs (post-9/16/26) will likely use an augmented 
+database.
 
 The remap is deterministic per file: single-character chains keep their ID,
 each multi-character chain gets the first unused character from ``CHAIN_POOL``
@@ -90,16 +94,6 @@ def remap_chain_ids(lines):
 def remap_remarks(mapping):
     '''REMARK lines recording *mapping*, to prepend to the written PDB.'''
     return [f'{CHAIN_REMAP_REMARK} {old} -> {new}\n' for old, new in mapping.items()]
-
-
-def parse_remap_remarks(lines):
-    '''Inverse of remap_remarks: {old: new} from a file's REMARK lines.'''
-    mapping = {}
-    for line in lines:
-        if line.startswith(CHAIN_REMAP_REMARK):
-            old, _, new = line[len(CHAIN_REMAP_REMARK):].split()
-            mapping[old] = new
-    return mapping
 
 
 def assert_single_char_chains(lines, name=''):

@@ -6,8 +6,7 @@ isotope it produces must be in the string before MolFromSmarts sees it).
 They cannot share code, so they are pinned by this test instead. If session 2
 widens what `_query_primitive` accepts, this is where it fails.
 """
-import os
-import pickle
+from pathlib import Path
 
 import pytest
 from rdkit import Chem, RDLogger
@@ -16,6 +15,7 @@ from ligand_vdgs.functions.utils import (_QUERY_DEGREE_LINE, _QUERY_HCOUNT_LINE,
                                          _BRACKET_ATOM_INNER, _query_primitive,
                                          mol_from_fragment,
                                          split_bracket_annotations)
+from ligand_vdgs.generate_vdgs.extract_fragment_smiles import load_frags_dict
 
 RDLogger.DisableLog('rdApp.*')
 
@@ -85,13 +85,17 @@ def test_out_of_vocabulary_forms_are_refused_by_the_text_reader(key):
 
 def test_every_production_key_parses_on_the_text_side():
     """The shipped dictionary must stay inside the closed grammar."""
-    path = 'resources/database_frags_dict.pkl'
-    if not os.path.exists(path):
-        pytest.skip(f'{path} not present')
-    with open(path, 'rb') as handle:
-        frags_dict = pickle.load(handle)
-    keys = [k for bucket in frags_dict.values() for k in bucket]
+    path = Path(__file__).resolve().parents[1] / 'resources' / 'database_frags_dict.pkl'
+    assert path.exists(), f'{path} not present -- shipped artifact is required, not optional'
+    frags, _support, _meta = load_frags_dict(path)
+    keys = sorted({k for bucket in frags.values() for k in bucket})
     assert keys, 'dictionary is empty; test would pass vacuously'
+    # `frags` is {composition: {annotated SMARTS: [lig_id, ...]}}. Walking the
+    # wrong level yields composition strings ('CCCCO'), which carry no bracket
+    # atoms, so `_text_side` returns [] and never raises -- exactly how this
+    # check passed without ever parsing a production key.
+    non_smarts = [k for k in keys if not _BRACKET_ATOM_INNER.search(k)]
+    assert not non_smarts, non_smarts[:5]
     bad = []
     for key in keys:
         try:

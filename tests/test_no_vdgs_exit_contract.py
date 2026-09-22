@@ -81,17 +81,14 @@ class NoVdgsExitContractTests(unittest.TestCase):
 
 
 class CountOneArityTests(unittest.TestCase):
-    """_count_one must return (counts, read_failures, unreadable) on EVERY path.
+    """_count_one must return (counts, read_failures, unreadable, all_ligands_failed)
+    on EVERY path.
 
-    The early return for a structure with no readable ligands was missed when the
-    read-failure tally was added, and a 40-structure smoke sample happened to
-    contain no such structure -- so the happy path passed while the real 3000-
-    structure run would have died on the first ligand-less file.
-
-    The third field also has to distinguish an unreadable file (None) from a
-    structure that genuinely has no ligands ({}). Conflating them leaves dead
-    files in the denominator of the extrapolation, which biases every count
-    downward and under-requests resources -- jobs killed at h_rt.
+    The third field distinguishes an unreadable file (None) from a structure that
+    genuinely has no ligands ({}); the fourth (B8) distinguishes a structure whose
+    ligands are all present but every one failed perception from either of those.
+    Conflating any of the three leaves dead files in the denominator of the
+    extrapolation, biasing every count downward and under-requesting resources.
     """
 
     def _call(self, ligands):
@@ -106,17 +103,30 @@ class CountOneArityTests(unittest.TestCase):
         finally:
             cg_mod.read_ligand_blocks = real
 
-    def test_no_ligands_returns_a_three_tuple(self):
+    def test_no_ligands_returns_a_four_tuple(self):
         for ligands in (None, {}, []):
             with self.subTest(ligands=ligands):
                 result = self._call(ligands)
                 self.assertIsInstance(result, tuple)
-                self.assertEqual(len(result), 3)
-                counts, failures, unreadable = result
+                self.assertEqual(len(result), 4)
+                counts, failures, unreadable, all_failed = result
                 self.assertEqual((counts, failures), ({}, 0))
                 # None means the file could not be read after retries; an empty
                 # mapping means it was read and had no ligands.
                 self.assertEqual(unreadable, ligands is None)
+                # No ligands to fail perception -- distinct from B8's actual case.
+                self.assertFalse(all_failed)
+
+    def test_all_present_ligands_failing_perception_is_not_a_clean_zero(self):
+        """B8's actual falsifier: ligands are present (not the no-ligands early
+        return above), but every one fails perception -- must be flagged, not
+        silently indistinguishable from a genuinely ligand-less structure."""
+        bad_block = 'HETATM    1        XXX A 301    not numbers at all\n'
+        ligands = {('A', 301, 'XXX'): bad_block, ('A', 302, 'XXX'): bad_block}
+        counts, read_failures, unreadable, all_failed = self._call(ligands)
+        self.assertEqual((counts, unreadable), ({}, False))
+        self.assertEqual(read_failures, len(ligands))
+        self.assertTrue(all_failed)
 
     def test_aggregator_survives_ligandless_structures(self):
         # The real failure: _tally unpacks the tuple, so an early return of the
@@ -126,14 +136,14 @@ class CountOneArityTests(unittest.TestCase):
         struct_hits, occurrences, failures = [0], [0], [0]
 
         def tally(result):
-            matched, n_failed, _unreadable = result
+            matched, n_failed, _unreadable, _all_failed = result
             failures[0] += n_failed
             for i, n in matched.items():
                 struct_hits[i] += 1
                 occurrences[i] += n
 
         tally(self._call(None))
-        tally(({0: 3}, 1, False))
+        tally(({0: 3}, 1, False, False))
         self.assertEqual((struct_hits[0], occurrences[0], failures[0]), (1, 3, 1))
 
 

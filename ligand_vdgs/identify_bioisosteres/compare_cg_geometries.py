@@ -36,8 +36,8 @@ import numpy as np
 
 from ligand_vdgs.functions.vdg_struct_utils import BB_LABELS
 from ligand_vdgs.functions import utils, Frags
-from ligand_vdgs.functions.vdg_npz_utils import (load_vdg_bucket, aa_perm_indices,
-                                                 resolve_fragment_alias)
+from ligand_vdgs.functions.vdg_npz_utils import (CHARGE_SIGNS, load_vdg_bucket,
+                                                 aa_perm_indices, resolve_fragment_alias)
 
 from ligand_vdgs.identify_bioisosteres.common import calc_single_aa_propensities
 
@@ -47,18 +47,12 @@ from ligand_vdgs.identify_bioisosteres.common import calc_single_aa_propensities
 # ---------------------------------------------------------------------------
 
 def compute_single_aa_enrichments(nr_vdgs_dir):
-    """Log-enrichment per contact category (bg_weighted norm). {} if no single-AA vdGs.
-
-    bb_mode is pinned explicitly rather than left to the default: the category set
-    is part of what the numbers mean, and this branch reports them next to
-    geometry, where a silently-changing label set would be hard to notice.
-    """
+    """Return per-residue, background-weighted enrichments or {} if absent."""
     try:
-        enrich, _ = calc_single_aa_propensities(nr_vdgs_dir, 'bg_weighted',
-                                                bb_mode='per-residue')
+        return calc_single_aa_propensities(nr_vdgs_dir, 'bg_weighted',
+                                           bb_mode='per-residue')[0]
     except FileNotFoundError:
         return {}
-    return enrich
 
 
 # ---------------------------------------------------------------------------
@@ -82,11 +76,10 @@ def compare_bucket_geometry(cg_A, bb_A, cg_B, bb_B, aa_bucket_parts,
     cg_B = np.asarray(cg_B, np.float32)
     bb_B = np.asarray(bb_B, np.float32)
 
-    N_A, N_B    = cg_A.shape[0], cg_B.shape[0]
-    num_vdms    = bb_A.shape[1]
-    aa_perms    = aa_perm_indices(list(aa_bucket_parts))
+    N_A, N_B = cg_A.shape[0], cg_B.shape[0]
+    num_vdms = bb_A.shape[1]
+    aa_perms = aa_perm_indices(list(aa_bucket_parts))
 
-    # Subsample to keep runtime feasible
     rng = np.random.default_rng(0)
     if N_A > max_per_lib:
         idx = rng.choice(N_A, max_per_lib, replace=False)
@@ -100,36 +93,26 @@ def compare_bucket_geometry(cg_A, bb_A, cg_B, bb_B, aa_bucket_parts,
     cg_A_cents = cg_A.mean(axis=1)     # [N_A, 3]
     cg_B_cents = cg_B.mean(axis=1)     # [N_B, 3]
 
-    # Build reference vectors for B (fixed)
     ref_B = np.empty((N_B, num_vdms * 3 + 1, 3), dtype=np.float32)
     ref_B[:, :num_vdms * 3] = bb_B.reshape(N_B, -1, 3)
     ref_B[:, -1]             = cg_B_cents
 
-    # Pairwise minimum distances [N_A, N_B] — minimised over AA permutations
     dists_min = np.full((N_A, N_B), np.inf, dtype=np.float32)
 
     for perm in aa_perms:
-        # Build A's references with this residue permutation
-        bb_A_perm = bb_A[:, perm, :, :]        # [N_A, num_vdms, 3, 3]
+        bb_A_perm = bb_A[:, perm, :, :]
         ref_A = np.empty((N_A, num_vdms * 3 + 1, 3), dtype=np.float32)
         ref_A[:, :num_vdms * 3] = bb_A_perm.reshape(N_A, -1, 3)
         ref_A[:, -1]             = cg_A_cents
 
         for i in range(N_A):
-            # Kabsch fast path: one X [N_ref, 3] against many Y [N_B, N_ref, 3]
-            # R, t satisfy: ref_A[i] @ R[j] + t[j] ≈ ref_B[j] (right-multiply)
-            R, t, _ = utils.kabsch(ref_A[i], ref_B)    # R [N_B,3,3], t [N_B,3]
-
-            # Transform CG centroid of A[i] into each B[j]'s frame
-            cg_A_aligned = cg_A_cents[i] @ R + t        # [N_B, 3]
-            dists = np.linalg.norm(cg_A_aligned - cg_B_cents, axis=1)  # [N_B]
+            R, t, _ = utils.kabsch(ref_A[i], ref_B)
+            dists = np.linalg.norm(cg_A_cents[i] @ R + t - cg_B_cents, axis=1)
             np.minimum(dists_min[i], dists, out=dists_min[i])
 
-    min_dist       = float(dists_min.min())
-    frac_A_matched = float((dists_min.min(axis=1) < threshold).mean())
-    frac_B_matched = float((dists_min.min(axis=0) < threshold).mean())
-
-    return min_dist, frac_A_matched, frac_B_matched
+    return (float(dists_min.min()),
+            float((dists_min.min(axis=1) < threshold).mean()),
+            float((dists_min.min(axis=0) < threshold).mean()))
 
 
 # ---------------------------------------------------------------------------
@@ -172,8 +155,8 @@ def _find_completed_frags(vdg_lib_dir, frag_filter):
     (e.g. mid-clustering); only the '<frag>_log' completion line is authoritative
     (Frags.check_vdg_job_status). Incomplete fragments are dropped, with a warning.
     """
-    candidates = (_resolve_requested_frags(vdg_lib_dir, frag_filter) if frag_filter
-                  else sorted(os.listdir(vdg_lib_dir)))
+    candidates = (_resolve_requested_frags(vdg_lib_dir, frag_filter)
+                  if frag_filter else sorted(os.listdir(vdg_lib_dir)))
     completed, incomplete = [], []
     for d in candidates:
         if not os.path.isdir(os.path.join(vdg_lib_dir, d, 'nr_vdgs')):
@@ -198,14 +181,19 @@ def _bucket_counts(vdg_lib_dir, frag, subset_size):
     the size-1 `bb` bucket is usually the library's largest.
     """
     d = os.path.join(vdg_lib_dir, frag, 'nr_vdgs', str(subset_size))
-    counts = {}
     if not os.path.isdir(d):
-        return counts
-    for fname in os.listdir(d):
-        if not fname.endswith('.npz'):
+        return {}
+    counts = {}
+    for sign in CHARGE_SIGNS:
+        sign_dir = os.path.join(d, sign)
+        if not os.path.isdir(sign_dir):
             continue
-        with np.load(os.path.join(d, fname)) as npz:
-            counts[fname[:-4]] = len(npz['cluster_id'])
+        for fname in os.listdir(sign_dir):
+            if not fname.endswith('.npz'):
+                continue
+            with np.load(os.path.join(sign_dir, fname)) as npz:
+                bucket = fname[:-4]
+                counts[bucket] = counts.get(bucket, 0) + len(npz['cluster_id'])
     return counts
 
 
@@ -216,6 +204,19 @@ def _cached_counts(cache, vdg_lib_dir, frag, subset_size):
     if key not in cache:
         cache[key] = _bucket_counts(vdg_lib_dir, frag, subset_size)
     return cache[key]
+
+
+def _load_bucket_all_signs(vdg_lib_dir, frag, subset_size, aa_bucket):
+    """Load and concatenate the disjoint current-format charge partitions."""
+    buckets = [load_vdg_bucket(vdg_lib_dir, frag, subset_size, sign, aa_bucket)
+               for sign in CHARGE_SIGNS]
+    buckets = [bucket for bucket in buckets if bucket is not None]
+    if not buckets:
+        return None
+    keys = ('cg', 'bb', 'cluster_id', 'cluster_num_parents', 'resnames', 'slot_flags')
+    out = {key: np.concatenate([bucket[key] for bucket in buckets], axis=0) for key in keys}
+    out['aa_bucket_parts'] = buckets[0]['aa_bucket_parts']
+    return out
 
 
 def _cached_enrichments(cache, vdg_lib_dir, frag):
@@ -229,9 +230,12 @@ def _shared_aa_buckets(vdg_lib_dir, frag_A, frag_B, subset_sizes):
     """Return set of (subset_size, aa_bucket) tuples present in both libraries."""
     def _buckets(frag, size):
         d = os.path.join(vdg_lib_dir, frag, 'nr_vdgs', str(size))
-        if not os.path.isdir(d):
-            return set()
-        return {f[:-4] for f in os.listdir(d) if f.endswith('.npz')}
+        buckets = set()
+        for sign in CHARGE_SIGNS:
+            sign_dir = os.path.join(d, sign)
+            if os.path.isdir(sign_dir):
+                buckets.update(f[:-4] for f in os.listdir(sign_dir) if f.endswith('.npz'))
+        return buckets
 
     shared = set()
     for size in subset_sizes:
@@ -290,8 +294,8 @@ def compare_pair(vdg_lib_dir, frag_A, frag_B, subset_sizes, threshold,
         )
 
         if not skip_geometry and N_A > 0 and N_B > 0:
-            bucket_A = load_vdg_bucket(vdg_lib_dir, frag_A, subset_size, aa_bucket)
-            bucket_B = load_vdg_bucket(vdg_lib_dir, frag_B, subset_size, aa_bucket)
+            bucket_A = _load_bucket_all_signs(vdg_lib_dir, frag_A, subset_size, aa_bucket)
+            bucket_B = _load_bucket_all_signs(vdg_lib_dir, frag_B, subset_size, aa_bucket)
             if bucket_A is not None and bucket_B is not None:
                 try:
                     # Interchangeable slots come from aa_bucket_parts, the array

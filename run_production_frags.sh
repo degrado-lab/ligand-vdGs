@@ -1,12 +1,12 @@
 #!/bin/bash
-# Generate and submit the full production vdG-library fleet, longest job first.
+# Generate and submit the full production vdG-library fleet, widest job first.
 #
 # MODE IS REQUIRED, and deliberately has no default. The two modes differ in
 # what they do to an existing library, and the destructive reading is the one a
 # forgotten flag would silently select:
 #
 #   --mode threshold-plus-include
-#       Builds every fragment over $MIN_INSTANCES, PLUS anything in $INCLUDE.
+#       Builds every fragment at or over $MIN_SUPPORT biounits, PLUS $INCLUDE.
 #       Demands an empty library: this is a full build, not an addition.
 #
 #   --mode include-only
@@ -20,7 +20,7 @@
 # is, in both -- the difference is only whether the threshold pass runs too.
 #
 # Usage:
-#   ./run_production_frags.sh --mode threshold-plus-include --dry-run
+#   ./run_production_frags.sh --mode threshold-plus-include --no-submit
 #   ./run_production_frags.sh --mode threshold-plus-include
 #   MAX_H_RT=24:00:00 ./run_production_frags.sh --mode threshold-plus-include
 #
@@ -32,37 +32,29 @@
 
 set -euo pipefail
 
-PDB_DIR="${PDB_DIR:-/wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2/}"
-PROBE_DIR="${PROBE_DIR:-/wynton/group/degradolab/skt/docking/databases/probe_output/}"
+PDB_DIR="${PDB_DIR:-/wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2_repaired/}"
 VDG_LIB_DIR="${VDG_LIB_DIR:-/wynton/home/degradolab/skt/docking/frag_lib}"
 LOG_DIR="${LOG_DIR:-/wynton/home/degradolab/skt/docking/frag_sge_logs}"
 ESTIMATE="${ESTIMATE:-resources/frag_cost_estimate.tsv}"
 
 MAX_H_RT="${MAX_H_RT:-36:00:00}"
-# 250 CG occurrences, the generator default. The threshold cannot be made
-# reliable by tuning: over five seeds of the 3000-structure sample the selected
-# set holds ~720 fragments every time but ~40% of the union changes membership,
-# so anything needed specifically belongs in INCLUDE rather than under a lower
-# cutoff. 100 would build 1103 fragments with no less seed noise.
-MIN_INSTANCES="${MIN_INSTANCES:-250}"
+MIN_SUPPORT="${MIN_SUPPORT:-}"
 MEM_FREE="${MEM_FREE:-4G}"
 SCRATCH="${SCRATCH:-20G}"
 
-# Fragments to build regardless of their estimated count, space-separated. The
-# threshold is a sampling estimate: across five seeds of the 3000-structure
-# sample ~40% of the selected set changes membership while its size barely
-# moves, so a fragment you actually need can miss the cut on the draw you took.
+# Fragments to build regardless of their estimated count, space-separated.
 INCLUDE="${INCLUDE:-}"
 
 usage() {
     cat >&2 <<'USAGE'
-Usage: run_production_frags.sh --mode <threshold-plus-include|include-only> [--dry-run]
+Usage: run_production_frags.sh --mode <threshold-plus-include|include-only> [--no-submit]
 
-  --mode threshold-plus-include   Every fragment over $MIN_INSTANCES, plus $INCLUDE.
+  --mode threshold-plus-include   Every fragment at or over $MIN_SUPPORT, plus $INCLUDE.
                                   Requires an EMPTY library: this rebuilds everything.
   --mode include-only             Only the fragments in $INCLUDE, threshold skipped.
                                   Requires an EXISTING library; adds to it in place.
-  --dry-run                       Generate scripts and print the order; submit nothing.
+  --no-submit                     Generate scripts and print the order; submit nothing.
+                                  Note: fragment_aliases.tsv is still updated (non-destructive).
 
 $INCLUDE is honoured in BOTH modes; the mode decides only whether the count
 threshold runs as well. There is no default mode -- a forgotten flag would
@@ -71,14 +63,14 @@ USAGE
     exit 2
 }
 
-DRY_RUN=0
+NO_SUBMIT=0
 MODE=""
 while [ $# -gt 0 ]; do
     case "$1" in
-        --mode)    MODE="${2:-}"; shift 2 || usage ;;
-        --mode=*)  MODE="${1#*=}"; shift ;;
-        --dry-run) DRY_RUN=1; shift ;;
-        -h|--help) usage ;;
+        --mode)     MODE="${2:-}"; shift 2 || usage ;;
+        --mode=*)   MODE="${1#*=}"; shift ;;
+        --no-submit) NO_SUBMIT=1; shift ;;
+        -h|--help)  usage ;;
         *) echo "ERROR: unknown argument '$1'." >&2; usage ;;
     esac
 done
@@ -124,6 +116,18 @@ else
     fi
 fi
 [ -f "$ESTIMATE" ] || { echo "ERROR: missing $ESTIMATE (run estimate_frag_cost.py)." >&2; exit 1; }
+# Refuse rather than substitute a number. --include-only skips the threshold pass
+# entirely, so it legitimately needs none.
+if [ "$TOP_UP" -eq 0 ] && [ -z "$MIN_SUPPORT" ]; then
+    echo "ERROR: MIN_SUPPORT is unset and has no default." >&2
+    echo "  It is the minimum number of distinct parent biounits a fragment must" >&2
+    echo "  appear in, with every atom observed, to be built (DR-5). It decides the" >&2
+    echo "  library's permanent vocabulary, so it must come from the frontier table," >&2
+    echo "  not from a previous run: the flag it replaced counted CG occurrences, a" >&2
+    echo "  different unit that does not convert." >&2
+    echo "  Usage: MIN_SUPPORT=<n> $0 --mode threshold-plus-include" >&2
+    exit 1
+fi
 
 mkdir -p "$LOG_DIR"
 
@@ -133,6 +137,15 @@ mkdir -p "$LOG_DIR"
 # the dict + estimate + flags). Reusing them would silently keep a stale
 # MAX_H_RT, which is the one value most likely to change between runs.
 rm -rf "$SCRIPT_DIR"
+
+# --min-support is required=True in the generator, but --include-only skips the
+# threshold pass entirely, so under top-up there is no threshold to state. 0 is the
+# accurate encoding of that, not an invented number: select_fragments' own
+# `min_support <= 0` branch means "apply no threshold", which is exactly what
+# --include-only does. (Cleaner would be for the generator to drop `required` when
+# --include-only is given; that is Session B's file.)
+MIN_SUPPORT_ARG="$MIN_SUPPORT"
+[ "$TOP_UP" -eq 1 ] && MIN_SUPPORT_ARG=0
 
 # --include takes the fragments verbatim; word-splitting INCLUDE is intended, so
 # each SMARTS becomes its own argument.
@@ -147,10 +160,9 @@ fi
 python ligand_vdgs/generate_vdgs/make_sge_scripts_for_frags.py \
     --frags-dict resources/database_frags_dict.pkl \
     --frag-cost-estimate "$ESTIMATE" \
-    --min-instances "$MIN_INSTANCES" \
+    --min-support "$MIN_SUPPORT_ARG" \
     ${INCLUDE_ARGS[@]+"${INCLUDE_ARGS[@]}"} \
     --pdb-dir "$PDB_DIR" \
-    --probe-dir "$PROBE_DIR" \
     --vdg-lib-dir "$VDG_LIB_DIR" \
     --log-dir "$LOG_DIR" \
     --sge-out-dir "$SCRIPT_DIR" \
@@ -160,35 +172,31 @@ python ligand_vdgs/generate_vdgs/make_sge_scripts_for_frags.py \
     --subset-sizes 1 2
 
 # --- order -----------------------------------------------------------------
-# smiles_to_filename is the same encoder the generator used, so every line here
-# names a script that exists; a missing one is a real mismatch, not a skip.
+# Descending -pe smp slot count, ties in path order. Slots, not estimated
+# runtime, set the queue wait: the scheduler takes far longer to assemble a
+# 20-core reservation than a 10-core one, so the widest jobs have to go in first
+# or they sit behind a wall of narrow ones. A long 10-core job still starts
+# sooner than a short 20-core one, which is why runtime is not a tiebreaker.
+# The count is read back out of the rendered script rather than re-derived from
+# $ESTIMATE, so the order is exactly what was requested; a script with no -pe
+# line is a generator bug and stops the run.
 ORDER_FILE=$(mktemp)
 trap 'rm -f "$ORDER_FILE"' EXIT
-python - "$ESTIMATE" "$SCRIPT_DIR" > "$ORDER_FILE" <<'PY'
-import os, sys
-from ligand_vdgs.functions.utils import smiles_to_filename
-from ligand_vdgs.generate_vdgs.estimate_frag_cost import read_estimate_tsv
-
-estimate_path, script_dir = sys.argv[1:]
-est, _ = read_estimate_tsv(estimate_path)
-
-built = {f[:-3] for f in os.listdir(script_dir) if f.endswith('.sh')}
-by_cg = {}
-for smiles, count in est.items():
-    cg = smiles_to_filename(smiles)
-    if cg in built:
-        by_cg[cg] = max(count, by_cg.get(cg, 0))
-
-missing = built - set(by_cg)
-if missing:
-    sys.exit(f'{len(missing)} generated script(s) absent from the estimate, '
-             f'e.g. {sorted(missing)[:3]}')
-
-# Descending estimated cost: longest-running job first, so it goes in while the
-# maintenance window is still wide enough to schedule it.
-ordered = sorted(by_cg, key=lambda cg: -by_cg[cg])
-for cg in ordered:
-    print(f'{by_cg[cg]}\t{os.path.join(script_dir, cg + ".sh")}')
+python - "$SCRIPT_DIR" > "$ORDER_FILE" <<'PY'
+import os, re, sys
+script_dir, = sys.argv[1:]
+slots_re = re.compile(r'^#\$\s*-pe\s+smp\s+(\d+)', re.MULTILINE)
+rows = []
+for name in sorted(os.listdir(script_dir)):
+    if not name.endswith('.sh'):
+        continue
+    path = os.path.join(script_dir, name)
+    match = slots_re.search(open(path).read())
+    if not match:
+        sys.exit(f'[ERROR] no "#$ -pe smp N" line in {path}')
+    rows.append((-int(match.group(1)), path))
+for neg_slots, path in sorted(rows):
+    print(f'{-neg_slots}\t{path}')
 PY
 
 # In include-only mode, refuse fragments the library already holds. Nothing
@@ -201,13 +209,13 @@ if [ "$TOP_UP" -eq 1 ]; then
     KEPT_FILE=$(mktemp)
     already=0
     partial=0
-    while IFS=$'\t' read -r est_count script; do
+    while IFS=$'\t' read -r slots script; do
         cg=$(basename "$script" .sh)
         d="$VDG_LIB_DIR/$cg"
         if [ ! -d "$d" ] || [ -z "$(ls -A "$d" 2>/dev/null)" ]; then
             # Absent, or present but empty -- set_up_outdir accepts an empty dir,
             # which is what a job killed before it wrote anything leaves.
-            printf '%s\t%s\n' "$est_count" "$script" >> "$KEPT_FILE"
+            printf '%s\t%s\n' "$slots" "$script" >> "$KEPT_FILE"
         elif grep -q '^Job completed\.' "$d/${cg}_log" 2>/dev/null; then
             echo "ALREADY BUILT, skipping: $cg" >&2
             already=$((already + 1))
@@ -234,15 +242,15 @@ fi
 
 TOTAL=$(wc -l < "$ORDER_FILE")
 echo
-echo "Submission order: $TOTAL job(s), longest estimated runtime first."
-echo "Maintenance boundary: 2026-09-07 15:00 PDT. h_rt ceiling: $MAX_H_RT."
+echo "Submission order: $TOTAL job(s), most -pe smp slots first."
+echo "h_rt ceiling: $MAX_H_RT."
 echo
 
-if [ "$DRY_RUN" -eq 1 ]; then
+if [ "$NO_SUBMIT" -eq 1 ]; then
     echo "--- first 15 ---"; head -15 "$ORDER_FILE"
     echo "--- last 10 ---";  tail -10 "$ORDER_FILE"
     echo
-    echo "Dry run: nothing submitted. Scripts are in $SCRIPT_DIR."
+    echo "Submission order printed. Scripts in $SCRIPT_DIR (not submitted)."
     exit 0
 fi
 
@@ -254,9 +262,9 @@ FAILED_FILE="qsub_failures.txt"
 : > "$FAILED_FILE"
 n=0
 ok=0
-while IFS=$'\t' read -r est_count script; do
+while IFS=$'\t' read -r slots script; do
     n=$((n + 1))
-    printf '[%4d/%4d] %7s structures  ' "$n" "$TOTAL" "$est_count"
+    printf '[%4d/%4d] %3s slots  ' "$n" "$TOTAL" "$slots"
     if qsub "$script"; then
         ok=$((ok + 1))
     else
@@ -274,8 +282,8 @@ else
     rm -f "$FAILED_FILE"
 fi
 # A production run writes no marker file -- _finish() appends 'Job completed.' to
-# <cg>_log. That line is the only way to tell a finished fragment from one the
-# maintenance window killed, since both leave a populated nr_vdgs/.
+# <cg>_log. That line is the only way to tell a finished fragment from one killed
+# at its h_rt ceiling, since both leave a populated nr_vdgs/.
 # Driven off the generated scripts, not off $VDG_LIB_DIR/*/: a fragment that was
 # never scheduled, was rejected at qsub, or died before set_up_outdir ran has no
 # library directory at all, so globbing the library cannot see the failures that

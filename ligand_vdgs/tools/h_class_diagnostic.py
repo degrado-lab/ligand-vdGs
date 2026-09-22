@@ -1,39 +1,4 @@
-"""h_class_diagnostic.py
-
-Per fragment key / CG-atom slot orbit (automorphism-equivalent slots pooled)
-/ AA bucket: does H-class (``num_h == 0`` vs. ``> 0``) split the observations
-informatively? Run after every library (re)build and whenever the fragment
-key scheme changes, before deciding which ``H0``/``!H0`` key variants to pool
-at read time. Full rationale: docs/database_generation_guide.md, "When to run
-the H-class diagnostic".
-
-Reads ``{nr,mem}_cg_heavy_degree`` / ``{nr,mem}_cg_num_h`` (int8, n_rows x
-n_cg_atoms) written alongside the usual per-row arrays. Sentinel contract: a
-NEGATIVE value means "unreadable"; 0 is a real count, so ``heavy_degree == 0``
-(impossible for a connected atom) is a hard error, and ``heavy_degree < 0``
-with ``num_h >= 0`` only warns. A bucket violating this aborts the run;
-``--dry-run`` only runs this check, over the whole library. Optional
-``nr_vdm_o_coords`` (backbone carbonyl O, never part of RMSD) lets
-``--contact-atoms`` include ``O``.
-
-Per orbit/bucket, measures (a) class balance (nr+mem observations, clusters,
-parents) per H-class; (b) contact rate by class (nr rows only: CG atom within
-``--cutoff`` of a stored backbone atom), with a cluster-block bootstrap CI on
-the H-vs-noH difference; (c) verdict -- ``single-class`` (a class <
-``--min-class-frac`` of known pairs) > ``low-support`` (< ``--min-support``
-nr rows, or too few valid bootstrap reps) > ``informative``/``uninformative``
-by whether the CI excludes 0.
-
-Output: a TSV, one row per key/slot orbit/bucket/class, plus a stdout
-summary. Bucket ``X`` (non-canonical) is never read.
-
-Usage
------
-    python ligand_vdgs/tools/h_class_diagnostic.py --lib /path/to/frag_lib \\
-        --out h_class.tsv [--keys keys.txt] [--buckets bb ASP GLU] \\
-        [--subset-size 1] [--cutoff 3.5] [--contact-atoms N,CA,C,O]
-    python ligand_vdgs/tools/h_class_diagnostic.py --lib /path/to/frag_lib --dry-run
-"""
+# used in post-build validation (scripts/check_library_after_build.py) and one test (tests/test_dr61_charge_sign.py)
 
 import argparse
 import itertools
@@ -45,17 +10,16 @@ import numpy as np
 from ligand_vdgs.functions import parent_db, utils
 from ligand_vdgs.functions.Frags import check_vdg_job_status
 from ligand_vdgs.functions.vdg_npz_utils import (
-    cg_symmetry_path, load_bucket_npz, load_cg_symmetry, load_vdg_bucket,
-    make_aa_bucket, vdg_npz_path)
+    CHARGE_SIGNS, cg_symmetry_path, load_bucket_npz, load_cg_symmetry,
+    load_vdg_bucket, make_aa_bucket, vdg_npz_path)
 from ligand_vdgs.functions.vdg_struct_utils import (
     BB_LABEL, CANONICAL_HEAVY_ATOMS, NONCANONICAL_AA_LABEL)
 
 H_CLASS_FIELDS = ("nr_cg_heavy_degree", "nr_cg_num_h",
                   "mem_cg_heavy_degree", "mem_cg_num_h")
-# Order of the stored vdM backbone triplet (see build_vdg_atomgroup_from_npz).
 BB_ATOM_ORDER = ("N", "CA", "C")
 SLOT_LABELS = tuple(sorted(CANONICAL_HEAVY_ATOMS)) + (BB_LABEL,)
-O_COORDS_FIELD = "nr_vdm_o_coords"   # optional (n_nr, num_vdms, 3)
+O_COORDS_FIELD = "nr_vdm_o_coords"
 
 TSV_COLUMNS = (
     "key", "cg_smarts", "subset_size", "bucket", "slot_orbit", "orbit_elements",
@@ -65,17 +29,10 @@ TSV_COLUMNS = (
 
 
 class ContractError(RuntimeError):
-    """A bucket does not carry the H-class fields this tool reads."""
+    pass
 
-
-# --- Library discovery ---
 
 def completed_fragments(lib_dir, keys=None):
-    """Fragment dir names with a completed job log and a symmetry sidecar.
-
-    ``keys`` maps to directory names via ``utils.smiles_to_filename``;
-    without it every directory at the library root is a candidate.
-    """
     candidates = ([utils.smiles_to_filename(k) for k in keys] if keys is not None
                   else sorted(os.listdir(lib_dir)))
     done, skipped = [], []
@@ -92,35 +49,37 @@ def completed_fragments(lib_dir, keys=None):
         print(f"[WARNING] skipping {frag!r}: {why}", file=sys.stderr)
     return done
 
-
 def bucket_names(subset_size):
-    """Every bucket name a subset size can produce, X-free, sorted."""
     combos = itertools.combinations_with_replacement(SLOT_LABELS, subset_size)
     return sorted({make_aa_bucket(c) for c in combos})
 
-
 def read_bucket(lib_dir, frag, subset_size, bucket):
-    """Full array dict of one bucket, or None if absent/non-canonical/unreadable.
-
-    ``load_vdg_bucket`` carries the job-status warning and corrupt-file
-    handling but strips mem_ rows and the H-class fields, so the full dict is
-    read separately once it has confirmed the file is good.
-    """
     if NONCANONICAL_AA_LABEL in bucket.split("_"):
         return None
-    if load_vdg_bucket(lib_dir, frag, subset_size, bucket) is None:
+    loaded = []
+    for sign in CHARGE_SIGNS:
+        path = vdg_npz_path(lib_dir, frag, subset_size, sign, bucket)
+        if load_vdg_bucket(lib_dir, frag, subset_size, sign, bucket) is not None:
+            data = load_bucket_npz(path)
+            if data is not None:
+                loaded.append((sign, data))
+    if not loaded:
         return None
-    return load_bucket_npz(vdg_npz_path(lib_dir, frag, subset_size, bucket))
-
-
-# --- Contract check ---
+    nr_keys = {'cluster_id', 'cluster_size', 'cluster_num_parents', 'cluster_pose_radius',
+               'first_stage_cluster_id', 'second_stage_cluster_id'}
+    out = {}
+    for key, value in loaded[0][1].items():
+        if key in nr_keys or key.startswith(('nr_', 'mem_')):
+            out[key] = np.concatenate([data[key] for _sign, data in loaded], axis=0)
+        else:
+            out[key] = value
+    out['_source_npz_path'] = vdg_npz_path(lib_dir, frag, subset_size, loaded[0][0], bucket)
+    return out
 
 def contract_problems(data, npz_path):
-    """Human-readable problems with the H-class fields of one bucket ([] if ok)."""
     n_cg = int(data["cg_elements"].shape[0])
     n_nr, n_mem = len(data["cluster_id"]), len(data["mem_cluster_id"])
-    expected = dict(zip(H_CLASS_FIELDS,
-                        [(n_nr, n_cg), (n_nr, n_cg), (n_mem, n_cg), (n_mem, n_cg)]))
+    expected = dict(zip(H_CLASS_FIELDS, [(n_nr, n_cg)] * 2 + [(n_mem, n_cg)] * 2))
     problems = []
     for field, shape in expected.items():
         if field not in data:
@@ -134,10 +93,6 @@ def contract_problems(data, npz_path):
         elif arr.dtype != np.int8:
             print(f"[WARNING] {npz_path}: {field} is {arr.dtype}, not int8; read anyway.",
                   file=sys.stderr)
-    # 0 degree is impossible (every CG atom has >= 1 heavy neighbour), so it can only
-    # be a writer storing 0 for "unreadable" instead of the required negative sentinel
-    # (error). deg < 0 with num_h >= 0 is merely suspicious -- H count claimed for an
-    # atom whose graph was unreadable -- so it only warns.
     for prefix in ("nr", "mem"):
         deg, nh = f"{prefix}_cg_heavy_degree", f"{prefix}_cg_num_h"
         if deg not in data or nh not in data or data[deg].shape != data[nh].shape:
@@ -153,7 +108,6 @@ def contract_problems(data, npz_path):
                   file=sys.stderr)
     return problems
 
-
 def require_contract(data, npz_path):
     problems = contract_problems(data, npz_path)
     if problems:
@@ -164,9 +118,7 @@ def require_contract(data, npz_path):
             + "\nRebuild the library with a writer that records them, or run "
               "--dry-run to list every affected bucket.")
 
-
 def dry_run(lib_dir, frags, subset_size, buckets):
-    """Validate the contract over every requested bucket; return #problem buckets."""
     n_checked = n_bad = 0
     for frag in frags:
         for bucket in buckets:
@@ -174,8 +126,7 @@ def dry_run(lib_dir, frags, subset_size, buckets):
             if data is None:
                 continue
             n_checked += 1
-            problems = contract_problems(
-                data, vdg_npz_path(lib_dir, frag, subset_size, bucket))
+            problems = contract_problems(data, data['_source_npz_path'])
             if problems:
                 n_bad += 1
                 print("\n".join(problems))
@@ -184,11 +135,7 @@ def dry_run(lib_dir, frags, subset_size, buckets):
           f"({', '.join(H_CLASS_FIELDS)}).")
     return n_bad
 
-
-# --- Per-bucket statistics ---
-
 def slot_orbits(automorphisms, n_cg):
-    """Connected components of slot indices under the automorphism group."""
     parent = list(range(n_cg))
 
     def find(i):
@@ -207,9 +154,7 @@ def slot_orbits(automorphisms, n_cg):
         orbits.setdefault(find(i), []).append(i)
     return [tuple(v) for _, v in sorted(orbits.items())]
 
-
 def contact_atom_indices(contact_atoms):
-    """Indices into BB_ATOM_ORDER for the non-'O' entries of --contact-atoms."""
     idx = []
     for name in contact_atoms:
         if name == "O":
@@ -220,12 +165,10 @@ def contact_atom_indices(contact_atoms):
         idx.append(BB_ATOM_ORDER.index(name))
     return idx
 
-
 def nr_contacts(data, atom_idx, cutoff, want_o):
-    """(n_nr, n_cg) bool: CG atom within cutoff of any selected stored residue atom."""
-    cg = np.asarray(data["nr_cg_coords"], dtype=np.float64)          # (n, n_cg, 3)
-    bb = np.asarray(data["nr_vdm_bb_coords"], dtype=np.float64)      # (n, v, 3, 3)
-    res = bb[:, :, atom_idx, :].reshape(bb.shape[0], -1, 3)          # (n, v*a, 3)
+    cg = np.asarray(data["nr_cg_coords"], dtype=np.float64)
+    bb = np.asarray(data["nr_vdm_bb_coords"], dtype=np.float64)
+    res = bb[:, :, atom_idx, :].reshape(bb.shape[0], -1, 3)
     if want_o:
         if O_COORDS_FIELD not in data:
             raise ContractError(
@@ -233,32 +176,22 @@ def nr_contacts(data, atom_idx, cutoff, want_o):
                 "(n_nr, num_vdms, 3) field; rebuild with a writer that stores the "
                 "backbone carbonyl O, or drop O from --contact-atoms.")
         res = np.concatenate([res, np.asarray(data[O_COORDS_FIELD], dtype=np.float64)], axis=1)
-    d = np.linalg.norm(cg[:, :, None, :] - res[:, None, :, :], axis=-1)
-    # An absent O is NaN; a plain min would turn the whole row NaN (-> False).
-    return np.where(np.isnan(d), np.inf, d).min(axis=2) <= cutoff
-
+    distances = np.linalg.norm(cg[:, :, None, :] - res[:, None, :, :], axis=-1)
+    return np.where(np.isnan(distances), np.inf, distances).min(axis=2) <= cutoff
 
 def h_class_of(num_h):
-    """1 = H, 0 = noH, -1 = unknown (negative sentinel)."""
     num_h = np.asarray(num_h)
     return np.where(num_h < 0, -1, (num_h > 0).astype(np.int8))
 
-
 def bootstrap_diff(nH, cH, nN, cN, n_boot, rng, chunk=200):
-    """Cluster-block bootstrap of rate_H - rate_noH.
-
-    Inputs are per-nr-row (per-cluster) pair counts: H pairs, contacting H
-    pairs, noH pairs, contacting noH pairs. Reps where a class vanishes are
-    NaN and excluded from the percentile CI; their count is reported.
-    """
     n = len(nH)
-    counts = np.stack([nH, cH, nN, cN], axis=1).astype(np.float64)   # (n, 4)
+    counts = np.stack([nH, cH, nN, cN], axis=1).astype(np.float64)
     diffs = np.empty(n_boot)
     p = np.full(n, 1.0 / n)
     for start in range(0, n_boot, chunk):
         reps = min(chunk, n_boot - start)
-        weights = rng.multinomial(n, p, size=reps).astype(np.float64)  # (reps, n)
-        s = weights @ counts                                            # (reps, 4)
+        weights = rng.multinomial(n, p, size=reps).astype(np.float64)
+        s = weights @ counts
         with np.errstate(invalid="ignore", divide="ignore"):
             diffs[start:start + reps] = s[:, 1] / s[:, 0] - s[:, 3] / s[:, 2]
     valid = np.isfinite(diffs)
@@ -267,23 +200,19 @@ def bootstrap_diff(nH, cH, nN, cN, n_boot, rng, chunk=200):
     lo, hi = np.percentile(diffs[valid], [2.5, 97.5])
     return float(lo), float(hi), int(valid.sum())
 
-
 def _degree_hist(degrees):
     vals, cnts = np.unique(degrees, return_counts=True)
     return ";".join(f"{int(v)}:{int(c)}" for v, c in zip(vals, cnts)) or ""
 
-
 def _fmt(x):
     return "" if x is None or (isinstance(x, float) and np.isnan(x)) else f"{x:.4f}"
 
-
 def analyse_bucket(data, orbits, args, rng):
-    """Rows (dicts, TSV_COLUMNS keys minus key/smarts/bucket) for one bucket."""
     n_nr, n_mem = len(data["cluster_id"]), len(data["mem_cluster_id"])
     elements = [str(e) for e in data["cg_elements"]]
 
-    cls_nr = h_class_of(data["nr_cg_num_h"])                    # (n_nr, n_cg)
-    cls_mem = h_class_of(data["mem_cg_num_h"])                  # (n_mem, n_cg)
+    cls_nr = h_class_of(data["nr_cg_num_h"])
+    cls_mem = h_class_of(data["mem_cg_num_h"])
     cls_all = np.concatenate([cls_nr, cls_mem], axis=0)
     deg_all = np.concatenate([data["nr_cg_heavy_degree"],
                               data["mem_cg_heavy_degree"]], axis=0)
@@ -296,18 +225,16 @@ def analyse_bucket(data, orbits, args, rng):
     rows = []
     for orbit in orbits:
         orbit = list(orbit)
-        # (observation, slot) pairs pooled over the orbit's slots.
         c_pairs = cls_all[:, orbit].ravel()
         d_pairs = deg_all[:, orbit].ravel()
         obs_idx = np.repeat(np.arange(n_nr + n_mem), len(orbit))
         n_pairs = c_pairs.size
         n_known = int((c_pairs >= 0).sum())
 
-        # nr-only, for geometry: per-row counts feed the block bootstrap.
-        c_nr = cls_nr[:, orbit]                                  # (n_nr, k)
+        c_nr = cls_nr[:, orbit]
         k_nr = contact[:, orbit]
-        nH = (c_nr == 1).sum(axis=1); cH = ((c_nr == 1) & k_nr).sum(axis=1)
-        nN = (c_nr == 0).sum(axis=1); cN = ((c_nr == 0) & k_nr).sum(axis=1)
+        nH, cH = (c_nr == 1).sum(axis=1), ((c_nr == 1) & k_nr).sum(axis=1)
+        nN, cN = (c_nr == 0).sum(axis=1), ((c_nr == 0) & k_nr).sum(axis=1)
         rate = {"H": cH.sum() / nH.sum() if nH.sum() else np.nan,
                 "noH": cN.sum() / nN.sum() if nN.sum() else np.nan}
         nr_rows = {"H": int((nH > 0).sum()), "noH": int((nN > 0).sum())}
@@ -356,15 +283,7 @@ def analyse_bucket(data, orbits, args, rng):
             ))
     return rows
 
-
-# --- Driver ---
-
 def select_buckets(lib_dir, frag, subset_size, requested, min_bucket_obs):
-    """(bucket, data) pairs to analyse for one fragment.
-
-    Default: bb, ASP, GLU (subset size 1) plus any bucket with at least
-    ``min_bucket_obs`` observations (nr + mem rows).
-    """
     names = requested if requested else bucket_names(subset_size)
     always = set() if requested else {BB_LABEL, "ASP", "GLU"}
     out = []
@@ -381,7 +300,6 @@ def select_buckets(lib_dir, frag, subset_size, requested, min_bucket_obs):
         if requested or bucket in always or n_obs >= min_bucket_obs:
             out.append((bucket, data))
     return out
-
 
 def print_summary(rows):
     print("\nH-class diagnostic summary (contact = CG atom within cutoff of a stored "
@@ -410,7 +328,6 @@ def print_summary(rows):
             print(f"  {ref['bucket']:<8} slot {ref['slot_orbit']:<7} "
                   f"{ref['orbit_elements']:<5} {' | '.join(parts)}{ci} "
                   f"-> {ref['verdict']} ({ref['reason']})")
-
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__,
@@ -448,7 +365,6 @@ def parse_args(argv=None):
         p.error("--subset-size must be 1 or 2")
     return args
 
-
 def main(argv=None):
     args = parse_args(argv)
     keys = None
@@ -470,7 +386,7 @@ def main(argv=None):
         cg_smarts, automorphisms = load_cg_symmetry(args.lib, frag)
         for bucket, data in select_buckets(args.lib, frag, args.subset_size,
                                            args.buckets, args.min_bucket_obs):
-            npz_path = vdg_npz_path(args.lib, frag, args.subset_size, bucket)
+            npz_path = data['_source_npz_path']
             try:
                 require_contract(data, npz_path)
             except ContractError as err:
@@ -488,7 +404,6 @@ def main(argv=None):
             fh.write("\t".join(str(r[c]) for c in TSV_COLUMNS) + "\n")
     print_summary(rows)
     print(f"\nWrote {len(rows)} rows to {args.out}")
-
 
 if __name__ == "__main__":
     main()

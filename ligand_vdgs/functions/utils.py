@@ -1,5 +1,3 @@
-# utils.py
-
 import itertools
 import os
 import re
@@ -10,17 +8,12 @@ import numpy as np
 
 import hashlib
 
-
 def file_sha256(path):
-    """SHA-256 of a file, streamed. Used to pin derived artifacts (the cost
-    estimate TSV, the library provenance record) to the fragment dict they were
-    computed from."""
     h = hashlib.sha256()
     with open(path, 'rb') as handle:
         for block in iter(lambda: handle.read(1 << 20), b''):
             h.update(block)
     return h.hexdigest()
-
 
 def _int_or_none(v):
     if v.lower() == 'none':
@@ -28,8 +21,6 @@ def _int_or_none(v):
     return int(v)
 
 def set_up_outdir(outdir, overwrite=False):
-    '''Create outdir if it does not exist, and require overwrite if it does, so that there are '
-    no stale files.'''
     if os.path.exists(outdir):
         if not os.path.isdir(outdir):
             raise ValueError(f'[ERROR] The filename you designated as the output directory, {outdir}, '
@@ -37,14 +28,12 @@ def set_up_outdir(outdir, overwrite=False):
         if overwrite:
             print(f'[WARNING] Overwriting existing output directory {outdir} because '
                   'overwrite_existing was set to True.')
-            # Another process might remove/create concurrently; guard with try/except.
             try:
                 shutil.rmtree(outdir)
             except FileNotFoundError:
                 pass
             os.makedirs(outdir, exist_ok=True)
         else:
-            # Allow empty dirs; error only if files are present.
             with os.scandir(outdir) as entries:
                 not_empty = any(entries)
             if not_empty:
@@ -57,34 +46,15 @@ def set_up_outdir(outdir, overwrite=False):
         os.makedirs(outdir, exist_ok=True)
 
 def smiles_equiv(existingfrag, sub_smiles):
-    """Whether two fragment keys denote the same substructure.
-
-    Delegates to fragment_keys_equivalent: comparing ring-annotated keys
-    directly is not even reflexive, because `r<n>` cannot be satisfied on the
-    acyclic graph a fragment key parses to.
-    """
     return fragment_keys_equivalent(existingfrag, sub_smiles)
 
-# Elements whose terminal atoms are treated as interchangeable positions.
-_TERMINAL_RESONANCE_ELEMENTS = frozenset({7, 8, 16})  # N, O, S
-# Centers those terminal atoms may hang off: B, C, N, O, P, S, Cl, Br, I.
-# The halogens cover perchlorate/periodate-style oxyanions; B covers boronates.
+_TERMINAL_RESONANCE_ELEMENTS = frozenset({7, 8, 16})
 _TERMINAL_RESONANCE_CENTERS = frozenset({5, 6, 7, 8, 15, 16, 17, 35, 53})
 
-# `D<n>` and `H0`/`!H0` are read back off the parsed query rather than off the
-# key string, which `_automorphism_graph` never sees.
 _QUERY_DEGREE_LINE = re.compile(r'^\s*AtomExplicitDegree (\d+) (!?)= val\s*$', re.M)
 _QUERY_HCOUNT_LINE = re.compile(r'^\s*AtomHCount (\d+) (!?)= val\s*$', re.M)
 
-
 def _query_primitive(atom, pattern):
-    """Values of one SMARTS primitive declared on a query atom, or None.
-
-    A sorted tuple of ``(value, negated)``, so ``[O;D1,D2]`` and ``!D1`` stay
-    distinguishable instead of collapsing onto the first match. Real atoms and
-    recursive SMARTS give None: a recursive query's description embeds the
-    primitives of its environment, which are not the atom's own.
-    """
     if not atom.HasQuery():
         return None
     description = atom.DescribeQuery()
@@ -95,24 +65,11 @@ def _query_primitive(atom, pattern):
         return None
     return tuple(sorted((int(value), bool(negated)) for value, negated in found))
 
-
 def _query_allows_terminal(atom):
-    """Whether the key's own `D<n>` contradicts this atom being terminal.
-
-    A bridging heteroatom cut out of its parent has fragment-graph degree 1 but
-    carries `D2`. Without this, it joins the terminal set and a bridging O can
-    be mapped onto a terminal O.
-    """
     degree = _query_primitive(atom, _QUERY_DEGREE_LINE)
     return degree is None or degree == ((1, False),)
 
-
 def _has_deliberate_charge_assignment(mol, bond_indices):
-    """True if a terminal set's drawn charges should be trusted as-is.
-
-    See the carve-out described in ``_find_resonance_terminal_groups``: four or
-    more terminal atoms, every bond single, and charges that are not uniform.
-    """
     if len(bond_indices) < 4:
         return False
     if any(mol.GetBondWithIdx(i).GetBondTypeAsDouble() != 1.0 for i in bond_indices):
@@ -126,39 +83,7 @@ def _has_deliberate_charge_assignment(mol, bond_indices):
                 charges.add(atom.GetFormalCharge())
     return len(charges) > 1
 
-
 def _find_resonance_terminal_groups(mol):
-    """Find terminal X-N/O/S groups whose drawn bond order and charge may move.
-
-    Two or more terminal atoms of the same element on a common center are
-    treated as one set of interchangeable positions. In these hydrogen-free
-    fragments a drawn ``-OH``, ``=O``, and ``[O-]`` on the same center are the
-    same physical position recorded in different protonation or resonance
-    states, so the drawing must not decide which vdG atom maps to which.
-
-    Each element forms its own set, so a terminal O is never exchanged with a
-    terminal S (see ``OP(O)(=S)[S-]``: the O pair and the S pair each permute,
-    but not across). Aromatic terminal atoms are excluded -- a truncated ring
-    atom is a real ring position, not a resonance form of an exocyclic
-    substituent, so the ring ``o`` and the hydroxyl ``O`` of ``cc(o)O`` stay
-    distinct. Degree, not implicit H count, defines "terminal" here because
-    these fragments carry no hydrogens -- but fragment-graph degree alone is
-    not enough: a bridging heteroatom cut at the key's radius also has degree
-    1, so a declared ``D<n>`` other than ``D1`` excludes the atom.
-
-    Substituted and bridging atoms represented in the fragment are untouched.
-
-    One carve-out: a saturated center carrying four or more terminal atoms of an
-    element, all single-bonded but not all the same charge, is left alone. Such
-    a drawing has no bond-order ambiguity left to resolve, so its explicit
-    charge assignment is taken as deliberate. This keeps the bisulfate drawing
-    ``[O-]S([O-])([O-])O`` at three interchangeable anionic oxygens plus a fixed
-    hydroxyl, rather than merging all four. It fires on that fragment alone in
-    the current dictionary; three-terminal centers such as ``cS([O-])(O)O`` are
-    unaffected and still merge fully.
-
-    Returns: dict {bond_idx: (center_atomic_num, group_id)}
-    """
     resonance_groups = {}
     next_group_id = 0
 
@@ -189,19 +114,8 @@ def _find_resonance_terminal_groups(mol):
 
     return resonance_groups
 
-
 def _find_resonance_center_groups(mol, center_z, neighbor_z, charge_rule):
-    """Shared body of the C-N / N-O / S-N finders below.
-
-    Recognizes a non-aromatic ``center_z`` atom carrying >=2 ``neighbor_z``
-    neighbors, accepted when it has a double bond to one of them or when
-    ``charge_rule`` (``None``, ``'positive'`` or ``'nonzero'``) admits its formal
-    charge. Group ids restart at 0 per call; the tag's ``center_z`` is what keeps
-    the finders' outputs distinct when the caller merges them.
-    """
     if charge_rule not in (None, 'positive', 'nonzero'):
-        # Unrecognized rules would otherwise fall through both tests below and
-        # silently accept every center.
         raise ValueError(f"unknown charge_rule {charge_rule!r}")
 
     resonance_groups = {}
@@ -237,62 +151,16 @@ def _find_resonance_center_groups(mol, center_z, neighbor_z, charge_rule):
 
     return resonance_groups
 
-
 def _find_resonance_CN_groups(mol):
-    """Find amidine/guanidine C-N groups whose drawn form is ignored.
-
-    A group is recognized at a non-aromatic carbon with at least two nitrogen
-    neighbors and either a C=N double bond or positive formal charge on the
-    carbon. The latter admits all-single-bond ``[C+]`` resonance drawings. All
-    C-N bonds at a recognized center are normalized; exact graph matching still
-    preserves every substituent attached beyond each nitrogen.
-
-    Ordinary aminals and nitrile-like C#N groups are deliberately excluded.
-    They have neither the amidine/guanidine C=N bond nor the charged-carbon
-    resonance representation.
-
-    Returns: dict {bond_idx: (center_atomic_num, group_id)}
-    """
     return _find_resonance_center_groups(mol, 6, 7, 'positive')
 
-
 def _find_resonance_NO_groups(mol):
-    """Find N-O groups whose bond/charge drawing may move among oxygens.
-
-    The rule covers a non-aromatic nitrogen with at least two oxygen neighbors
-    when either an N=O bond or a formal charge on nitrogen marks a resonance
-    representation. It therefore includes both ``cN(=O)O`` and
-    ``C=[N+]([O-])O``. Exact graph matching still preserves every represented
-    substituent beyond each oxygen.
-
-    Returns: dict {bond_idx: (center_atomic_num, group_id)}
-    """
     return _find_resonance_center_groups(mol, 7, 8, 'nonzero')
 
-
 def _find_resonance_SN_groups(mol):
-    """Find S-N groups whose single/double-bond placement may exchange.
-
-    A group is recognized at a non-aromatic sulfur with at least two nitrogen
-    neighbors and at least one S=N double bond. This covers S(VI)-N resonance
-    drawings such as ``CS(=N)(N)=O`` and ``N=S(N)(=O)F`` without treating
-    ordinary all-single-bond S-N groups as equivalent.
-
-    Returns: dict {bond_idx: (center_atomic_num, group_id)}
-    """
     return _find_resonance_center_groups(mol, 16, 7, None)
 
-
 def _find_resonance_NN_groups(mol):
-    """Find conjugated non-aromatic N chains whose bond placement may move.
-
-    Components must contain at least three nitrogens joined by N-N bonds and at
-    least one N=N double bond. Normalizing only bonds inside that component lets
-    exact graph matching recover the reversal of ``cN=NNc`` while retaining all
-    represented attachments at the two ends.
-
-    Returns: dict {bond_idx: (center_atomic_num, group_id)}
-    """
     nitrogen_indices = {
         atom.GetIdx() for atom in mol.GetAtoms()
         if atom.GetAtomicNum() == 7 and not atom.GetIsAromatic()
@@ -335,16 +203,7 @@ def _find_resonance_NN_groups(mol):
 
     return resonance_groups
 
-
 def _find_resonance_aromatic_N_atoms(mol):
-    """Find aromatic N atoms whose charge/proton placement may be ignored.
-
-    Only aromatic nitrogens in an aromatic-bond-connected component containing
-    at least two aromatic nitrogens participate. Exact graph matching still
-    decides whether any of those atoms can exchange. Requiring a shared aromatic
-    component prevents unrelated sites such as the two ends of [n+]CCCn from
-    becoming equivalent merely because their formal charges differ.
-    """
     aromatic_atom_indices = {
         atom.GetIdx() for atom in mol.GetAtoms() if atom.GetIsAromatic()
     }
@@ -382,20 +241,9 @@ def _find_resonance_aromatic_N_atoms(mol):
 
     return resonance_atoms
 
-
 def mol_from_fragment(fragment):
-    """Parse the pipeline's hydrogen-free fragment notation as unsanitized SMARTS.
-
-    These strings describe extracted substructures, not complete molecules. SMARTS
-    parsing preserves their query atoms and does not infer hydrogens, run valence
-    checks, or sanitize them as though they were standalone SMILES molecules.
-    """
     return init_query_ring_info(Chem.MolFromSmarts(fragment))
 
-
-# Annotations stored as isotopes (ring_code + 100*dh_code). D<n> and H0/!H0
-# are mutually exclusive per atom and share one field. RDKit silently truncates
-# isotope mod 65536, hence the bound check.
 _BRACKET_ATOM_INNER = re.compile(r'\[([^\]]+)\]')
 _RING_TOKEN = re.compile(r'\A(?:!R|R|r\d+)\Z')
 _DEGREE_TOKEN = re.compile(r'\AD(\d+)\Z')
@@ -404,18 +252,7 @@ _RING_ISOTOPE = {'!R': 1, 'R': 2}
 _H_ISOTOPE = {'H0': 1, '!H0': 2}
 _MAX_ISOTOPE = 65535
 
-
 def split_bracket_annotations(inner, fragment=None):
-    """Bracket content -> (atom_part, ring_token, degree, h_token).
-
-    Text-side reader of the annotation vocabulary; `_query_primitive` is the
-    parsed-query-side reader (different grammar, kept in sync by
-    tests/test_key_primitive_readers_agree.py). Runs pre-parse since the
-    isotope must be in the SMARTS string before MolFromSmarts sees it.
-
-    `degree` is the int of `D<n>` or None; `h_token` is 'H0'/'!H0' or None;
-    `ring_token` is '!R'/'R'/'r<n>' or None. Order-agnostic.
-    """
     atom_part, *tokens = inner.split(';')
     ring_token = degree = h_token = None
     for token in tokens:
@@ -426,13 +263,10 @@ def split_bracket_annotations(inner, fragment=None):
         elif _H_TOKEN.match(token):
             seen, name = h_token, 'hydrogen flag'
         else:
-            # Closed grammar; anything else is a writer bug that would silently
-            # break dedup (a key stops matching itself) rather than fail loudly.
             raise ValueError(
                 f'unrecognised annotation {token!r} in {inner!r} of '
                 f'{fragment!r}; key comparison cannot encode it')
         if seen is not None:
-            # Encoding would keep only one and merge keys that differ.
             raise ValueError(
                 f'conflicting annotations in {inner!r} of {fragment!r}: '
                 f'a second {name} token {token!r}')
@@ -443,21 +277,12 @@ def split_bracket_annotations(inner, fragment=None):
         else:
             h_token = token
     if degree is not None and h_token is not None:
-        # `D<n>` goes on non-carbon, `H0`/`!H0` on carbon (rebuild-notes 1), so
-        # they are exclusive per atom and share one isotope field.
         raise ValueError(
             f'{inner!r} of {fragment!r} carries both a degree and a hydrogen '
             'flag; they share one isotope field and are exclusive by construction')
     return atom_part, ring_token, degree, h_token
 
-
 def _annotations_as_isotope(fragment):
-    """A fragment key rewritten with its annotations as isotope labels.
-
-    Ring context, heavy-atom degree and the carbon H0 flag are removed from the
-    bracket and folded into the atom's isotope; the atom part (element, charge)
-    is left exactly as written.
-    """
     def _encode(match):
         inner = match.group(1)
         atom_part, ring_token, degree, h_token = split_bracket_annotations(
@@ -473,31 +298,14 @@ def _annotations_as_isotope(fragment):
         return f'[{isotope or ""}{atom_part}]'
     return _BRACKET_ATOM_INNER.sub(_encode, fragment)
 
-
 def fragment_keys_equivalent(key_a, key_b):
-    """Whether two fragment keys describe the same annotated substructure.
-
-    Canonical SMILES and submol matching both fail here (unsanitized perception
-    flags mean isomorphic submols can canonicalize differently; submols lack
-    RingInfo and have their rings already cut). So keys are compared to each
-    other directly, with annotations carried as isotopes to survive the compare.
-    """
     return fragment_query_mols_equivalent(fragment_key_query_mol(key_a),
                                           fragment_key_query_mol(key_b))
 
-
 def fragment_key_query_mol(key):
-    """The isotope-encoded, ring-info'd query mol that key comparison consumes.
-
-    Callers comparing one key against many (the O(bucket^2) scan in
-    fragment_database_ligs) should cache this per key and use
-    ``fragment_query_mols_equivalent`` rather than re-parsing both sides per pair.
-    """
     return init_query_ring_info(Chem.MolFromSmarts(_annotations_as_isotope(key)))
 
-
 def fragment_query_mols_equivalent(mol_a, mol_b):
-    """Whether two mols from ``fragment_key_query_mol`` are the same substructure."""
     if mol_a is None or mol_b is None:
         return False
     if mol_a.GetNumAtoms() != mol_b.GetNumAtoms():
@@ -506,83 +314,25 @@ def fragment_query_mols_equivalent(mol_a, mol_b):
         return False
     return bool(mol_a.HasSubstructMatch(mol_b) and mol_b.HasSubstructMatch(mol_a))
 
-
 def init_query_ring_info(mol):
-    """Give a SMARTS query mol the RingInfo that ring primitives need.
-
-    ``MolFromSmarts`` does not perceive rings, so a query mol used as the
-    *target* of a match raises ``RingInfo not initialized`` as soon as either
-    side carries `R` or `r<n>` -- which every fragment key does now (see
-    Frags.ring_query_for_atom). ``FastFindRings`` supplies it without
-    sanitizing, which matters because these are query mols with deliberately
-    incomplete valences.
-    """
     if mol is None:
         return mol
-    # Called unconditionally: RingInfo exposes no portable "is initialized"
-    # predicate across RDKit versions, and FastFindRings is idempotent and cheap
-    # on a 4-5 atom query.
     Chem.FastFindRings(mol)
     return mol
 
-
-# Bracket atom whose symbol is an aromatic (lower-case) element and which
-# carries an explicit total-H count: [nH], [nH1], [cH], ...
 _AROMATIC_H_ATOM = re.compile(r'\[([a-z][a-z]?)(H\d?)([^\]]*)\]')
 
-
 def aromatic_h_constrained_atoms(fragment):
-    """Bracket atoms in a fragment SMARTS that pin an H count on an aromatic atom.
-
-    ``identify_mol_automorphisms`` normalizes H (and charge) among the N atoms of
-    one aromatic component on purpose, so it treats an azole's tautomers as the
-    same graph. The *matching* layer does not: an unbracketed aromatic atom in
-    SMARTS carries no H constraint, but ``[nH]`` demands exactly one, and the
-    structures being mined are protonated by prepwizard rather than by the
-    depositor. A query that names the tautomer therefore silently keeps only the
-    ligands modeled in it -- measured over the database, ``c1nnn[nH]1`` finds 7% of
-    the tetrazoles ``cnnnn`` does and ``c1cnc[nH]1`` 15% of the imidazoles.
-
-    Fragment keys written by ``fragment_database_ligs.py`` never carry an H count,
-    so this only fires on a hand-written ``-s``. Returns the offending bracket
-    texts, empty when there are none.
-    """
     return [match.group(0) for match in _AROMATIC_H_ATOM.finditer(fragment or '')]
 
-
 def _require_hydrogen_free(mol, context):
-    """Reject explicit hydrogen atom *nodes*, in a molecule or a SMARTS query.
-
-    The test is atomic number, which covers plain H atoms and the SMARTS tokens
-    that pin one (`[H]`, `[#1]`, `[2H]` all report GetAtomicNum() == 1). Query
-    atoms that merely *allow* hydrogen report 0 and slip through (`[#1,#6]`,
-    `[$([H])]`, `[*H]`); the pipeline's fragment SMARTS never contain those. An
-    H *count* on a heavy atom (`[nH]`, `[CH3]`) is a property, not a node, and
-    is deliberately allowed.
-    """
     if any(atom.GetAtomicNum() == 1 for atom in mol.GetAtoms()):
         raise ValueError(
             f"{context} requires a hydrogen-free molecular graph; strip explicit "
             "hydrogen atom nodes upstream"
         )
 
-
 def _automorphism_graph(mol):
-    """Return atom labels and a labeled adjacency matrix for symmetry matching.
-
-    The graph preserves the molecular atom and bond attributes used for atom
-    correspondence, except that bonds and incident-atom charges are normalized
-    in recognized resonance groups: sets of terminal N/O/S atoms sharing a
-    center, plus C-N, N-O, S-N, and conjugated N-N groups. Formal charge and
-    declared-H distinctions are also normalized for aromatic nitrogens in the
-    same aromatic component. Other SMARTS query labels are preserved outside
-    recognized groups. This makes alternate drawings of those groups equivalent
-    without treating arbitrary same-element atoms as interchangeable.
-
-    ``D<n>`` and carbon ``H0``/``!H0`` are exempt from normalization: they
-    record the parent graph and keep a bridging heteroatom distinct from a
-    terminal one inside a resonance group.
-    """
     num_atoms = mol.GetNumAtoms()
     resonance_bonds = _find_resonance_terminal_groups(mol)
     resonance_bonds.update(_find_resonance_CN_groups(mol))
@@ -598,9 +348,6 @@ def _automorphism_graph(mol):
 
     atom_labels = []
     for atom in mol.GetAtoms():
-        # Query atoms from MolFromSmarts do not necessarily have a computed
-        # implicit valence, so only properties that are safe on both QueryAtom
-        # and Atom are used here.
         atom_idx = atom.GetIdx()
         if atom_idx in aromatic_resonance_atoms:
             query_label = ("aromatic_N_resonance",)
@@ -608,9 +355,6 @@ def _automorphism_graph(mol):
             query_label = atom.GetSmarts()
         else:
             query_label = None
-        # Separate slots: `query_label` is nulled on resonance atoms, but
-        # `D<n>`/`H0`/`!H0` must survive (they're parent-graph properties, not
-        # the protonation drawing the normalization erases).
         degree_label = _query_primitive(atom, _QUERY_DEGREE_LINE)
         h_label = (_query_primitive(atom, _QUERY_HCOUNT_LINE)
                    if atom.GetAtomicNum() == 6 else None)
@@ -628,10 +372,6 @@ def _automorphism_graph(mol):
     adjacency = [[None] * num_atoms for _ in range(num_atoms)]
     for bond in mol.GetBonds():
         if bond.GetIdx() in resonance_bonds:
-            # The shared label is deliberate: group membership is already
-            # encoded by incidence on the same center atom. A per-center ID
-            # would incorrectly prevent automorphisms that exchange two
-            # otherwise equivalent resonance centers.
             bond_label = (1,)
         else:
             bond_label = (
@@ -650,9 +390,7 @@ def _automorphism_graph(mol):
 
     return atom_labels, adjacency
 
-
 def _wl_colors(atom_labels, adjacency):
-    """WL refinement used only to prune exact automorphism enumeration."""
     num_atoms = len(atom_labels)
     colors = list(atom_labels)
 
@@ -674,17 +412,13 @@ def _wl_colors(atom_labels, adjacency):
                 signature_ids[signature] = len(signature_ids)
             refined.append(signature_ids[signature])
 
-        # Including the previous color means refinement only splits classes.
-        # Equal class counts therefore imply that the partition is stable.
         if len(set(refined)) == len(set(colors)):
             return refined
         colors = refined
 
     return colors
 
-
 def validate_atom_permutations(permutations, num_atoms=None):
-    """Validate and normalize index permutations to a tuple of unique tuples."""
     if permutations is None:
         return None
 
@@ -720,19 +454,7 @@ def validate_atom_permutations(permutations, num_atoms=None):
     normalized.insert(0, identity)
     return tuple(normalized)
 
-
 def group_preserving_permutations(labels):
-    """Return all index permutations that only swap positions sharing a label.
-
-    Shared by ``vdg_fp_utils.slot_orders`` (generation) and
-    ``vdg_npz_utils.aa_perm_indices`` (read path) -- both need the same
-    slot-permutation quotient, and keeping one implementation is what makes
-    that guaranteed rather than coincidental.
-
-    E.g.  ['ALA', 'ALA', 'SER'] -> [[0,1,2], [1,0,2]]
-          ['ASP', 'HIS']        -> [[0,1]]
-          ['bb', 'bb', 'bb']    -> all 6 permutations of [0,1,2]
-    """
     labels = list(labels)
     n = len(labels)
 
@@ -751,28 +473,7 @@ def group_preserving_permutations(labels):
         result.append(perm)
     return result
 
-
 def identify_mol_automorphisms(mol, max_automorphisms=10000):
-    """Enumerate exact automorphisms of a protonation-normalized molecular graph.
-
-    WL colors are used as candidate partitions only. Every returned mapping is
-    then checked by a full labeled adjacency-preservation test, so equal WL
-    colors can never introduce a non-automorphic atom permutation.
-
-    Explicit hydrogen atom nodes are rejected. SMARTS-declared H constraints,
-    bond order, and formal charge are preserved normally but normalized within
-    recognized resonance groups: terminal N/O/S sets on a shared center, and
-    C-N, N-O, S-N, and conjugated N-N groups. Charge/H distinctions are also
-    normalized among N atoms in one aromatic component.
-
-    Each returned tuple is the mapping itself: ``perm[i]`` is the atom that
-    atom ``i`` is sent to. That is the inverse of NumPy's
-    ``coords[permutation]`` gather order. The returned set is a group, hence
-    closed under inversion, so a consumer that enumerates all of it -- which
-    every consumer must, see docs/symmetry_edge_cases.md -- sees the same set
-    of reorderings either way; only code applying a single tuple on its own
-    needs the direction.
-    """
     if mol is None:
         raise ValueError("Cannot identify automorphisms of a null molecule")
     _require_hydrogen_free(mol, "Automorphism enumeration")
@@ -790,8 +491,6 @@ def identify_mol_automorphisms(mol, max_automorphisms=10000):
     for atom_idx, color in enumerate(colors):
         color_members.setdefault(color, []).append(atom_idx)
 
-    # Assign the most constrained vertices first. Trying the same index first
-    # finds the identity immediately and makes low caps deterministic.
     order = sorted(
         range(num_atoms),
         key=lambda i: (len(color_members[colors[i]]),
@@ -842,21 +541,16 @@ def identify_mol_automorphisms(mol, max_automorphisms=10000):
         )
     return validate_atom_permutations(automorphisms, num_atoms)
 
-
 def _proper_kabsch_rotations(H):
-    """Return proper rotations for a batch of 3x3 cross-covariance matrices."""
     if not np.isfinite(H).all():
         raise ValueError("Non-finite Kabsch cross-covariance matrix")
 
     U, _, Vt = np.linalg.svd(H, full_matrices=False)
     UVt = np.matmul(U, Vt)
-    det_uvt = _det3(UVt)   # same hand-expanded 3x3 determinant kabsch_ssd uses
+    det_uvt = _det3(UVt)
     if not np.isfinite(det_uvt).all():
         raise ValueError("Non-finite determinant from Kabsch SVD")
 
-    # A singular H has zero singular values, but U and Vt remain orthogonal, so
-    # det(U @ Vt) is still +/-1. The comparison form defensively keeps D proper
-    # even if a numerical backend ever reports signed zero.
     d = np.where(det_uvt < 0.0, -1.0, 1.0).astype(H.dtype, copy=False)
     D = np.zeros_like(H)
     D[..., 0, 0] = 1.0
@@ -864,47 +558,13 @@ def _proper_kabsch_rotations(H):
     D[..., 2, 2] = d
     return np.matmul(U, np.matmul(D, Vt))
 
-
 def _det3(H):
-    """Determinant of a batch of 3x3 matrices.
-
-    ``np.linalg.det`` goes through LAPACK and the ``__array_function__``
-    protocol; on 3x3 inputs called hundreds of thousands of times that dominates
-    the arithmetic. Only the sign is used here, and it is exact at the only
-    place it matters -- a singular H pairs it with a zero singular value.
-    """
     a, b, c = H[..., 0, 0], H[..., 0, 1], H[..., 0, 2]
     d, e, f = H[..., 1, 0], H[..., 1, 1], H[..., 1, 2]
     g, h, i = H[..., 2, 0], H[..., 2, 1], H[..., 2, 2]
     return a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
 
-
 def kabsch_ssd(X, Y, chunk_size=30000):
-    """Squared deviations for the optimal superposition, without building R or t.
-
-    Same inputs, same convention and the same ``ssd`` as ``kabsch``, but every
-    caller that only thresholds an RMSD can skip most of the work: the optimal
-    SSD is available from the singular *values* of the cross-covariance alone,
-
-        ssd = |Xc|^2 + |Yc|^2 - 2 * (s1 + s2 + d * s3),   d = sign(det H)
-
-    so ``compute_uv=False`` suffices and the rotation, translation and explicit
-    residual all disappear. ``d`` enforces a proper rotation exactly as
-    ``_proper_kabsch_rotations`` does: ``sign(det(U @ Vt)) == sign(det(H))``
-    whenever ``H`` is nonsingular, and when it is singular ``s3`` is zero, so the
-    term it multiplies vanishes either way.
-
-    Clustering calls this on 7x3 arrays hundreds of thousands of times per
-    bucket, where numpy's dispatch overhead outweighs the arithmetic, so the
-    reductions are written as ``np.add.reduce`` and the determinant expanded by
-    hand rather than routed through ``np.sum``/``np.linalg.det``.
-
-    Algebraically identical to ``kabsch``'s ``ssd``, but not bit-identical: the
-    precision differs by design -- this accumulates in float64, while ``kabsch``
-    runs its SVD and residual in float32 because its ``R``/``t`` are consumed as
-    float32 coordinates. Measured worst-case disagreement is ~2e-7 A in RMSD
-    against a 0.5 A clustering threshold. Use ``kabsch`` when you need R or t.
-    """
     X = np.asarray(X, dtype=np.float32)
     Y = np.asarray(Y, dtype=np.float32)
 
@@ -912,8 +572,6 @@ def kabsch_ssd(X, Y, chunk_size=30000):
         raise ValueError(f"kabsch_ssd: Y must have ndim=3, got Y.ndim={Y.ndim}, Y.shape={Y.shape}")
     if X.ndim not in (2, 3):
         raise ValueError(f"kabsch_ssd: X must have ndim 2 or 3, got X.ndim={X.ndim}")
-    # Checked rather than left to the matmul: the centering below divides by Y's
-    # point count, so a mismatch mis-centers X before anything raises.
     if X.shape[-2] != Y.shape[1]:
         raise ValueError(
             f"kabsch_ssd: point-count mismatch, X has {X.shape[-2]} points per structure, "
@@ -956,28 +614,11 @@ def kabsch_ssd(X, Y, chunk_size=30000):
         d = np.where(_det3(H) < 0.0, -1.0, 1.0)
         y_norm = np.add.reduce(np.add.reduce(Yc * Yc, axis=2), axis=1)
         trace = sv[:, 0] + sv[:, 1] + d * sv[:, 2]
-        # Clamped because the closed form, unlike an explicit residual, can land
-        # a hair below zero when the two structures superimpose exactly.
         chunks.append(np.maximum(xn + y_norm - 2.0 * trace, 0.0))
 
     return np.concatenate(chunks, axis=0) if len(chunks) > 1 else chunks[0]
 
-
 def kabsch(X, Y, chunk_size=30000):
-    """Chunked Kabsch alignment under ``Y ~= X @ R + t``.
-
-    ``X`` may be ``[N, 3]`` or ``[M, N, 3]``; ``Y`` must be ``[M, N, 3]``.
-    Returns proper rotations ``R [M, 3, 3]``, translations ``t [M, 3]``, and
-    squared deviations ``ssd [M]``.
-
-    Rank-2 cross-covariance matrices are valid and common for three-point fits.
-    At rank 0 or 1 the minimum SSD is still valid, but the optimal rotation is
-    non-unique; callers must not extrapolate that rotation to points outside the
-    fit unless they provide another non-collinear anchor.
-
-    The SVD and residual run in float32, unlike ``kabsch_ssd``'s float64 -- see
-    that docstring for why the two ``ssd`` values differ in the last digits.
-    """
     X = np.asarray(X, dtype=np.float32)
     Y = np.asarray(Y, dtype=np.float32)
 
@@ -1014,7 +655,6 @@ def kabsch(X, Y, chunk_size=30000):
     t_chunks = []
     ssd_chunks = []
 
-    # Fast path: one fixed X against many Y rows
     if X.ndim == 2:
         Xbar = X.mean(axis=0, keepdims=True)
         Xc = X - Xbar
@@ -1042,7 +682,6 @@ def kabsch(X, Y, chunk_size=30000):
             t_chunks.append(t)
             ssd_chunks.append(ssd)
 
-    # Fallback: batched X and batched Y
     else:
         for start in range(0, M, chunk_size):
             stop = min(start + chunk_size, M)
@@ -1085,21 +724,6 @@ def convert_time_elapsed(seconds):
     return h, m, s
 
 def best_inplace_symmetry_rmsd(ref_mol, query_mol):
-    """Return RDKit's symmetry-aware in-place RMSD without alignment.
-
-    ``CalcRMS`` generates atom mappings internally and treats conjugated terminal
-    groups symmetrically. In RDKit, ``maxMatches=0`` requests every mapping, so a
-    match cap cannot silently omit the lowest-RMSD mapping. Hydrogen-free inputs
-    avoid the most common source of combinatorial explosion.
-
-    Those mappings are RDKit's own and deliberately do **not** follow
-    ``identify_mol_automorphisms``. That policy merges terminal N/O/S because a
-    *fragment*'s degree-1 atom may have a bond omitted by truncation; these inputs
-    are whole ligands, where a terminal atom really is terminal, so importing it
-    here would merge genuinely distinct atoms. Don't "reconcile" the two -- see
-    docs/pitfalls.md, "vdG automorphisms and hit-finder CalcRMS use different
-    policies, deliberately".
-    """
     if ref_mol.GetNumAtoms() != query_mol.GetNumAtoms():
         raise ValueError(f"[ERROR] Atom count mismatch: ref={ref_mol.GetNumAtoms()}, "
             f"query={query_mol.GetNumAtoms()}")
@@ -1112,19 +736,10 @@ def best_inplace_symmetry_rmsd(ref_mol, query_mol):
         symmetrizeConjugatedTerminalGroups=True,
     )
 
-
-# Underscore is not a valid SMILES character, so _XX_ encodings are unambiguous.
 _SMILES_TO_FILENAME = {'/': '_fs_', '\\': '_bs_'}
-_SMILES_TO_JOB_NAME = {'#': '_tp_', '/': '_fs_', '\\': '_bs_'}  # these truncate or break SGE directives
+_SMILES_TO_JOB_NAME = {'#': '_tp_', '/': '_fs_', '\\': '_bs_'}
 
 def normalize_rmsd(num_atoms, atoms):
-    '''Return a size-normalized RMSD threshold (Å) for the given atom set
-    ('cgvdmbb' or 'flankbb'). The threshold scales linearly with the number
-    of atoms between 8 and 15:
-        flankbb: 0.5 Å → 1.5 Å
-        cgvdmbb: 0.5 Å → 1.0 Å
-    Below 8 atoms, use the minimum; above 15, use the maximum.
-    '''
     if atoms == 'flankbb':
         max_threshold, min_threshold = 1.5, 0.5
     elif atoms == 'cgvdmbb':
@@ -1138,39 +753,26 @@ def normalize_rmsd(num_atoms, atoms):
         return max_threshold
     return min_threshold + (num_atoms - min_atoms) / (max_atoms - min_atoms) * (max_threshold - min_threshold)
 
-
-# One atom per match, in SMILES order. The bracket branch comes first so that an
-# isotope/charge/chirality/H spec inside [] never yields extra tokens: the symbol
-# is the leading letter pair, and a trailing uppercase H ([nH], [SeH]) is a
-# hydrogen count, not an atom. Outside brackets only the organic subset is legal,
-# with Br/Cl before the single letters so they are not split.
 _SMILES_ATOM_RE = re.compile(
     r"\[\d*(?P<bracket>[A-Za-z][a-z]?|\*)"
     r"|(?P<organic>Br|Cl|[BCNOFPSI]|[bcnosp])")
 
-
 def extract_elements(smiles: str):
-    """Return element symbols in SMILES order, one per atom.
-
-    Aromatic atoms keep their lowercase form ('c', 'se'); callers that compare
-    against RDKit symbols capitalize first. A bracketed query token carrying no
-    element symbol (SMARTS '[+]', '[#6]') yields nothing, so this is a SMILES
-    tokenizer, not a SMARTS one.
-    """
     return [m.group('bracket') or m.group('organic')
             for m in _SMILES_ATOM_RE.finditer(smiles)]
 
 def smiles_to_filename(smiles):
-    '''Encode SMILES into a string safe for use as a filename (encodes / and \\).'''
     return ''.join(_SMILES_TO_FILENAME.get(c, c) for c in smiles)
 
 def filename_to_smiles(name):
-    '''Inverse of smiles_to_filename(). Injective because '_' is not a SMILES
-    character, so an encoded library name round-trips exactly.'''
     for ch, enc in _SMILES_TO_FILENAME.items():
         name = name.replace(enc, ch)
     return name
 
 def smiles_to_job_name(smiles):
-    '''Encode SMILES into a string safe for SGE job names (encodes # which truncates directives).'''
     return ''.join(_SMILES_TO_JOB_NAME.get(c, c) for c in smiles)
+
+def job_name_to_filename(job_name):
+    for ch, enc in _SMILES_TO_JOB_NAME.items():
+        job_name = job_name.replace(enc, ch)
+    return smiles_to_filename(job_name)

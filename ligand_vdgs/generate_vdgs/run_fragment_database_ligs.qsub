@@ -2,31 +2,47 @@
 #$ -S /bin/bash
 #$ -cwd
 #$ -N frag_db_ligs
-#$ -l h_rt=0:29:00
-#$ -l mem_free=2G
-#$ -l scratch=2G
+#$ -l h_rt=4:00:00
+#$ -l mem_free=8G
+#$ -l scratch=4G
 #$ -pe smp 8
-#$ -o logs/frag_db_ligs.sge.log
+#$ -o logs/frag_db_ligs.$JOB_ID.sge.log
 #$ -j y
 
 source ~/.bashrc
 conda activate lig_vdgs
 
-# -cwd + relative paths: submit from the repo root, or --ccd/--outdir below
-# resolve against the wrong directory.
+# $JOB_ID in -o above is load-bearing: SGE APPENDS to an existing -o file,
+# so a fixed name silently interleaves runs. A Sep-6 run and a Sep-11 run
+# ended up in one stream and the second run was read as having done the
+# first one's work.
+
+# STEP 2 of the vocabulary chain. Requires resources/ligand_roster.pkl from
+# run_build_ligand_roster.qsub; it supplies both the ligand vocabulary and the
+# observed-atom masks, and the parent database identity that ends up in the dict.
 #
-# mem_free is PER SLOT under
-# -pe smp, so this asks for 16G total; each worker holds one ligand plus its
-# fragments and peaks well under 1G, and only the parent holds frag_dict (~2 MB
-# pickled). A bigger PE request just lengthens the queue wait.
+# -cwd + relative paths: submit from the repo root.
 #
-# --nproc does not affect the output: results are merged in input order, which
-# is what fixes which of two degenerate keys becomes the recorded one.
+# Timing, measured on the first 3,000 stems (1,811 CCD codes, 2,983 biounits):
+# enumeration 13 s on 8 slots, protonation pooling 58 s single-threaded, total
+# 76 s. Pooling is the part that does not parallelize and scales worse than
+# linearly in the key count (it is an equivalence scan per charged group), so the
+# 4 h wall clock is sized for that, not for the enumeration.
+#
+# mem_free is PER SLOT under -pe smp, so this asks 64G total. A worker holds one
+# ligand and its subgraphs; the parent holds every key's atom-name tuples, which
+# is the real consumer.
+#
+# --num-procs does not affect the output: the collapse iterates keys in sorted
+# order, so which spelling of a degenerate key becomes the representative is
+# fixed regardless of worker scheduling.
+#
+# No --force: a rerun must not clobber a dict a build is running against.
 python ligand_vdgs/generate_vdgs/fragment_database_ligs.py \
-    --ccd resources/Components-smiles-cactvs.smi \
+    --roster resources/ligand_roster.pkl \
     --outdir resources \
     --logfile logs/fragment_database_ligs.log \
-    --nproc 8
+    --num-procs 8
 STATUS=$?
 
 [[ -n "$JOB_ID" ]] && qstat -j "$JOB_ID"

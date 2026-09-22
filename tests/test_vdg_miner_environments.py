@@ -19,7 +19,7 @@ from ligand_vdgs.functions.sasa import radius_of  # noqa: E402
 
 class EnvironmentApiTests(unittest.TestCase):
     def test_constructor_does_not_build_legacy_fingerprint_features(self):
-        vdg = VDG("_test_cg_", "pdb", "validation", cg_natoms=3)
+        vdg = VDG("_test_cg_", "pdb", cg_natoms=3)
 
         self.assertFalse(hasattr(vdg, "fingerprint_cols"))
         self.assertFalse(hasattr(vdg, "contact_cols"))
@@ -27,20 +27,20 @@ class EnvironmentApiTests(unittest.TestCase):
         self.assertFalse(hasattr(vdg, "relpos_cols"))
 
     def test_environment_api_requires_a_mining_source(self):
-        vdg = VDG("_test_cg_", "pdb", "validation", cg_natoms=3)
+        vdg = VDG("_test_cg_", "pdb", cg_natoms=3)
 
         with self.assertRaisesRegex(ValueError, "chain_cluster or cg_match_dict"):
             vdg.mine_environments()
 
     def test_environment_api_always_returns_a_list(self):
-        vdg = VDG("_test_cg_", "missing", "validation", cg_natoms=3)
+        vdg = VDG("_test_cg_", "missing", cg_natoms=3)
         matches = {("1abc", "", "A", "1", "LIG"): [["C1", "C2", "C3"]]}
 
         self.assertEqual(vdg.mine_environments(cg_match_dict=matches), [])
 
     def test_a_missing_chain_file_does_not_discard_the_whole_structure(self):
         """One unreadable chain used to return [] for every chain of the structure."""
-        vdg = VDG("_test_cg_", "missing", "validation", cg_natoms=3)
+        vdg = VDG("_test_cg_", "missing", cg_natoms=3)
         seen = []
 
         def fake_structure_contacts(pdb_file, cg_match_dict=None):
@@ -69,15 +69,15 @@ class EnvironmentApiTests(unittest.TestCase):
                          inspect.signature(VDG.structure_contacts).parameters)
         self.assertNotIn("probe_dir",
                          inspect.signature(VDG.__init__).parameters)
-        vdg = VDG("_test_cg_", "pdb", "validation", cg_natoms=3)
+        vdg = VDG("_test_cg_", "pdb", cg_natoms=3)
         self.assertFalse(hasattr(vdg, "probe_dir"))
 
     def test_the_membership_threshold_is_a_recorded_parameter(self):
         """theta is calibration output, so it must not be a hidden literal."""
-        vdg = VDG("_test_cg_", "pdb", "validation", cg_natoms=3)
+        vdg = VDG("_test_cg_", "pdb", cg_natoms=3)
         self.assertEqual(vdg.min_contact_area, sasa.MIN_CONTACT_AREA)
         self.assertEqual(
-            VDG("_test_cg_", "pdb", "validation", cg_natoms=3,
+            VDG("_test_cg_", "pdb", cg_natoms=3,
                 min_contact_area=2.5).min_contact_area, 2.5)
 
     def test_membership_thresholds_buried_plus_shared_not_buried_alone(self):
@@ -196,7 +196,7 @@ class GateBehaviourTests(unittest.TestCase):
             handle.writelines(atoms)
             handle.write("END\n")
         matches = {(stem, "", self.LIG_CHAIN, "900", "LIG"): [list(cg_names)]}
-        vdg = VDG("_test_cg_", tmp, "validation", cg_natoms=len(cg_names),
+        vdg = VDG("_test_cg_", tmp, cg_natoms=len(cg_names),
                   min_contact_area=min_contact_area)
         try:
             return vdg.mine_environments(cg_match_dict=matches, **kwargs)
@@ -337,7 +337,7 @@ class GateBehaviourTests(unittest.TestCase):
             handle.writelines(atoms)
             handle.write("END\n")
         matches = {(stem, "", "4", "900", "LIG"): [["C1", "O1", "N1"]]}
-        vdg = VDG("_test_cg_", tmp, "validation", cg_natoms=3)
+        vdg = VDG("_test_cg_", tmp, cg_natoms=3)
         try:
             envs = vdg.mine_environments(cg_match_dict=matches)
         finally:

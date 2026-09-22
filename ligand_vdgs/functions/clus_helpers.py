@@ -34,6 +34,10 @@ COLUMN_DTYPES = {
     # Nominal H count; protonation-bound under OpenBabel (see `perception`).
     # Metadata only -- the key's carbon H flag is binary, not this.
     "cg_num_h": np.int8,            # (N, n_cg)
+    # Placed-H status: 1 = H placed within the bond-length cutoff
+    # in the parent structure, 0 = none. Geometric, not the CCD template
+    # (cg_num_h) -- environment-dependent, protonation-tool-dependent.
+    "cg_placed_h": np.int8,         # (N, n_cg)
     "cg_formal_charge": np.int8,    # (N, n_cg)
     # Each CG atom's heavy neighbours outside the match, packed as an element
     # multiset (vdg_npz_utils.decode_nbr_elems). Metadata, not a key/partition
@@ -63,7 +67,7 @@ _REQUIRED_RECORD_FIELDS = (
     "cg_coords", "bbcoords", "flankseqs", "flankCAs", "biounit", "scrr",
     "cg_names", "cg_elements", "cg_seg", "cg_chain", "cg_resnum", "cg_resname",
     "slot_flags", "quality", "bbo",
-    "cg_heavy_degree", "cg_num_h", "cg_formal_charge", "cg_nbr_elems",
+    "cg_heavy_degree", "cg_num_h", "cg_placed_h", "cg_formal_charge", "cg_nbr_elems",
     "perception", "buried_area", "shared_area", "n_atom_pairs", "min_heavy_dist",
 )
 
@@ -121,6 +125,7 @@ def records_to_columns(records):
         "vdm_o": np.empty((n, n_res, 3), dtype=np.float32),
         "cg_heavy_degree": np.empty((n, n_cg), dtype=np.int8),
         "cg_num_h": np.empty((n, n_cg), dtype=np.int8),
+        "cg_placed_h": np.empty((n, n_cg), dtype=np.int8),
         "cg_formal_charge": np.empty((n, n_cg), dtype=np.int8),
         "cg_nbr_elems": np.empty((n, n_cg), dtype=np.uint32),
         "perception": np.empty(n, dtype=np.int8),
@@ -157,6 +162,7 @@ def records_to_columns(records):
             cols["vdm_o"][k] = np.asarray(rec["bbo"], dtype=np.float32).reshape(n_res, 3)
             cols["cg_heavy_degree"][k] = rec["cg_heavy_degree"]
             cols["cg_num_h"][k] = rec["cg_num_h"]
+            cols["cg_placed_h"][k] = rec["cg_placed_h"]
             cols["cg_formal_charge"][k] = rec["cg_formal_charge"]
             # The record carries the miner's symbol strings, which stay
             # readable in the annotation pickle; packing happens here, once.

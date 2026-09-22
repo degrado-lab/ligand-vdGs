@@ -78,8 +78,9 @@ class CrashDurabilityTests(unittest.TestCase):
             self.assertEqual(merged['cgvdmbb'].shape, (4, 7, 3))
 
     def test_corrupt_npz_is_reported_not_skipped(self):
+        # DR-61: bucket outputs live under a sign subdirectory now.
         with tempfile.TemporaryDirectory() as tmp:
-            size_dir = os.path.join(tmp, 'nr_vdgs', '1')
+            size_dir = os.path.join(tmp, 'nr_vdgs', '1', 'pos')
             os.makedirs(size_dir)
             np.savez_compressed(os.path.join(size_dir, 'ALA.npz'),
                                 cluster_id=np.arange(3),
@@ -91,18 +92,18 @@ class CrashDurabilityTests(unittest.TestCase):
             logfile = os.path.join(tmp, 'log')
             n_nr, n_in, unreadable = C._subset_output_counts(tmp, 1, logfile)
             self.assertEqual((n_nr, n_in), (3, 7))
-            self.assertEqual(unreadable, ['GLN'])
+            self.assertEqual(unreadable, ['pos/GLN'])
             self.assertIn('[ERROR] Unreadable npz', open(logfile).read())
 
     def test_failed_markers_are_read_back_off_disk(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(C._scan_failed_markers(tmp, 1), [])
-            size_dir = os.path.join(tmp, 'nr_vdgs', '1')
+            size_dir = os.path.join(tmp, 'nr_vdgs', '1', 'pos')
             os.makedirs(size_dir)
             open(os.path.join(size_dir, 'ALA.npz'), 'w').write('x')
-            C._write_failed_marker(tmp, 1, 'bb_GLN', 'boom')
-            C._write_failed_marker(tmp, 1, 'ALA', 'boom')
-            self.assertEqual(C._scan_failed_markers(tmp, 1), ['ALA', 'bb_GLN'])
+            C._write_failed_marker(tmp, 1, 'pos', 'bb_GLN', 'boom')
+            C._write_failed_marker(tmp, 1, 'neg', 'ALA', 'boom')
+            self.assertEqual(C._scan_failed_markers(tmp, 1), ['neg/ALA', 'pos/bb_GLN'])
 
     def test_preexisting_outputs_are_detected_per_requested_size(self):
         with tempfile.TemporaryDirectory() as tmp:

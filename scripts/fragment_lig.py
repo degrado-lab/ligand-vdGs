@@ -118,7 +118,9 @@ def main():
 
 def is_in_database_frags(lig_frags):
     # Determine whether these smiles are in database_frags_dict.pkl
-    db_frags = pkl.load(open('resources/database_frags_dict.pkl', 'rb'))
+    # load_frags_dict, not a raw pkl.load.
+    from ligand_vdgs.generate_vdgs.extract_fragment_smiles import load_frags_dict
+    db_frags, _support, _meta = load_frags_dict('resources/database_frags_dict.pkl')
     dict_smiles = []
     for elements, subdict in db_frags.items():
         for smiles, lignames in subdict.items():

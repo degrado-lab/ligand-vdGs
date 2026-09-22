@@ -2,8 +2,10 @@
 
 Both toolkits count explicit H atoms in the SMARTS `D` primitive, so on a protonated
 parent database -- which is what the pipeline mines -- a hydroxyl O reads `D2` and
-`[O;D1;!R]` matches nothing. The fragment then falls below --min-instances and is never
-built. The estimate has to route through functions/ligand_perception, not build its own
+`[O;D1;!R]` matches nothing. The fragment is then sized from a zero occurrence count
+and lands in the shortest queue tier, where it is killed at h_rt (selection itself no
+longer runs off this count -- it uses biounit support, DR-5 -- but job sizing does,
+DR-7). The estimate has to route through functions/ligand_perception, not build its own
 OBMol, so it cannot drift from what the miner actually matches.
 
 The discriminating input is an *explicitly protonated* ligand; a file without hydrogens
@@ -40,8 +42,9 @@ class HydrogenFreeCountingTests(unittest.TestCase):
         efc._init_worker(self.FRAGMENTS)
 
     def test_the_hydroxyl_counts_as_D1_not_D2(self):
-        counts, read_failures, unreadable = efc._count_one(self.path)
+        counts, read_failures, unreadable, all_failed = efc._count_one(self.path)
         self.assertFalse(unreadable)
+        self.assertFalse(all_failed)
         self.assertEqual(read_failures, 0)
         # index 0 is the D1 key, index 1 the D2 key it would be mistaken for.
         self.assertEqual(counts.get(0), 1,
@@ -51,16 +54,20 @@ class HydrogenFreeCountingTests(unittest.TestCase):
 
     def test_an_unreadable_block_is_a_read_failure_not_a_zero_count(self):
         """Counting an unparsable ligand as zero occurrences undercounts the fragment
-        and can drop it below --min-instances; it is tallied separately instead."""
+        and can under-size its job into a queue too short to finish; it is tallied
+        separately instead."""
         d = os.path.join(self.tmp, 'ba')
         os.makedirs(d)
         bad = os.path.join(d, '1bad.pdb')
         with open(bad, 'w') as f:
             f.write('HETATM    1        XXX A 301    not numbers at all\n')
-        counts, read_failures, unreadable = efc._count_one(bad)
+        counts, read_failures, unreadable, all_failed = efc._count_one(bad)
         self.assertFalse(unreadable)
         self.assertEqual(counts, {})
         self.assertEqual(read_failures, 1)
+        # The structure's one ligand is present but fails perception -- B8's
+        # all-failed case, distinct from unreadable (file couldn't be read at all).
+        self.assertTrue(all_failed)
 
 
 if __name__ == '__main__':

@@ -33,6 +33,7 @@ def _record(**overrides):
         "bbo": [np.zeros(3, dtype=np.float32), np.full(3, np.nan, dtype=np.float32)],
         # Synthetic until session 3's SASA gate lands.
         "cg_heavy_degree": [1, 4, 1], "cg_num_h": [0, 0, 1],
+        "cg_placed_h": [1, 0, 1],
         "cg_formal_charge": [-1, 0, 0], "cg_nbr_elems": ["", "OC", ""],
         "perception": vdg_npz_utils_perception(),
         "buried_area": [12.5, 4.0], "shared_area": [1.5, 0.0],
@@ -48,12 +49,12 @@ def vdg_npz_utils_perception():
     return ligand_perception.PERCEPTION_OPENBABEL
 
 
-def _write(tmp, recs, nr_idx=0):
+def _write(tmp, recs, nr_idx=0, sign="neg"):
     cols = clus_helpers.records_to_columns(recs)
     members = np.arange(len(recs), dtype=np.int32)
     subgroups = [clus.Subgroup(1, 1, nr_idx, members, 0.25)]
-    clus._write_bucket_npz(tmp, 2, ("GLY", "ALA"), cols, subgroups, "/db")
-    return os.path.join(tmp, "nr_vdgs", "2", "GLY_ALA.npz")
+    clus._write_bucket_npz(tmp, 2, sign, ("GLY", "ALA"), cols, subgroups, "/db")
+    return os.path.join(tmp, "nr_vdgs", "2", sign, "GLY_ALA.npz")
 
 
 class AnnotationColumnsReachBothRowSets(unittest.TestCase):
@@ -61,7 +62,8 @@ class AnnotationColumnsReachBothRowSets(unittest.TestCase):
         recs = [_record(), _record(cg_num_h=[2, 2, 2], perception=0)]
         with tempfile.TemporaryDirectory() as tmp:
             with np.load(_write(tmp, recs)) as z:
-                for key in ("cg_heavy_degree", "cg_num_h", "cg_formal_charge",
+                for key in ("cg_heavy_degree", "cg_num_h", "cg_placed_h",
+                            "cg_formal_charge",
                             "cg_nbr_elems", "perception", "vdm_buried_area",
                             "vdm_shared_area", "vdm_n_atom_pairs",
                             "vdm_min_heavy_dist"):
@@ -160,7 +162,7 @@ class SchemaVersionIsEnforced(unittest.TestCase):
                 self.assertEqual(block["parent_pdb_dir"], "/db")
                 self.assertIn("build_date", block)
             self.assertIsNotNone(vdg_npz_utils.load_vdg_bucket(
-                tmp, "", 2, "GLY_ALA"))
+                tmp, "", 2, "neg", "GLY_ALA"))
 
     def test_an_old_bucket_is_refused_not_skipped(self):
         # Refusing matters more than warning: the columns changed meaning, so a
@@ -180,7 +182,7 @@ class SchemaVersionIsEnforced(unittest.TestCase):
             # means a stale library is refused by hit finding and read
             # silently by everything else.
             with self.assertRaises(vdg_npz_utils.BucketSchemaMismatch):
-                vdg_npz_utils.load_vdg_bucket(tmp, "", 2, "GLY_ALA")
+                vdg_npz_utils.load_vdg_bucket(tmp, "", 2, "neg", "GLY_ALA")
             with self.assertRaises(vdg_npz_utils.BucketSchemaMismatch):
                 vdg_npz_utils.load_bucket_npz(path)
         self.assertNotIsInstance(vdg_npz_utils.BucketSchemaMismatch("x"),

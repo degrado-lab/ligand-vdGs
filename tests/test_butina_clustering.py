@@ -15,6 +15,16 @@ from ligand_vdgs.functions import align_and_cluster as ac
 from ligand_vdgs.functions.utils import kabsch_ssd
 from ligand_vdgs.functions.vdg_fp_utils import (
     build_perm_group, full_row_permutations)
+from vacuity import assert_discriminates
+
+def _some_cluster_is_not_a_singleton(clusters):
+    return any(len(members) > 1 for members in clusters)
+
+def _singleton_partition(data):
+    """The degenerate result both guarantees below hold for trivially: with every
+    record its own cluster the worst intra-cluster distance is 0 and the assigned
+    list is still range(len(data)) (vacuity audit V1)."""
+    return [np.array([i]) for i in range(len(data))]
 
 
 def _phosphate_permutations():
@@ -83,6 +93,8 @@ class ButinaGuaranteeTests(unittest.TestCase):
                     # The representative is emitted first.
                     worst = exact[members, members[0]].max()
                     self.assertLessEqual(worst, cutoff + 1e-6)
+                assert_discriminates(_some_cluster_is_not_a_singleton, [clusters],
+                                     [_singleton_partition(data)], label)
 
     def test_every_record_belongs_to_exactly_one_cluster(self):
         rng = np.random.default_rng(5)
@@ -92,6 +104,8 @@ class ButinaGuaranteeTests(unittest.TestCase):
                 clusters = ac.get_butina_clusters(data, 0.6, n_cg, build_perm_group(perms, n_cg, parts))
                 assigned = sorted(i for m in clusters for i in m.tolist())
                 self.assertEqual(assigned, list(range(len(data))))
+                assert_discriminates(_some_cluster_is_not_a_singleton, [clusters],
+                                     [_singleton_partition(data)], label)
 
     def test_neighbour_graph_is_exactly_the_within_cutoff_graph(self):
         """The prefilter cascade may only skip work, never drop a true pair."""

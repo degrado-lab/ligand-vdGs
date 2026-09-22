@@ -13,6 +13,7 @@ from openbabel import openbabel as ob
 from rdkit import Chem, RDLogger
 
 from ligand_vdgs.functions import ccd_templates, ligand_perception as lp
+from vacuity import assert_discriminates
 
 RDLogger.DisableLog('rdApp.*')
 
@@ -20,6 +21,16 @@ pytestmark = pytest.mark.skipif(
     not os.path.isfile(ccd_templates.template_db_path()),
     reason=f'{ccd_templates.template_db_path()} not built '
            '(scripts/build_ccd_templates.py)')
+
+def test_store_identity_pins_template_path_parser_and_stat():
+    identity = ccd_templates.store_identity()
+    path = os.path.abspath(ccd_templates.template_db_path())
+    stat = os.stat(path)
+    assert identity['ccd_dir'] == os.path.abspath(ccd_templates.ccd_dir())
+    assert identity['template_db'] == path
+    assert identity['parser_version'] == ccd_templates.TEMPLATE_PARSER_VERSION
+    assert identity['template_db_size'] == stat.st_size
+    assert identity['template_db_mtime_ns'] == stat.st_mtime_ns
 
 # Acetate, whose CCD template is the anion: C(=O)[O-] with a methyl.
 # A three-letter code the CCD does not have. Three letters matters: the PDB
@@ -253,13 +264,22 @@ def test_keys_written_from_the_graph_match_the_same_ligand_as_a_block(comp_id):
                         f'ligand as a block, e.g. {missed[:3]}')
 
 
+def _any_key_aromatic(keys):
+    """Aromaticity from the parsed query mol. The shipped `c.islower()` form fired
+    on the `l` of Cl and on the lowercase ring primitive `r` -- and every real key
+    here carries `r5`/`r6` -- so it could not reject an aliphatic set (audit V7).
+    """
+    return any(a.GetIsAromatic() for k in keys for a in Chem.MolFromSmarts(k).GetAtoms())
+
 def test_at_least_one_case_actually_exercises_aromatic_bonds():
     """Guard on the test above: it proves nothing if no key is aromatic."""
     from ligand_vdgs.functions import Frags
     mol = lp.perceive_ligand_graph('ATP').mol
     stripped = Frags.manually_remove_Hs(mol, 'single')
-    keys = Frags.get_fragments(2, stripped[0][0], 4, 5)
-    assert any(any(c.islower() for c in k if c.isalpha()) for k in keys)
+    keys = tuple(Frags.get_fragments(2, stripped[0][0], 4, 5))
+    assert not [k for k in keys if Chem.MolFromSmarts(k) is None], keys
+    assert_discriminates(_any_key_aromatic, [keys],
+                         [('[C;D4]-[Cl;D1]', '[C;r6;D3]')], 'ATP keys aromatic')
 
 
 def test_a_bond_openbabel_invents_is_deleted():

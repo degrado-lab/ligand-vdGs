@@ -158,6 +158,12 @@ def main():
         extras = []
 
     df = pd.read_csv(args.hits_tsv, sep="\t")
+    required_hit_fields = {"charge_sign", "vdg_index", "subset_size", "aa_bucket"}
+    missing_hit_fields = sorted(required_hit_fields - set(df.columns))
+    if missing_hit_fields:
+        raise SystemExit(
+            f"[ERROR] hit TSV is not current format; missing fields: {missing_hit_fields}. "
+            "Regenerate it with vdg_hit_finder.py.")
     counts = defaultdict(int)
     made_dirs, names_by_dir = set(), defaultdict(NameRegistry)
     skipped = []
@@ -175,21 +181,22 @@ def main():
         counts[key] += 1
 
         npz_path = vdg_npz.vdg_npz_path(
-            args.vdg_lib_dir, row["frag"], int(row["subset_size"]), row["aa_bucket"])
+            args.vdg_lib_dir, row["frag"], int(row["subset_size"]),
+            row["charge_sign"], row["aa_bucket"])
         vdg_idx = int(row["vdg_index"])
 
         if not os.path.exists(npz_path):
             skip(row_idx, row, f"NPZ file not found: {npz_path}")
             continue
 
-        with np.load(npz_path) as data:
-            num_vdgs = len(data["nr_cg_coords"])
-            bucket_parts = [str(x) for x in data["aa_bucket_parts"]]
-            if extras:
-                if not vdg_npz.parent_extras_available(extras, data,
-                                                       pdb_dir=args.pdb_dir):
-                    args.sidechain = args.carbonyl = False
-                extras = []
+        data = vdg_npz.load_bucket_npz(npz_path)
+        num_vdgs = len(data["nr_cg_coords"])
+        bucket_parts = [str(x) for x in data["aa_bucket_parts"]]
+        if extras:
+            if not vdg_npz.parent_extras_available(extras, data,
+                                                   pdb_dir=args.pdb_dir):
+                args.sidechain = args.carbonyl = False
+            extras = []
         if not 0 <= vdg_idx < num_vdgs:
             skip(row_idx, row, f"vdg_index {vdg_idx} out of range "
                                f"[0, {num_vdgs-1}] in {npz_path}")

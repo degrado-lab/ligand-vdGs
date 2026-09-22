@@ -13,7 +13,7 @@ import prody as pr
 
 from ligand_vdgs.preprocessing._chain_ids import (
     CHAIN_POOL, ChainIdOverflow, assert_single_char_chains, chain_id_mapping,
-    multichar_chain_ids, parse_remap_remarks, remap_chain_ids, remap_remarks)
+    multichar_chain_ids, remap_chain_ids)
 
 
 def _atom(serial, name, resname, chain2, resnum, x=0.0, het=False):
@@ -66,10 +66,6 @@ class RemapTest(unittest.TestCase):
         assert_single_char_chains(clean)
         with self.assertRaises(ValueError):
             assert_single_char_chains(self.lines, 'x')
-
-    def test_remarks_round_trip(self):
-        _, mapping = remap_chain_ids(self.lines)
-        self.assertEqual(parse_remap_remarks(remap_remarks(mapping)), mapping)
 
     def test_overflow_raises_instead_of_colliding(self):
         # Every single character in use, then one more two-character chain.

@@ -76,6 +76,7 @@ class SmartSlotOrderSurvivesRecordUnpacking(unittest.TestCase):
             # Synthetic until session 3's gate lands. Required fields: the
             # writer refuses a record without them rather than filling in.
             "cg_heavy_degree": [1, 4, 1], "cg_num_h": [0, 0, 1],
+            "cg_placed_h": [1, 0, 1],
             "cg_formal_charge": [-1, 0, 0], "cg_nbr_elems": ["", "OC", ""],
             "perception": 1,
             "buried_area": [12.5, 4.0], "shared_area": [1.5, 0.0],
@@ -142,8 +143,8 @@ class CentroidIsStoredExactlyOnce(unittest.TestCase):
         members = np.arange(n, dtype=np.int32)
         subgroups = [clus.Subgroup(1, 1, 2, members, 0.25)]
         with tempfile.TemporaryDirectory() as tmp:
-            clus._write_bucket_npz(tmp, 2, ("GLY", "ALA"), cols, subgroups, "/db")
-            with np.load(os.path.join(tmp, "nr_vdgs", "2", "GLY_ALA.npz")) as z:
+            clus._write_bucket_npz(tmp, 2, "pos", ("GLY", "ALA"), cols, subgroups, "/db")
+            with np.load(os.path.join(tmp, "nr_vdgs", "2", "pos", "GLY_ALA.npz")) as z:
                 self.assertEqual(z["cluster_size"].tolist(), [n])
                 self.assertEqual(z["cluster_num_parents"].tolist(), [4])
                 self.assertEqual(z["nr_parent_biounit"].tolist(), ["1a02"])

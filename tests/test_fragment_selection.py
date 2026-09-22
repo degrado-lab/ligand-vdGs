@@ -40,10 +40,24 @@ class SolventArtifactFilterTests(unittest.TestCase):
             "ClOOOO": {"O=[Cl](=O)(=O)[O-]": ["LCP", "AAA", "BBB"]},
             "COO": {"CC(=O)O": ["AAA", "BBB", "CCC"]},
         }
+        support = {"O=[Cl](=O)(=O)[O-]": 999, "CC(=O)O": 3}
         self.assertEqual(
-            select_fragments(frags_dict, counts_threshold=2, max_size=5),
+            select_fragments(frags_dict, min_support=2, max_size=5, support=support),
             ["CC(=O)O"],
         )
+        # Discriminating: the artifact is dropped by the filter, not by the
+        # threshold -- its support is the highest in the dict. Without this the
+        # test would also pass for a selector that had no solvent filter at all.
+        self.assertEqual(
+            select_fragments(frags_dict, min_support=0, max_size=5),
+            ["CC(=O)O"],
+        )
+
+    def test_a_threshold_without_support_is_refused(self):
+        """Thresholding must never silently fall back to another unit."""
+        frags_dict = {"COO": {"CC(=O)O": ["AAA", "BBB", "CCC"]}}
+        with self.assertRaises(ValueError):
+            select_fragments(frags_dict, min_support=2, max_size=5)
 
 
 class ProtonationVariantCollapseTests(unittest.TestCase):

@@ -39,7 +39,8 @@ from ligand_vdgs.functions.utils import set_up_outdir
 from ligand_vdgs.functions import parent_db
 from ligand_vdgs.preprocessing._prep_filters import (
     drop_prepwizard_hazard_residues, load_ccd_polymer_types, text_repairs)
-from ligand_vdgs.preprocessing._chain_ids import ChainIdOverflow, remap_remarks
+from ligand_vdgs.preprocessing._chain_ids import (
+    ChainIdOverflow, remap_remarks, assert_single_char_chains)
 
 origin_dir = '/home/sophia/DockDesign/databases/consolidated_BioLiP2_split'
 target_dir = '/home/sophia/DockDesign/databases/consolidated_BioLiP2_trimmed'
@@ -76,12 +77,19 @@ def parse_pdb_with_single_char_chains(pdbpath, ccd_types):
 
 
 def write_pdb_with_remap_remarks(output_path, atoms, mapping):
-    '''pr.writePDB, with the chain remap recorded as REMARK lines up front.'''
+    '''pr.writePDB, with the chain remap recorded as REMARK lines up front.
+
+    Verifies ProDy's writer preserved single-character chain IDs before writing;
+    raises ValueError otherwise rather than silently reintroducing the collision
+    remap_chain_ids was meant to fix.
+    '''
     buf = io.StringIO()
     pr.writePDBStream(buf, atoms)
+    lines = buf.getvalue().splitlines(keepends=True)
+    assert_single_char_chains(lines, name=output_path)
     with open(output_path, 'w') as f:
         f.writelines(remap_remarks(mapping))
-        f.write(buf.getvalue())
+        f.writelines(lines)
 
 
 def main():

@@ -7,13 +7,33 @@ from unittest import mock
 import numpy as np
 
 from ligand_vdgs.functions.clus_helpers import load_shard
+from ligand_vdgs.functions.vdg_npz_utils import CHARGE_SIGNS
 from ligand_vdgs.generate_vdgs import clus_and_deduplicate_vdgs as pipeline
+from tests.vacuity import assert_discriminates
 
 # A real N/CA/C triple: a zero backbone is degenerate and streaming drops it.
 BB = np.array([[-1.459, 0.0, 0.0], [0.0, 0.0, 0.0], [0.551, 1.422, 0.0]],
               dtype=np.float32)
 
+class _FakeAtomGroup:
+    """No-atom stand-in for `_get_atomgroup_for_env`: `_cg_placed_h_in_slot_order`
+    reads no placed H from an empty group, which is all these tests need since
+    they don't exercise chemistry."""
+    def getSegnames(self): return np.array([], dtype="U8")
+    def getChids(self): return np.array([], dtype="U2")
+    def getResnums(self): return np.array([], dtype=np.int32)
+    def getNames(self): return np.array([], dtype="U4")
+    def getElements(self): return np.array([], dtype="U2")
+    def getCoords(self): return np.zeros((0, 3), dtype=np.float32)
 
+def _shard_paths(bucket_dir):
+    """Every shard file under one subset-size dir's DR-61 sign subdirectories
+    (_write_cg_pickles's synthetic annotations are all-zero-charge, so in
+    practice only 'neut' is ever populated -- walking all four keeps this
+    honest if a test ever varies charge)."""
+    return [os.path.join(bucket_dir, sign, name)
+            for sign in CHARGE_SIGNS if os.path.isdir(os.path.join(bucket_dir, sign))
+            for name in os.listdir(os.path.join(bucket_dir, sign))]
 
 def _write_cg_pickles(temp_dir, names=None, biounits=("1abc",), by_biounit=None):
     """Matches pickle + its sibling annotation pickle, for one CG match each.
@@ -44,9 +64,6 @@ def _write_cg_pickles(temp_dir, names=None, biounits=("1abc",), by_biounit=None)
 
 class MultiSubsetStreamingTests(unittest.TestCase):
     def test_one_environment_builds_both_subset_sizes_once(self):
-        environment = [["1abc", "", "A", 10, 1],
-                       ["1abc", "", "A", 20],
-                       ["1abc", "", "A", 30]]
         cg_result = (
             np.zeros((3, 3), dtype=np.float32),
             ["C1", "O1", "O2"], ["C", "O", "O"],
@@ -56,7 +73,9 @@ class MultiSubsetStreamingTests(unittest.TestCase):
             environments_dir = os.path.join(temp_dir, "environments", "ab")
             os.makedirs(environments_dir)
             with open(os.path.join(environments_dir, "1abc.jsonl"), "w") as handle:
-                json.dump({"env": environment, "cg_max_b": 15.0,
+                json.dump({"env": [["1abc", "", "A", 10, 1],
+                                    ["1abc", "", "A", 20],
+                                    ["1abc", "", "A", 30]], "cg_max_b": 15.0,
                            "cg_min_occ": 1.0, "vdm_max_b": 25.0,
                            "vdm_min_occ": 1.0,
                            # Synthetic until session 3's SASA gate lands; one
@@ -68,14 +87,6 @@ class MultiSubsetStreamingTests(unittest.TestCase):
                 handle.write("\n")
 
             worker_root = os.path.join(temp_dir, "worker")
-            args = (
-                [("ab", "1abc.jsonl")],
-                os.path.join(temp_dir, "environments"),
-                os.path.join(temp_dir, "pdb"),
-                "test_cg", _write_cg_pickles(temp_dir, cg_result[1]), [1, 0, 2],
-                os.path.join(temp_dir, "log"), 3, ["C", "O", "O"], 2,
-                worker_root, (0, 0), (1, 2), pipeline._FLUSH_RECORDS_THRESHOLD)
-
             def reorder(subset, _vdms, _cg, _atomgroup):
                 labels = ["ALA"] if len(subset) == 1 else ["ALA", "SER"]
                 n = len(labels)
@@ -86,7 +97,7 @@ class MultiSubsetStreamingTests(unittest.TestCase):
                         [BB[2] + 1.23] * n)
 
             with mock.patch.object(
-                    pipeline, "_get_atomgroup_for_env", return_value=object()), \
+                    pipeline, "_get_atomgroup_for_env", return_value=_FakeAtomGroup()), \
                     mock.patch.object(
                         pipeline, "_resolve_duplicate_ligand_occupancies",
                         side_effect=lambda atomgroup, _label: atomgroup), \
@@ -101,13 +112,16 @@ class MultiSubsetStreamingTests(unittest.TestCase):
                     mock.patch.object(
                         pipeline.clust, "reorder_vdg_subset",
                         side_effect=reorder):
-                pipeline._stream_one_chunk(args)
+                pipeline._stream_one_chunk((
+                    [("ab", "1abc.jsonl")], os.path.join(temp_dir, "environments"),
+                    os.path.join(temp_dir, "pdb"), "test_cg",
+                    _write_cg_pickles(temp_dir, cg_result[1]), [1, 0, 2],
+                    os.path.join(temp_dir, "log"), 3, ["C", "O", "O"], (), 2,
+                    worker_root, (0, 0), (1, 2), pipeline._FLUSH_RECORDS_THRESHOLD))
 
             self.assertEqual(get_features.call_count, 1)
             for size, aa_key in ((1, "ALA"), (2, "ALA_SER")):
-                bucket_dir = os.path.join(worker_root, str(size))
-                paths = [os.path.join(bucket_dir, name)
-                         for name in os.listdir(bucket_dir)]
+                paths = _shard_paths(os.path.join(worker_root, str(size)))
                 self.assertEqual(len(paths), 1)
                 self.assertEqual(
                     pipeline._aa_key_from_bucket_fname(os.path.basename(paths[0])),
@@ -117,9 +131,6 @@ class MultiSubsetStreamingTests(unittest.TestCase):
     def test_cg_element_mismatch_is_skipped_and_counted(self):
         """A CG whose elements disagree with the SMARTS must be dropped at stream
         time, not written out and raised on at npz-write time."""
-        environment = [["1abc", "", "A", 10, 1],
-                       ["1abc", "", "A", 20],
-                       ["1abc", "", "A", 30]]
         # SMARTS multiset is C,O,O; OpenBabel picked an N.
         cg_result = (
             np.zeros((3, 3), dtype=np.float32),
@@ -130,7 +141,9 @@ class MultiSubsetStreamingTests(unittest.TestCase):
             environments_dir = os.path.join(temp_dir, "environments", "ab")
             os.makedirs(environments_dir)
             with open(os.path.join(environments_dir, "1abc.jsonl"), "w") as handle:
-                json.dump({"env": environment, "cg_max_b": 15.0,
+                json.dump({"env": [["1abc", "", "A", 10, 1],
+                                    ["1abc", "", "A", 20],
+                                    ["1abc", "", "A", 30]], "cg_max_b": 15.0,
                            "cg_min_occ": 1.0, "vdm_max_b": 25.0,
                            "vdm_min_occ": 1.0,
                            # Synthetic until session 3's SASA gate lands; one
@@ -142,17 +155,8 @@ class MultiSubsetStreamingTests(unittest.TestCase):
                 handle.write("\n")
 
             worker_root = os.path.join(temp_dir, "worker")
-            args = (
-                [("ab", "1abc.jsonl")],
-                os.path.join(temp_dir, "environments"),
-                os.path.join(temp_dir, "pdb"),
-                "test_cg", _write_cg_pickles(temp_dir, cg_result[1]), [1, 0, 2],
-                os.path.join(temp_dir, "log"), 3, ["C", "O", "O"], 2,
-                worker_root, (0, 0), (1, 2),
-                pipeline._FLUSH_RECORDS_THRESHOLD)
-
             with mock.patch.object(
-                    pipeline, "_get_atomgroup_for_env", return_value=object()), \
+                    pipeline, "_get_atomgroup_for_env", return_value=_FakeAtomGroup()), \
                     mock.patch.object(
                         pipeline, "_resolve_duplicate_ligand_occupancies",
                         side_effect=lambda atomgroup, _label: atomgroup), \
@@ -160,12 +164,56 @@ class MultiSubsetStreamingTests(unittest.TestCase):
                     mock.patch.object(
                         pipeline.clust, "get_vdm_res_features",
                         return_value={20: object(), 30: object()}):
-                _, skips, _warns = pipeline._stream_one_chunk(args)
+                _, skips, _warns = pipeline._stream_one_chunk((
+                    [("ab", "1abc.jsonl")], os.path.join(temp_dir, "environments"),
+                    os.path.join(temp_dir, "pdb"), "test_cg",
+                    _write_cg_pickles(temp_dir, cg_result[1]), [1, 0, 2],
+                    os.path.join(temp_dir, "log"), 3, ["C", "O", "O"], (), 2,
+                    worker_root, (0, 0), (1, 2),
+                    pipeline._FLUSH_RECORDS_THRESHOLD))
 
             self.assertEqual(skips["cg_elements_mismatch"], 1)
             for size in (1, 2):
-                bucket_dir = os.path.join(worker_root, str(size))
-                self.assertEqual(os.listdir(bucket_dir), [])
+                self.assertEqual(_shard_paths(os.path.join(worker_root, str(size))), [])
+
+    def test_geometry_rejection_is_one_row_level_skip(self):
+        """Multiple bad edges in one environment are one non-generic row skip."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            environments_dir = os.path.join(temp_dir, "environments", "ab")
+            os.makedirs(environments_dir)
+            with open(os.path.join(environments_dir, "1abc.jsonl"), "w") as handle:
+                json.dump({"env": [["1abc", "", "A", 10, 1],
+                                    ["1abc", "", "A", 20]],
+                           "cg_max_b": 15.0, "cg_min_occ": 1.0,
+                           "vdm_max_b": 25.0, "vdm_min_occ": 1.0,
+                           "buried_area": [12.5], "shared_area": [1.5],
+                           "n_atom_pairs": [6], "min_heavy_dist": [3.2]}, handle)
+                handle.write("\n")
+
+            def reject_geometry(*_args, row_rejections=None, **_kwargs):
+                row_rejections["cg_bond_geometry"] += 1
+                return None
+
+            worker_root = os.path.join(temp_dir, "worker")
+            with mock.patch.object(
+                    pipeline, "_get_atomgroup_for_env", side_effect=reject_geometry):
+                _, skips, _warns = pipeline._stream_one_chunk((
+                    [("ab", "1abc.jsonl")], os.path.join(temp_dir, "environments"),
+                    os.path.join(temp_dir, "pdb"), "test_cg",
+                    _write_cg_pickles(temp_dir, ["C1", "O1", "O2"]), [1, 0, 2],
+                    os.path.join(temp_dir, "log"), 3, ["C", "O", "O"],
+                    ((0, 1, "single"), (0, 2, "double")), 2, worker_root,
+                    (0, 0), (1,), pipeline._FLUSH_RECORDS_THRESHOLD))
+
+            self.assertEqual(skips["cg_bond_geometry"], 1)
+            self.assertEqual(skips["no_atomgroup"], 0)
+            self.assertEqual(_shard_paths(os.path.join(worker_root, "1")), [])
+            assert_discriminates(
+                lambda counts: (counts["cg_bond_geometry"], counts["no_atomgroup"])
+                               == (1, 0),
+                accepts=[skips],
+                rejects=[{"cg_bond_geometry": 0, "no_atomgroup": 1}],
+                label="geometry failure is counted once at row level")
 
     def test_generic_smarts_slot_acceptance_is_chunk_independent(self):
         """A slot the SMARTS does not pin must not be validated against whatever
@@ -180,8 +228,7 @@ class MultiSubsetStreamingTests(unittest.TestCase):
                              "", "A", 10, "LIG"),
             "2xyz__A_10_1": (np.zeros((3, 3), dtype=np.float32),
                              ["O1", "C1", "O2"], ["O", "C", "O"],
-                             "", "A", 10, "LIG"),
-        }
+                             "", "A", 10, "LIG")}
 
         def run(chunks, temp_dir, tag):
             """Stream `chunks` (one call per chunk, as separate workers would) and
@@ -195,7 +242,7 @@ class MultiSubsetStreamingTests(unittest.TestCase):
                     _write_cg_pickles(temp_dir, by_biounit={
                         label.split("_")[0]: r[1]
                         for label, r in cg_by_label.items()}), [1, 0, 2],
-                    os.path.join(temp_dir, "log"), 3, expected_element_seq, 2,
+                    os.path.join(temp_dir, "log"), 3, expected_element_seq, (), 2,
                     worker_root, (0, 0), (1,), pipeline._FLUSH_RECORDS_THRESHOLD)
 
                 def reorder(subset, _vdms, _cg, _atomgroup):
@@ -204,7 +251,7 @@ class MultiSubsetStreamingTests(unittest.TestCase):
                             [BB[2] + 1.23])
 
                 with mock.patch.object(
-                        pipeline, "_get_atomgroup_for_env", return_value=object()), \
+                        pipeline, "_get_atomgroup_for_env", return_value=_FakeAtomGroup()), \
                         mock.patch.object(
                             pipeline, "_resolve_duplicate_ligand_occupancies",
                             side_effect=lambda atomgroup, _label: atomgroup), \
@@ -222,9 +269,8 @@ class MultiSubsetStreamingTests(unittest.TestCase):
                     _, skips, _warns = pipeline._stream_one_chunk(args)
 
                 total_skips += skips["cg_elements_mismatch"]
-                bucket_dir = os.path.join(worker_root, "1")
-                for name in os.listdir(bucket_dir):
-                    total_records += load_shard(os.path.join(bucket_dir, name))["biounit"].size
+                for path in _shard_paths(os.path.join(worker_root, "1")):
+                    total_records += load_shard(path)["biounit"].size
             return total_records, total_skips
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -274,7 +320,7 @@ class MultiSubsetStreamingTests(unittest.TestCase):
             args = ([("ab", "1abc.jsonl")], os.path.join(temp_dir, "environments"),
                     os.path.join(temp_dir, "pdb"), "test_cg",
                     _write_cg_pickles(temp_dir, ["C1", "O1", "O2"]), [1, 0, 2],
-                    os.path.join(temp_dir, "log"), 3, ["C", "O", "O"], 2,
+                    os.path.join(temp_dir, "log"), 3, ["C", "O", "O"], (), 2,
                     worker_root, (0, 0), (1,), pipeline._FLUSH_RECORDS_THRESHOLD)
             collinear = BB.copy()
             collinear[:, 1] = 0.0
@@ -284,7 +330,7 @@ class MultiSubsetStreamingTests(unittest.TestCase):
                         [("", "A", 20, "ALA")], [0], [np.full(3, np.nan)])
 
             with mock.patch.object(
-                    pipeline, "_get_atomgroup_for_env", return_value=object()), \
+                    pipeline, "_get_atomgroup_for_env", return_value=_FakeAtomGroup()), \
                     mock.patch.object(
                         pipeline, "_resolve_duplicate_ligand_occupancies",
                         side_effect=lambda atomgroup, _label: atomgroup), \
@@ -297,16 +343,22 @@ class MultiSubsetStreamingTests(unittest.TestCase):
                                       side_effect=reorder):
                 _, skips, _warns = pipeline._stream_one_chunk(args)
             self.assertEqual(skips["incomplete_stage1"], 1)
-            self.assertEqual(os.listdir(os.path.join(worker_root, "1")), [])
+            self.assertEqual(_shard_paths(os.path.join(worker_root, "1")), [])
 
     def test_warning_counts_returned_are_per_chunk_deltas(self):
         """_WARN_COUNTS is module state and the executor reuses a worker across
         chunks, so returning the running totals would re-report every earlier
         chunk's warnings and inflate the end-of-streaming line. Also covers the
         keys nothing else counts: vdm_not_in_contact drops one residue and lets
-        the environment through, so it never reaches a skips[...] bucket."""
+        the environment through, so it never reaches a skips[...] bucket.
+        Counts are of deduplicated entries, so an immediate repeat of the same
+        line collapses and each chunk still reports its own distinct warning."""
         pipeline._WARN_COUNTS.clear()
+        pipeline._SIDECAR_BUFFER.clear()
+        pipeline._LAST_SIDECAR_LINE.clear()
         self.addCleanup(pipeline._WARN_COUNTS.clear)
+        self.addCleanup(pipeline._SIDECAR_BUFFER.clear)
+        self.addCleanup(pipeline._LAST_SIDECAR_LINE.clear)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             shards = []
@@ -334,15 +386,17 @@ class MultiSubsetStreamingTests(unittest.TestCase):
                     os.path.join(temp_dir, "pdb"), "test_cg",
                     _write_cg_pickles(temp_dir, ["C1", "O1", "O2"],
                                       biounits=("1abc", "2xyz")), [1, 0, 2],
-                    logfile, 3, ["C", "O", "O"], 2,
+                    logfile, 3, ["C", "O", "O"], (), 2,
                     os.path.join(temp_dir, f"worker_{tag}"), (0, 0), (1,),
                     pipeline._FLUSH_RECORDS_THRESHOLD)
 
                 # One residue-level warning per environment, then the environment
-                # proceeds -- exactly the vdm_not_in_contact shape.
+                # proceeds -- exactly the vdm_not_in_contact shape. The detail
+                # differs per chunk, and is then repeated verbatim so the repeat
+                # is deduplicated rather than counted twice.
                 def fake_atomgroup(*_a, **_kw):
-                    pipeline._log_warn_capped(
-                        logfile, "vdm_not_in_contact", "[WARNING] dropped.\n")
+                    pipeline._log_warn(logfile, "vdm_not_in_contact", f"dropped {tag}")
+                    pipeline._log_warn(logfile, "vdm_not_in_contact", f"dropped {tag}")
                     return None
 
                 with mock.patch.object(
@@ -354,7 +408,8 @@ class MultiSubsetStreamingTests(unittest.TestCase):
             skips_a, warns_a = run([shards[0]], "a")
             skips_b, warns_b = run([shards[1]], "b")
 
-        # Each chunk reports only its own warning, not the running total.
+        # Each chunk reports only its own warning, not the running total, and the
+        # verbatim repeat inside each chunk is deduplicated rather than counted.
         self.assertEqual(warns_a, {"vdm_not_in_contact": 1})
         self.assertEqual(warns_b, {"vdm_not_in_contact": 1})
         # ... and the running total really did advance, so the deltas are not
@@ -365,6 +420,73 @@ class MultiSubsetStreamingTests(unittest.TestCase):
         self.assertNotIn("vdm_not_in_contact", skips_a)
         self.assertNotIn("vdm_not_in_contact", skips_b)
 
+    def test_warning_detail_goes_to_sidecar_not_main_log(self):
+        """_log_warn used to write full per-occurrence text straight to the
+        main logfile via a flock'd NFS write per warning; under a systematic
+        failure that serializes one network write per environment per worker
+        into a multi-GB log. It now buffers detail (_SIDECAR_BUFFER) and
+        flushes it to a `{logfile}.warn.tsv` sidecar, leaving the main log to
+        carry only the end-of-streaming aggregate line written elsewhere. The
+        sidecar records deduplicated entries: distinct details each get a line,
+        an immediate verbatim repeat does not."""
+        pipeline._WARN_COUNTS.clear()
+        pipeline._SIDECAR_BUFFER.clear()
+        pipeline._LAST_SIDECAR_LINE.clear()
+        self.addCleanup(pipeline._WARN_COUNTS.clear)
+        self.addCleanup(pipeline._SIDECAR_BUFFER.clear)
+        self.addCleanup(pipeline._LAST_SIDECAR_LINE.clear)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            environments_dir = os.path.join(temp_dir, "environments", "ab")
+            os.makedirs(environments_dir, exist_ok=True)
+            with open(os.path.join(environments_dir, "1abc.jsonl"), "w") as handle:
+                json.dump({"env": [["1abc", "", "A", 10, 1], ["1abc", "", "A", 20]],
+                           "cg_max_b": 15.0, "cg_min_occ": 1.0,
+                           "vdm_max_b": 25.0, "vdm_min_occ": 1.0,
+                           "buried_area": [12.5], "shared_area": [1.5],
+                           "n_atom_pairs": [6], "min_heavy_dist": [3.2]}, handle)
+                handle.write("\n")
+
+            logfile = os.path.join(temp_dir, "log")
+
+            def fake_atomgroup(*_a, **_kw):
+                for i in range(3):
+                    pipeline._log_warn(logfile, "vdm_not_in_contact", f"dropped {i}")
+                # A verbatim repeat of the line just written must not add a
+                # fourth sidecar line or a fourth count.
+                pipeline._log_warn(logfile, "vdm_not_in_contact", "dropped 2")
+                return None
+
+            with mock.patch.object(
+                    pipeline, "_get_atomgroup_for_env", side_effect=fake_atomgroup):
+                pipeline._stream_one_chunk((
+                    [("ab", "1abc.jsonl")], os.path.join(temp_dir, "environments"),
+                    os.path.join(temp_dir, "pdb"), "test_cg",
+                    _write_cg_pickles(temp_dir, ["C1", "O1", "O2"], biounits=("1abc",)),
+                    [1, 0, 2], logfile, 3, ["C", "O", "O"], (), 2,
+                    os.path.join(temp_dir, "worker"), (0, 0), (1,),
+                    pipeline._FLUSH_RECORDS_THRESHOLD))
+
+            with open(logfile + ".warn.tsv") as handle:
+                sidecar_lines = [l for l in handle.read().splitlines() if l]
+            # Three distinct details, four _log_warn calls: the repeat collapsed.
+            self.assertEqual(sidecar_lines, [f"vdm_not_in_contact\tdropped {i}"
+                                             for i in range(3)])
+            self.assertEqual(pipeline._WARN_COUNTS["vdm_not_in_contact"], 3)
+
+            main_log_text = ""
+            if os.path.isfile(logfile):
+                with open(logfile) as handle:
+                    main_log_text = handle.read()
+
+        # Non-vacuity: the clause must accept the real (clean) main log and
+        # reject text shaped like the per-occurrence write it replaced --
+        # otherwise a clause that always passes would hide a regression.
+        assert_discriminates(
+            lambda text: "vdm_not_in_contact" not in text,
+            accepts=[main_log_text],
+            rejects=["[WARNING] vdm_not_in_contact dropped\n"],
+            label="main log stays free of per-occurrence warning detail")
 
 if __name__ == "__main__":
     unittest.main()

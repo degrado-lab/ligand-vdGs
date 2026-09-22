@@ -49,6 +49,7 @@ def _bucket_columns(rng, n, n_cg=4, n_res=1, flank=2, n_centers=6):
         # these cannot be zeros.
         "cg_heavy_degree": np.full((n, n_cg), 2, dtype=np.int8),
         "cg_num_h": np.full((n, n_cg), 1, dtype=np.int8),
+        "cg_placed_h": np.zeros((n, n_cg), dtype=np.int8),
         "cg_formal_charge": np.zeros((n, n_cg), dtype=np.int8),
         "cg_nbr_elems": np.full((n, n_cg), 1, dtype=np.uint32),  # one C
         # OpenBabel, the perception these records would actually have come
@@ -73,7 +74,7 @@ def _run(tmp, tag, split_min, buckets_spec, break_bucket=None,
         save_columns(bucket_dir, cols)
         if label == break_bucket:
             os.remove(os.path.join(bucket_dir, "cgvdmbb.npy"))
-        buckets.append(C.Bucket(key=(1, label), size_subset=1,
+        buckets.append(C.Bucket(key=(1, "pos", label), size_subset=1, sign="pos",
                                 aa_parts=tuple(label.split("_")),
                                 n=len(cols["biounit"]), bucket_dir=bucket_dir))
     buckets.sort(key=lambda b: -b.n)
@@ -93,7 +94,7 @@ def _run(tmp, tag, split_min, buckets_spec, break_bucket=None,
 
 
 def _load(lib, label):
-    with np.load(os.path.join(lib, "nr_vdgs", "1", f"{label}.npz")) as z:
+    with np.load(os.path.join(lib, "nr_vdgs", "1", "pos", f"{label}.npz")) as z:
         return {k: z[k] for k in z.files}
 
 
@@ -186,11 +187,14 @@ class PhasedBucketTests(unittest.TestCase):
                 "SER": _bucket_columns(rng, 90)}
         with tempfile.TemporaryDirectory() as tmp:
             failed, _counters, lib = _run(tmp, "fail", 40, spec, break_bucket="SER")
-            self.assertEqual(failed, ["SER"])
-            self.assertEqual(sorted(os.listdir(os.path.join(lib, "nr_vdgs", "1"))),
+            self.assertEqual(failed, ["pos/SER"])
+            self.assertEqual(sorted(os.listdir(os.path.join(lib, "nr_vdgs", "1", "pos"))),
                              ["ALA.npz", "GLY.npz", "SER.FAILED"])
-            marker = open(os.path.join(lib, "nr_vdgs", "1", "SER.FAILED")).read()
-            self.assertIn("task stage1_block", marker)
+            marker = open(os.path.join(lib, "nr_vdgs", "1", "pos", "SER.FAILED")).read()
+            # stage1_pivots is the first task to open cgvdmbb.npy, so it is the one
+            # that reports a missing stage-1 file; naming the task pins where it failed.
+            self.assertIn("task stage1_pivots", marker)
+            self.assertIn("cgvdmbb.npy", marker)
 
 
 if __name__ == "__main__":

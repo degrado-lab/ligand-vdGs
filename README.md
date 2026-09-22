@@ -32,14 +32,13 @@ The core command, run once per fragment SMILES:
 python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py \
     -s "<fragment SMILES, matched as SMARTS>" -c "<CG label; defaults to the SMARTS if omitted>" \
     -p <path/to/pdb_database/> \
-    -b <path/to/probe_output/> \
     -o <path/to/vdg_library/> \
     --num-procs <n> \
     --subset-sizes 1 2
 ```
 
-All requested subset sizes share one environment-reconstruction pass and are
-written independently under `nr_vdgs/<subset_size>/`.
+All requested subset sizes share one environment-reconstruction pass. Buckets are written under
+`nr_vdgs/<subset_size>/<pos|neut|neg|unreadable>/<aa_composition>.npz`.
 
 Each bucket npz holds one `nr_*` row per non-redundant vdG and one `mem_*` row per
 clustered vdG that is not the nr one, so `cluster_size == 1 + (mem_ rows)`. Stage-1
@@ -49,7 +48,6 @@ per cluster. See
 [docs/database_generation_guide.md](docs/database_generation_guide.md) for the full
 array schema. A per-phase timing sidecar is written by default; `--no-profile-compute` skips it.
 
-`-b` is the Probe output directory produced by preprocessing step 3.
 `-c` (or its default, `-s`) is encoded with `utils.smiles_to_filename` before use,
 so a SMILES containing `/` or `\` can be passed as-is.
 Exact graph automorphisms are derived automatically from `-s` in
@@ -73,16 +71,12 @@ On Wynton (SGE), generate one job per fragment and submit them:
 
 ```bash
 # generate and submit in one step, longest job first (--mode is required)
-MAX_H_RT=36:00:00 ./run_production_frags.sh --mode threshold-plus-include
+MIN_SUPPORT=<distinct_biounit_stems> MAX_H_RT=36:00:00 \
+    ./run_production_frags.sh --mode threshold-plus-include
 ```
 
 The generated scripts use `#$ -cwd` with repo-relative paths, so submit from the
 repository root.
-
-- After a build or rebuild (and after any change to the fragment key scheme), run
-  `python ligand_vdgs/tools/h_class_diagnostic.py --lib <vdg_library> --out h_class.tsv`
-  before deciding which `H0`/`!H0` key variants to pool at read time; see
-  ["When to run the H-class diagnostic"](docs/database_generation_guide.md#when-to-run-the-h-class-diagnostic).
 
 ---
 
@@ -90,7 +84,7 @@ repository root.
 
 Identify candidate bioisosteres by comparing amino acid interaction profiles across chemical groups in the fragment library. See [docs/bioisostere_identification.md](docs/bioisostere_identification.md) for full details.
 
-Steps 1 → 2 → 3 form a chain; `compare_cg_geometries.py` is an independent
+Steps 1 → 2 form a chain; `compare_cg_geometries.py` is an independent
 branch that reads the vdG library directly rather than the profiles.
 
 ```bash
@@ -100,10 +94,6 @@ python ligand_vdgs/identify_bioisosteres/compute_aa_profiles.py \
 
 # 2. Pairwise profile similarity  (reads step 1's outputs from --profiles-dir)
 python ligand_vdgs/identify_bioisosteres/compare_aa_profiles.py --single-aa
-
-# 3. Visualize  (--sim-npz is the similarity matrix written by step 2)
-python ligand_vdgs/identify_bioisosteres/visualize_bioisosteres.py \
-    --sim-npz <path/to/similarity_matrix_*.npz>
 
 # Independent: compare CG geometries directly between libraries
 python ligand_vdgs/identify_bioisosteres/compare_cg_geometries.py \
