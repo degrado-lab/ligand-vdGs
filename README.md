@@ -70,8 +70,8 @@ exact rule, and `docs/symmetry_edge_cases.md` for where it misfires.
 On Wynton (SGE), generate one job per fragment and submit them:
 
 ```bash
-# generate and submit in one step, longest job first (--mode is required)
-MIN_SUPPORT=<distinct_biounit_stems> MAX_H_RT=36:00:00 \
+# generate and submit in one step, by manifest resource order (--mode is required)
+MIN_SUPPORT=<distinct_biounit_stems> \
     ./run_production_frags.sh --mode threshold-plus-include
 ```
 

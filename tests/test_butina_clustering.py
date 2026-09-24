@@ -303,6 +303,23 @@ class BatchedRmsdTests(unittest.TestCase):
             ac._masked_min_rmsd(self.data, self.ii, self.jj, only_best, self.full_perms,
                                 n_total), full, atol=1e-6)
 
+    def test_thresholded_fit_early_accepts_identity_without_losing_swap_match(self):
+        base = np.array([[0, 0, 0], [2, 0, 0], [0, 3, 0], [0, 0, 5]], np.float32)
+        data = np.stack((base, base.copy(), base[[1, 0, 2, 3]]))
+        ia = np.array([0, 0], dtype=np.intp)
+        ib = np.array([1, 2], dtype=np.intp)
+        perms = np.array([np.arange(4), [1, 0, 2, 3]], dtype=np.intp)
+        mask = np.ones((2, 2), dtype=bool)
+        keep, evaluations = ac._masked_within_rmsd(
+            data, ia, ib, mask, perms, n_total=4, threshold=1e-5, batch_rows=1)
+        np.testing.assert_array_equal(keep, [True, True])
+        self.assertEqual(evaluations, 3, 'identity accept did not skip its second fit')
+        assert_discriminates(
+            lambda allowed: bool(ac._masked_within_rmsd(
+                data, ia[1:], ib[1:], allowed, perms, 4, 1e-5)[0][0]),
+            [mask[1:]], [np.array([[True, False]])],
+            'slot-swapped pair needs its non-identity fit')
+
 
 class NeighbourOrderTests(unittest.TestCase):
     """Stage-1 neighbour order is load-bearing, so it is pinned here.

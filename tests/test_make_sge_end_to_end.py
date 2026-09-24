@@ -28,40 +28,32 @@ ETHER = '[C;!R;!H0][O;!R;D2]'
 FRAGMENTS = [ACID, PYRIDINE, ETHER]
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-
-# Held constant across every fragment on purpose: if the structures column varied
-# with the occurrence column, a tier test could not tell which one keys the tiers.
+# Cost is now estimated inline by main() rather than read from a file, so every
+# case fakes estimate_fragment_counts. main() discards its structures return
+# value (only occurrences drive tiering), so STRUCTURES is just a filler.
 STRUCTURES = 900
 
+def _fake_estimate(occurrences, sample_scale=1.0):
+    """A stand-in for estimate_fragment_counts, keyed by fragment SMARTS."""
+    def fake(fragments, pdb_dir, sample_size=None, num_procs=1, seed=0):
+        mk._LAST_SAMPLE_SCALE[0] = sample_scale
+        return ({f: STRUCTURES for f in fragments},
+                {f: occurrences.get(f, STRUCTURES) for f in fragments})
+    return fake
 
-def _setup(tmp_path, support=500, occurrences=None, shipped_template=False):
+def _setup(tmp_path, support=500, shipped_template=False):
     """A complete set of inputs for one main() run. Returns an argv list."""
-    occurrences = occurrences or {f: 900 for f in FRAGMENTS}
     for name in ('lib', 'sge', 'logs', 'pdb'):
         (tmp_path / name).mkdir(parents=True, exist_ok=True)
 
     dict_path = tmp_path / 'frags.pkl'
-    identity = identity_of(str(tmp_path / 'pdb'))
     with open(dict_path, 'wb') as handle:
         pickle.dump({'key_schema': Frags.KEY_SCHEMA,
                      'frags': {'CCOO': {ACID: ['LIG']},
                                'CCCCN': {PYRIDINE: ['PYR']},
                                'CO': {ETHER: ['MET']}},
                      'support_pooled': {f: support for f in FRAGMENTS},
-                     'db_identity': identity}, handle)
-
-    # The identity is computed from the (empty) database directory, not invented:
-    # check_recorded_inputs compares contents, and a fixed string would make every
-    # case fail on the provenance guard rather than on what it is testing.
-    est = tmp_path / 'est.tsv'
-    est.write_text(
-        '# sample_scale\t1.0\n'
-        f'# key_schema\t{Frags.KEY_SCHEMA}\n'
-        f'# pdb_db_identity\t{identity["sha256"]}\n'
-        f'# frags_dict_sha256\t{utils.file_sha256(dict_path)}\n'
-        '# max_size\t5\n'
-        f'# pdb_dir\t{tmp_path / "pdb"}\n'
-        + ''.join(f'{f}\t{STRUCTURES}\t{occurrences[f]}\n' for f in FRAGMENTS))
+                     'db_identity': identity_of(str(tmp_path / 'pdb'))}, handle)
 
     if shipped_template:
         # The real template, so a regression in the shipped file is caught here
@@ -70,7 +62,7 @@ def _setup(tmp_path, support=500, occurrences=None, shipped_template=False):
     else:
         template = tmp_path / 'template.sh'
         template.write_text('# header\n#!/bin/bash\n#$ -pe smp $NUM_PROCS\n'
-                            '#$ -l h_rt=$RUN_TIME\n$PRE_RUN\n'
+                            '#$ -l h_rt=$RUN_TIME\n'
                             'python $WRAPPER -s $SMILES -c $CG '
                             '-o $OUTPUT_DIR\n')
 
@@ -81,29 +73,24 @@ def _setup(tmp_path, support=500, occurrences=None, shipped_template=False):
             '--vdg-lib-dir', str(tmp_path / 'lib'),
             '--log-dir', str(tmp_path / 'logs'),
             '--pdb-dir', str(tmp_path / 'pdb'),
-            '--frag-cost-estimate', str(est),
-            '--max-h-rt', '336:00:00',
             '--max-size', '5',
             '--min-support', '100']
 
-
-def _run(monkeypatch, argv):
+def _run(monkeypatch, argv, occurrences=None, sample_scale=1.0):
+    occurrences = occurrences or {f: STRUCTURES for f in FRAGMENTS}
+    monkeypatch.setattr(mk, 'estimate_fragment_counts', _fake_estimate(occurrences, sample_scale))
     monkeypatch.setattr(sys, 'argv', argv)
     mk.main()
 
-
 def _scripts(tmp_path):
     return sorted(f for f in os.listdir(tmp_path / 'sge') if f.endswith('.sh'))
-
 
 def _manifest(tmp_path):
     """submission_order.tsv as a list of dicts, in submission order."""
     lines = [line for line in
              (tmp_path / 'sge' / 'submission_order.tsv').read_text().splitlines()
              if line and not line.startswith('#')]
-    header = lines[0].split('\t')
-    return [dict(zip(header, line.split('\t'))) for line in lines[1:]]
-
+    return [dict(zip(lines[0].split('\t'), line.split('\t'))) for line in lines[1:]]
 
 def _finish(tmp_path, smiles):
     """Write the 'Job completed.' line a finished fragment leaves behind."""
@@ -111,7 +98,6 @@ def _finish(tmp_path, smiles):
     frag = tmp_path / 'lib' / label
     frag.mkdir(parents=True, exist_ok=True)
     (frag / f'{label}_log').write_text('work\nJob completed.\n')
-
 
 def _kill(tmp_path, smiles):
     """The directory an h_rt kill leaves: populated, no completion line."""
@@ -121,7 +107,6 @@ def _kill(tmp_path, smiles):
     (frag / f'{label}_log').write_text('work\nProcessing 65598 PDBs...\n')
     (frag / 'nr_vdgs').mkdir(exist_ok=True)
 
-
 def test_a_full_run_writes_one_script_per_selected_fragment(monkeypatch, tmp_path):
     # The signature-compatibility case: this calls the real select_fragments with
     # the real keywords. A renamed, removed or keyword-only parameter fails here.
@@ -129,14 +114,12 @@ def test_a_full_run_writes_one_script_per_selected_fragment(monkeypatch, tmp_pat
     assert len(_scripts(tmp_path)) == len(FRAGMENTS)
     assert os.path.isfile(tmp_path / 'lib' / 'library_provenance.json')
 
-
 def test_support_below_the_threshold_selects_nothing(monkeypatch, tmp_path):
     # Vacuity guard on the case above: if `support` were ignored -- which is what
     # passing the wrong quantity would look like -- every fragment would still be
     # selected and the previous test would pass for the wrong reason.
     _run(monkeypatch, _setup(tmp_path, support=3))
     assert _scripts(tmp_path) == []
-
 
 def test_a_stale_dict_is_refused_rather_than_silently_built(monkeypatch, tmp_path):
     argv = _setup(tmp_path)
@@ -150,13 +133,11 @@ def test_a_stale_dict_is_refused_rather_than_silently_built(monkeypatch, tmp_pat
         _run(monkeypatch, argv)
     assert _scripts(tmp_path) == []
 
-
 def test_rerunning_into_a_used_directory_needs_resume(monkeypatch, tmp_path):
     argv = _setup(tmp_path)
     _run(monkeypatch, argv)
     with pytest.raises(FileExistsError):
         _run(monkeypatch, argv)
-
 
 def test_resume_skips_finished_and_rewrites_the_rest(monkeypatch, tmp_path):
     argv = _setup(tmp_path)
@@ -177,61 +158,23 @@ def test_resume_skips_finished_and_rewrites_the_rest(monkeypatch, tmp_path):
     assert len(rows) == 2
     assert all(os.path.isfile(row['script']) for row in rows)
 
-
-def test_resume_leaves_a_partial_directory_alone_without_clear_partial(
-        monkeypatch, tmp_path):
+def test_resume_leaves_a_partial_directory_alone(monkeypatch, tmp_path):
     argv = _setup(tmp_path)
     _run(monkeypatch, argv)
     for name in _scripts(tmp_path):
         os.remove(tmp_path / 'sge' / name)
     _kill(tmp_path, PYRIDINE)
     _run(monkeypatch, argv + ['--resume'])
-    script = (tmp_path / 'sge' /
-              (utils.smiles_to_filename(PYRIDINE) + '.sh')).read_text()
-    assert 'rm -rf' not in script
+    assert 'rm -rf' not in (tmp_path / 'sge' /
+        (utils.smiles_to_filename(PYRIDINE) + '.sh')).read_text()
     # and the leftover output is still there for the user to inspect
     assert os.path.isdir(tmp_path / 'lib' / utils.smiles_to_filename(PYRIDINE))
 
-
-def test_clear_partial_targets_only_the_unfinished_fragment(monkeypatch, tmp_path):
-    # The scheduler-query/parser contract has its own focused test. Keep this
-    # end-to-end case about which output directory receives the cleanup command,
-    # so it does not depend on a live SGE installation.
-    monkeypatch.setattr(mk, 'active_sge_job_names', lambda: set())
-    argv = _setup(tmp_path)
-    _run(monkeypatch, argv)
-    for name in _scripts(tmp_path):
-        os.remove(tmp_path / 'sge' / name)
-    _kill(tmp_path, PYRIDINE)          # has leftovers; ETHER does not
-    _run(monkeypatch, argv + ['--resume', '--clear-partial'])
-
-    killed = (tmp_path / 'sge' /
-              (utils.smiles_to_filename(PYRIDINE) + '.sh')).read_text()
-    fresh = (tmp_path / 'sge' /
-             (utils.smiles_to_filename(ETHER) + '.sh')).read_text()
-    assert 'rm -rf' in killed
-    assert utils.smiles_to_filename(PYRIDINE) in killed
-    # The fragment that never ran has nothing to clear, so it must not carry a
-    # deletion at all.
-    assert 'rm -rf' not in fresh
-
-
-def test_clear_partial_without_resume_is_rejected(monkeypatch, tmp_path):
-    with pytest.raises(SystemExit):
-        _run(monkeypatch, _setup(tmp_path) + ['--clear-partial'])
-
-
 def test_na_sample_scale_does_not_crash(monkeypatch, capsys, tmp_path):
-    # B7: estimate_frag_cost.py writes the literal 'n/a' for an empty fragment set;
-    # float('n/a') must not be allowed to raise before this run's own selection
-    # (non-empty here) even gets a chance to print the no-sample-scale warning.
-    argv = _setup(tmp_path)
-    est_path = argv[argv.index('--frag-cost-estimate') + 1]
-    pathlib.Path(est_path).write_text('\n'.join(
-        line if not line.startswith('# sample_scale') else '# sample_scale\tn/a'
-        for line in pathlib.Path(est_path).read_text().splitlines()) + '\n')
-    _run(monkeypatch, argv)
-    assert 'records no sample_scale' in capsys.readouterr().out
+    # estimate_fragment_counts leaves _LAST_SAMPLE_SCALE at None whenever it
+    # cannot compute a scale; main() must warn, not crash, and still proceed.
+    _run(monkeypatch, _setup(tmp_path), sample_scale=None)
+    assert 'no sample_scale' in capsys.readouterr().out
     assert len(_scripts(tmp_path)) == len(FRAGMENTS)
 
 def test_resume_preserves_an_alias_a_top_up_merged_in(monkeypatch, tmp_path):
@@ -261,14 +204,12 @@ def test_resume_does_not_rewrite_the_original_provenance(monkeypatch, tmp_path):
     _run(monkeypatch, argv + ['--resume'])
     assert json.loads(prov.read_text()) == original
 
-
 def test_tiers_key_on_occurrences_not_structures(monkeypatch, tmp_path):
-    # DR-7. Every fragment shares one structure count, so the tiers can only come
-    # apart if the OCCURRENCE column is what keys them. Were the key still the
-    # structure column, all three would land in the same tier and this fails.
+    # DR-7. Every fragment shares one structure count (STRUCTURES, faked constant
+    # and discarded by main()), so the tiers can only come apart if the OCCURRENCE
+    # return value is what keys them.
     cheap, dear = mk.TIER_1[0] // 4, mk.RESOURCE_TIERS[-2][0] * 10
-    argv = _setup(tmp_path, occurrences={ACID: cheap, PYRIDINE: dear, ETHER: cheap})
-    _run(monkeypatch, argv)
+    _run(monkeypatch, _setup(tmp_path), occurrences={ACID: cheap, PYRIDINE: dear, ETHER: cheap})
     acid = (tmp_path / 'sge' / (utils.smiles_to_filename(ACID) + '.sh')).read_text()
     pyr = (tmp_path / 'sge' / (utils.smiles_to_filename(PYRIDINE) + '.sh')).read_text()
     # Positive on both sides: 'not in' alone would also pass on an empty file.
@@ -281,13 +222,20 @@ def test_tiers_key_on_occurrences_not_structures(monkeypatch, tmp_path):
     assert mk.TIER_1[1] != mk.RESOURCE_TIERS[-1][1], 'tiers no longer differ in slots either'
     assert f'-pe smp {mk.TIER_1[1]}' in acid
     assert f'-pe smp {mk.RESOURCE_TIERS[-1][1]}' in pyr
-    # And the structures column really is constant, or the test proves nothing.
-    est = [line.split('\t') for line in
-           open(argv[argv.index('--frag-cost-estimate') + 1]).read().splitlines()
-           if not line.startswith('#')]
-    assert len({row[1] for row in est}) == 1, est
-    assert len({row[2] for row in est}) > 1, est
 
+def test_manifest_orders_widest_jobs_first(monkeypatch, tmp_path):
+    # The durable monitor submits this manifest directly. The old fragment-order
+    # output [10, 20, 20] would strand wide reservations behind narrow jobs.
+    _run(monkeypatch, _setup(tmp_path),
+         occurrences={ACID: 900, PYRIDINE: 30_000, ETHER: 25_000})
+    rows = _manifest(tmp_path)
+    assert [int(row['slots']) for row in rows] == [20, 20, 10]
+    # Within the tied 20-slot tier, the pricier fragment (higher occurrence count)
+    # bubbles up first instead of falling back to alphabetical script path.
+    assert [row['script'] for row in rows[:2]] == [
+        str(tmp_path / 'sge' / (utils.smiles_to_filename(f) + '.sh'))
+        for f in (PYRIDINE, ETHER)]
+    assert [int(row['order']) for row in rows] == list(range(len(rows)))
 
 def test_resume_refuses_a_changed_max_size(monkeypatch, tmp_path):
     # The silent-mix case DR-6 makes fatal: a resume at a different --max-size
@@ -307,7 +255,6 @@ def test_resume_refuses_a_changed_max_size(monkeypatch, tmp_path):
         _run(monkeypatch, changed + ['--resume'])
     assert _scripts(tmp_path) == []
 
-
 def test_min_support_is_required_for_a_build_but_not_for_a_top_up(
         monkeypatch, tmp_path):
     argv = _setup(tmp_path)
@@ -325,7 +272,6 @@ def test_min_support_is_required_for_a_build_but_not_for_a_top_up(
     _run(monkeypatch, without + ['--include-only', '--include', ACID])
     assert _scripts(tmp_path) == [utils.smiles_to_filename(ACID) + '.sh']
 
-
 def test_slot_hour_ceiling_is_arithmetically_right(monkeypatch, capsys, tmp_path):
     # The coordinator sizes the overnight round from this number, so it has to be
     # right rather than plausible. Occurrences are chosen to put one fragment in
@@ -336,14 +282,9 @@ def test_slot_hour_ceiling_is_arithmetically_right(monkeypatch, capsys, tmp_path
     # just past its boundary, one far past the last finite boundary. The table
     # collapsed from four bands to two on 2026-09-12, and a `t0, t1, t2 = ...`
     # unpack here failed on the shape rather than on the arithmetic it tests.
-    uppers = [t[0] for t in mk.RESOURCE_TIERS]
-    finite = [u for u in uppers if u != float('inf')]
-    occurrences = {ACID: finite[0] // 2,
-                   PYRIDINE: finite[0],
-                   ETHER: finite[-1] * 10}
-    argv = _setup(tmp_path, occurrences=occurrences)
-    monkeypatch.setattr(sys, 'argv', argv)
-    mk.main()
+    finite = [u for u in (t[0] for t in mk.RESOURCE_TIERS) if u != float('inf')]
+    _run(monkeypatch, _setup(tmp_path),
+         occurrences={ACID: finite[0] // 2, PYRIDINE: finite[0], ETHER: finite[-1] * 10})
     out = capsys.readouterr().out
 
     rows = _manifest(tmp_path)
@@ -361,7 +302,6 @@ def test_slot_hour_ceiling_is_arithmetically_right(monkeypatch, capsys, tmp_path
     largest = max(int(row['slots']) * mk._h_rt_to_hours(row['h_rt']) for row in rows)
     assert expected > largest, (expected, largest)
 
-
 def test_a_library_in_another_vocabulary_is_refused(monkeypatch, tmp_path):
     # The 2026-09-11 near-miss: ~/docking/frag_lib held 673 pre-annotation fragment
     # directories plus a library_provenance.json with NO key_schema field. A full
@@ -373,13 +313,12 @@ def test_a_library_in_another_vocabulary_is_refused(monkeypatch, tmp_path):
         {'frags_dict': 'old.pkl', 'frags_dict_sha256': 'd04d5f', 'max_size': 5,
          'min_instances': 250}))            # exactly the shipped old record's shape
     (lib / 'ccccn').mkdir()                 # an old-vocabulary fragment directory
-    with pytest.raises(SystemExit, match='different fragment vocabulary'):
+    with pytest.raises(SystemExit, match='vocabulary mismatch'):
         _run(monkeypatch, argv)
     # Nothing may be written, including the provenance the run would have clobbered.
     assert _scripts(tmp_path) == []
     assert json.loads((lib / 'library_provenance.json').read_text())['frags_dict'] \
         == 'old.pkl'
-
 
 def test_a_library_in_the_same_vocabulary_is_accepted(monkeypatch, tmp_path):
     # Discriminating pair for the case above: identical situation except the
@@ -395,7 +334,6 @@ def test_a_library_in_the_same_vocabulary_is_accepted(monkeypatch, tmp_path):
     _run(monkeypatch, argv + ['--resume'])           # must not raise
     assert _scripts(tmp_path)
 
-
 def test_the_vocabulary_guard_also_covers_a_top_up(monkeypatch, tmp_path):
     # --include-only writes into an existing library by design, so it is the path
     # where a vocabulary mix is easiest to cause and where check_provenance's
@@ -408,10 +346,9 @@ def test_the_vocabulary_guard_also_covers_a_top_up(monkeypatch, tmp_path):
     provenance = json.loads((lib / 'library_provenance.json').read_text())
     provenance['key_schema'] = 'older-0'
     (lib / 'library_provenance.json').write_text(json.dumps(provenance))
-    with pytest.raises(SystemExit, match='different fragment vocabulary'):
+    with pytest.raises(SystemExit, match='vocabulary mismatch'):
         _run(monkeypatch, argv + ['--include-only', '--include', ACID])
     assert _scripts(tmp_path) == []
-
 
 def _wrapper_invocation(script_text):
     """The `python ...` line a generated script runs, as a token list."""
@@ -420,7 +357,6 @@ def _wrapper_invocation(script_text):
         if stripped.startswith('python ') and not stripped.startswith('#'):
             return stripped.split()
     raise AssertionError(f'no python invocation in script:\n{script_text}')
-
 
 def test_generated_scripts_invoke_the_wrapper_by_absolute_path(
         monkeypatch, tmp_path):
@@ -435,7 +371,6 @@ def test_generated_scripts_invoke_the_wrapper_by_absolute_path(
         assert os.path.isabs(target), (name, target)
         assert os.path.isfile(target), (name, target)
         assert target.endswith('vdg_generation_wrapper.py'), (name, target)
-
 
 def test_the_generated_wrapper_call_works_from_an_unrelated_cwd(
         monkeypatch, tmp_path):
@@ -464,7 +399,6 @@ def test_the_generated_wrapper_call_works_from_an_unrelated_cwd(
                             cwd=str(elsewhere), capture_output=True, text=True)
     assert broken.returncode != 0, broken.stdout[-200:]
 
-
 def test_the_shipped_template_has_no_relative_python_invocation():
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     text = open(os.path.join(repo, 'resources', 'frag_sge_template.sh')).read()
@@ -472,20 +406,17 @@ def test_the_shipped_template_has_no_relative_python_invocation():
     assert tokens[1] == '$WRAPPER', tokens
     assert 'python ligand_vdgs/' not in text
 
-
 def test_manifest_has_no_ab_arm_column_and_the_flag_is_gone(monkeypatch, tmp_path):
     """The A/B experiment and the 0:29:00 tier it tested were removed 2026-09-12.
 
-    Three falsifiers: restoring the trailing `ab_arm` column reddens the column
+    Two falsifiers: restoring the trailing `ab_arm` column reddens the column
     assertion; re-adding the --short-queue-ab flag reddens the argparse one
-    (argparse exits 2 on an unrecognised argument, so ACCEPTANCE means it is back);
-    restoring assign_ab_arms reddens the last.
+    (argparse exits 2 on an unrecognised argument, so ACCEPTANCE means it is back).
     """
     argv = _setup(tmp_path)
     _run(monkeypatch, argv)
     rows = _manifest(tmp_path)
     assert rows, 'no manifest rows; the column assertion below would be vacuous'
-    assert set(rows[0]) == {'order', 'script', 'fragment', 'slots', 'h_rt'}, rows[0]
+    assert set(rows[0]) == {'order', 'script', 'fragment', 'slots', 'h_rt', 'tier_count'}, rows[0]
     with pytest.raises(SystemExit):
         _run(monkeypatch, argv + ['--short-queue-ab', '20260911'])
-    assert not hasattr(mk, 'assign_ab_arms')

@@ -65,6 +65,43 @@ def _masked_min_rmsd(data, ia, ib, elem_mask, full_perms, n_total,
    best = np.minimum.reduceat(ssd, starts) if ssd.size else ssd
    return np.sqrt(best / n_total)
 
+def _masked_within_rmsd(data, ia, ib, elem_mask, full_perms, n_total, threshold,
+                        batch_rows=_GRAPH_BATCH_ROWS):
+   """Threshold exact fits, skipping other symmetries after an identity match."""
+   full_perms = np.asarray(full_perms, dtype=np.intp)
+   identity = np.arange(n_total, dtype=np.intp)
+   identity_idx = next((i for i, perm in enumerate(full_perms)
+                        if np.array_equal(perm, identity)), None)
+   best = np.full(ia.size, np.inf, dtype=np.float64)
+   remaining = np.array(elem_mask, dtype=bool, copy=True)
+   evaluations = 0
+   if identity_idx is not None:
+      pairs = np.flatnonzero(remaining[:, identity_idx])
+      for start in range(0, pairs.size, batch_rows):
+         p = pairs[start:start + batch_rows]
+         best[p] = kabsch_ssd(data[ia[p]], data[ib[p]])
+      evaluations += pairs.size
+      remaining[:, identity_idx] = False
+      remaining[np.sqrt(best / n_total) <= threshold] = False
+
+   active = np.flatnonzero(remaining.any(axis=1))
+   if active.size:
+      submask = remaining[active]
+      pair_idx, perm_idx = np.nonzero(submask)
+      ssd = np.empty(pair_idx.size, dtype=np.float64)
+      for start in range(0, pair_idx.size, batch_rows):
+         stop = min(start + batch_rows, pair_idx.size)
+         p = pair_idx[start:stop]
+         A = data[ia[active[p]]]
+         X = np.take_along_axis(
+            A, full_perms[perm_idx[start:stop]][:, :, None], axis=1)
+         ssd[start:stop] = kabsch_ssd(X, data[ib[active[p]]])
+      starts = np.zeros(active.size, dtype=np.intp)
+      np.cumsum(submask.sum(axis=1)[:-1], out=starts[1:])
+      best[active] = np.minimum.reduceat(ssd, starts)
+      evaluations += pair_idx.size
+   return np.sqrt(best / n_total) <= threshold, int(evaluations)
+
 def assert_perm_group_closed(perm_group):
    """The pivot bound needs `perm_group` to be a group, not an arbitrary set.
 
@@ -176,10 +213,12 @@ def stage1_edges(data, threshold, n_cg, perm_group, row_range=None,
       qi = np.concatenate(pend_i)
       qj = np.concatenate(pend_j)
       mask = np.concatenate(pend_mask)
-      keep = _masked_min_rmsd(data, qi, qj, mask, full_perms, n_total) <= threshold
+      keep, evaluations = _masked_within_rmsd(
+         data, qi, qj, mask, full_perms, n_total, threshold)
       out_i.append(qi[keep].astype(np.int32))
       out_j.append(qj[keep].astype(np.int32))
       stats['edges'] += int(keep.sum())
+      stats['exact_rows'] += evaluations
       stats['exact_s'] += time.perf_counter() - t0
       pend_i.clear(); pend_j.clear(); pend_mask.clear()
       pend_rows = 0
@@ -226,7 +265,6 @@ def stage1_edges(data, threshold, n_cg, perm_group, row_range=None,
       if cand.size:
          stats['exact'] += cand.size
          rows = int(elem_ok.sum())
-         stats['exact_rows'] += rows
          pend_i.append(np.full(cand.size, i, dtype=np.intp))
          pend_j.append(cand)
          pend_mask.append(elem_ok)

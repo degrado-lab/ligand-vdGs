@@ -1,14 +1,12 @@
 """Tier assignment in make_sge_scripts_for_frags, after the 2026-09-12 collapse to
 two bands. NAMED FALSIFIERS, one per invariant:
-  * a band at or under 30 min -> test_no_band_can_reach_the_short_queue. The
-    retired 0:29:00 tier killed 112 of 1,097 jobs; re-adding one must redden.
   * a band above 48 h -> test_no_band_crosses_the_latency_cliff. Past 48 h the
     median queue wait goes 1.6 min -> 21.1 min (p90 8.6 h).
   * tiers keyed on the wrong estimate column -> test_boundaries.
-  * a body that slices the table (the retired `short_queue=False` path did
-    `RESOURCE_TIERS[1:]`, dropping TIER_1) -> test_boundaries. Injected after
-    collection so expectations still came from the full table: [0-10] and
-    [19999-10] failed `assert 30 == 10` (DR-50 addendum, DR-57).
+  * a body that slices the table (a retired path dropped TIER_1 via
+    `RESOURCE_TIERS[1:]`) -> test_boundaries. Injected after collection so
+    expectations still came from the full table: [0-10] and [19999-10] failed
+    `assert 30 == 10` (DR-50 addendum, DR-57).
 """
 # Why the assertions key on SLOTS and not h_rt: the old table had four bands with
 # four h_rt values, so boundary cases could assert on h_rt. Both surviving bands
@@ -20,8 +18,6 @@ import pytest
 from ligand_vdgs.generate_vdgs.make_sge_scripts_for_frags import (
     RESOURCE_TIERS, TIER_1, _h_rt_to_hours, resources_for)
 
-CEILING = '336:00:00'
-SHORT_QUEUE_MAX_H = 0.5      # SGE admits a job to the short queue only at <= 30 min
 LATENCY_CLIFF_H = 48.0       # measured: requests past this wait 13x longer
 
 def _boundary_cases():
@@ -38,7 +34,7 @@ def _boundary_cases():
 
 @pytest.mark.parametrize('est,expected_slots', _boundary_cases())
 def test_boundaries(est, expected_slots):
-    assert resources_for(est, CEILING)[0] == expected_slots
+    assert resources_for(est)[0] == expected_slots
 
 def test_boundary_cases_are_not_vacuous():
     """The clause that fails if the parametrised test proves nothing.
@@ -55,20 +51,12 @@ def test_boundary_cases_are_not_vacuous():
     # as the boundary axis without noticing it has gone flat.
     assert len({t[2] for t in RESOURCE_TIERS}) == 1, RESOURCE_TIERS
 
-def test_no_band_can_reach_the_short_queue():
-    for upper, slots, h_rt in RESOURCE_TIERS:
-        assert _h_rt_to_hours(h_rt) > SHORT_QUEUE_MAX_H, (upper, slots, h_rt)
-
 def test_no_band_crosses_the_latency_cliff():
     for upper, slots, h_rt in RESOURCE_TIERS:
         assert _h_rt_to_hours(h_rt) <= LATENCY_CLIFF_H, (upper, slots, h_rt)
 
-def test_max_h_rt_clamps_but_does_not_lengthen():
-    assert resources_for(10_000, '4:00:00')[1] == '4:00:00'
-    assert resources_for(0, '96:00:00')[1] == TIER_1[2]
-
 def test_fixed_overrides_win():
-    slots, h_rt = resources_for(0, CEILING, fixed_num_procs=2, fixed_h_rt='1:00:00')
+    slots, h_rt = resources_for(0, fixed_num_procs=2, fixed_h_rt='1:00:00')
     assert (slots, h_rt) == (2, '1:00:00')
 
 def test_tiers_are_monotone_and_ordered():

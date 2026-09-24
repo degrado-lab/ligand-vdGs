@@ -1,18 +1,14 @@
-"""Severe scheduler/roster gates from review_findings_20260912.md (A1, A2, B1).
+"""Severe scheduler/roster gates from review_findings_20260912.md (A1, B1).
 
 Each of these silently did nothing before the fix: A1 let a default full build mine the
-wrong parent database, A2 let --resume --clear-partial rm -rf a still-running job's
-output, B1 let the roster exit 0 after losing a large fraction of the census. Discriminating
-pairs throughout, per DR-52/gates.md: a broken artifact must be refused, a clean one must
-not be.
+wrong parent database, B1 let the roster exit 0 after losing a large fraction of the census.
+Discriminating pairs throughout, per DR-52/gates.md: a broken artifact must be refused, a
+clean one must not be.
 """
 import types
-import subprocess
 import pytest
 
-from ligand_vdgs.functions import utils
-from ligand_vdgs.generate_vdgs.make_sge_scripts_for_frags import (
-    check_frags_dict_identity, check_no_live_partial, active_sge_job_names)
+from ligand_vdgs.generate_vdgs.make_sge_scripts_for_frags import check_frags_dict_identity
 from ligand_vdgs.generate_vdgs.build_ligand_roster import check_loss_threshold
 
 # ---------------------------------------------------------------------------
@@ -26,7 +22,7 @@ def test_mismatched_pdb_dir_is_refused(tmp_path, monkeypatch):
     monkeypatch.setattr(
         'ligand_vdgs.generate_vdgs.make_sge_scripts_for_frags.identity_of',
         lambda pdb_dir: _identity('b' * 64))
-    with pytest.raises(SystemExit, match='different parent database'):
+    with pytest.raises(SystemExit, match='different --pdb-dir'):
         check_frags_dict_identity(
             {'db_identity': _identity('a' * 64)},
             types.SimpleNamespace(pdb_dir=str(tmp_path), frags_dict='dict.pkl'))
@@ -48,44 +44,6 @@ def test_dict_with_no_recorded_identity_is_refused(tmp_path, monkeypatch):
     with pytest.raises(SystemExit, match='records no parent-database identity'):
         check_frags_dict_identity(
             {}, types.SimpleNamespace(pdb_dir=str(tmp_path), frags_dict='dict.pkl'))
-
-# ---------------------------------------------------------------------------
-# A2 -- --clear-partial must refuse to delete a fragment whose job is still live.
-# ---------------------------------------------------------------------------
-
-def test_clear_partial_refuses_a_live_job():
-    with pytest.raises(SystemExit, match='running or queued'):
-        check_no_live_partial(
-            ['CC(=O)O'], {utils.smiles_to_job_name('CC(=O)O'), 'unrelated'})
-
-def test_clear_partial_allows_a_dead_job():
-    # Discriminating pair: same fragment, active set no longer contains its job name
-    # (the ordinary case -- the job actually died and left a partial directory).
-    check_no_live_partial(['CC(=O)O'], {'unrelated'})
-
-def test_clear_partial_allows_an_empty_queue():
-    check_no_live_partial(['CC(=O)O'], set())
-
-def test_active_sge_job_names_parses_qstat_xml(monkeypatch):
-    # Keep the parser contract deterministic. A live-cluster smoke test belongs in
-    # an explicitly scheduler-backed job, not in the default unit suite.
-    result = subprocess.CompletedProcess(
-        ['qstat', '-xml', '-u', 'skt'], 0,
-        stdout='<job_info><job_list><JB_name>frag_a</JB_name></job_list>'
-               '<job_list><JB_name>frag_b</JB_name></job_list></job_info>',
-        stderr='')
-    calls = []
-
-    def fake_run(args, **kwargs):
-        calls.append((args, kwargs))
-        return result
-
-    monkeypatch.setattr(
-        'ligand_vdgs.generate_vdgs.make_sge_scripts_for_frags.subprocess.run',
-        fake_run)
-    assert active_sge_job_names() == {'frag_a', 'frag_b'}
-    assert calls[0][0][:2] == ['qstat', '-xml']
-    assert calls[0][1]['check'] is True
 
 # ---------------------------------------------------------------------------
 # B1 -- the roster must refuse when it silently lost a large fraction of the census.

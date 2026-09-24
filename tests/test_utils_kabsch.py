@@ -174,6 +174,20 @@ class KabschSsdParityTests(unittest.TestCase):
             kabsch_ssd(X, Y, chunk_size=17), kabsch_ssd(X, Y),
             atol=1e-9, rtol=0.0)
 
+    def test_analytic_singular_values_match_lapack(self):
+        """Falsifier: wrong eigenvalue ordering changes the reflection correction."""
+        from ligand_vdgs.functions.utils import _singular_values_3x3
+        rng = np.random.default_rng(20260922)
+        random = rng.normal(size=(256, 3, 3))
+        rank_two = random[:32].copy()
+        rank_two[:, 2] = rank_two[:, 0] + rank_two[:, 1]
+        matrices = np.concatenate((random, rank_two, np.zeros((1, 3, 3))))
+        expected = np.linalg.svd(matrices, compute_uv=False)
+        actual = _singular_values_3x3(matrices)
+        np.testing.assert_allclose(actual, expected, atol=2e-8, rtol=1e-9)
+        self.assertTrue(np.any(expected[:, 2] > 0.1),
+                        'all smallest singular values vanished, so ordering was untested')
+
     def test_hand_rolled_determinant_matches_numpy(self):
         # Only its sign is used, but a wrong expansion would flip that sign.
         from ligand_vdgs.functions.utils import _det3

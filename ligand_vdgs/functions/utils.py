@@ -564,6 +564,35 @@ def _det3(H):
     g, h, i = H[..., 2, 0], H[..., 2, 1], H[..., 2, 2]
     return a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
 
+def _singular_values_3x3(H):
+    """Singular values of batched 3x3 matrices without per-matrix LAPACK calls."""
+    A = np.matmul(np.transpose(H, (0, 2, 1)), H)
+    q = (A[:, 0, 0] + A[:, 1, 1] + A[:, 2, 2]) / 3.0
+    A[:, 0, 0] -= q
+    A[:, 1, 1] -= q
+    A[:, 2, 2] -= q
+    p = np.sqrt(np.maximum(np.einsum('nij,nij->n', A, A) / 6.0, 0.0))
+    A /= np.maximum(p, np.finfo(H.dtype).tiny)[:, None, None]
+    phi = np.arccos(np.clip(_det3(A) * 0.5, -1.0, 1.0)) / 3.0
+    eig1 = q + 2.0 * p * np.cos(phi)
+    cross01 = np.cross(H[:, 0], H[:, 1])
+    cross02 = np.cross(H[:, 0], H[:, 2])
+    cross12 = np.cross(H[:, 1], H[:, 2])
+    eig23_sum = (np.einsum('ni,ni->n', cross01, cross01)
+                 + np.einsum('ni,ni->n', cross02, cross02)
+                 + np.einsum('ni,ni->n', cross12, cross12))
+    eig1 = np.maximum(eig1, 0.0)
+    eig23_product = _det3(H) ** 2 / np.maximum(eig1, np.finfo(H.dtype).tiny)
+    eig23_sum = np.maximum((eig23_sum - eig23_product)
+                           / np.maximum(eig1, np.finfo(H.dtype).tiny), 0.0)
+    disc = np.sqrt(np.maximum(eig23_sum ** 2 - 4.0 * eig23_product, 0.0))
+    eig2 = 0.5 * (eig23_sum + disc)
+    eig3 = eig23_product / np.maximum(eig2, np.finfo(H.dtype).tiny)
+    s1 = np.sqrt(eig1)
+    s2 = np.sqrt(eig2)
+    s3 = np.minimum(np.sqrt(eig3), s2)
+    return np.stack((s1, s2, s3), axis=1)
+
 def kabsch_ssd(X, Y, chunk_size=30000):
     X = np.asarray(X, dtype=np.float32)
     Y = np.asarray(Y, dtype=np.float32)
@@ -610,7 +639,7 @@ def kabsch_ssd(X, Y, chunk_size=30000):
             H = np.matmul(np.transpose(Xc_b, (0, 2, 1)), Yc)
             xn = np.add.reduce(np.add.reduce(Xc_b * Xc_b, axis=2), axis=1)
 
-        sv = np.linalg.svd(H, compute_uv=False)
+        sv = _singular_values_3x3(H)
         d = np.where(_det3(H) < 0.0, -1.0, 1.0)
         y_norm = np.add.reduce(np.add.reduce(Yc * Yc, axis=2), axis=1)
         trace = sv[:, 0] + sv[:, 1] + d * sv[:, 2]

@@ -30,8 +30,7 @@ def _build(tmp_path, jobs):
     lib, logs, sge = (tmp_path / n for n in ('lib', 'logs', 'sge'))
     for d in (lib, logs, sge):
         d.mkdir(parents=True, exist_ok=True)
-    lines = ['# short_queue_ab_seed\t7', '# short_arm_h_rt\t0:29:00',
-             '# long_arm_h_rt\t6:00:00',
+    lines = ['# short_arm_h_rt\t0:29:00', '# long_arm_h_rt\t6:00:00',
              'order\tscript\tfragment\tslots\th_rt\tab_arm']
     for order, (frag, arm, h_rt, completed, log_text) in enumerate(jobs):
         label = utils.smiles_to_filename(frag)

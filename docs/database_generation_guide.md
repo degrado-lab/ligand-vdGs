@@ -17,7 +17,8 @@ Installs the repo (`pip install -e .`). Requires OpenBabel Python bindings
 
 Layout: `<pdb-dir>/<lowercase inner two chars>/XXXX.pdb` (biounits `XXXX_1.pdb` also read).
 `scripts/format_parent_database.py` copies/validates standard filenames; biounit mirrors are
-laid out by hand.
+laid out by hand. Generation discovers structures through `functions.parent_db`; preserve the
+inner-two-character directory layout and filename stems.
 
 **Optional trim/repair:** `preprocessing/s01_trim_database.py` (module-level settings, no CLI)
 deduplicates structures and extracts 20 Å binding sites. Use `skip_to_output_pdbs = False` on a
@@ -40,8 +41,11 @@ output is the `--pdb-dir` used below.
 
 ## 2. Build the fragment dictionary
 
-Both passes read the parent PDB database (support = distinct parent biounits; a SMILES-only
-ligand can't qualify).
+The roster pass reads the parent PDB database. It records CCD-templated ligand types and the
+canonical heavy-atom names observed in each biounit; OpenBabel-fallback and unreadable ligand
+instances do not enter the roster. NCS copies count once per biounit. The fragment pass reads
+that roster and the CCD templates, enumerates connected induced fragments, then counts support
+as distinct biounits with every fragment atom observed. A SMILES-only ligand cannot qualify.
 
 ```bash
 python ligand_vdgs/generate_vdgs/build_ligand_roster.py \
@@ -50,20 +54,20 @@ python ligand_vdgs/generate_vdgs/fragment_database_ligs.py \
   --roster resources/ligand_roster.pkl --outdir <output-dir> --num-procs 8
 ```
 
-Enumerates connected induced subgraphs (4–5 heavy atoms default), writes
-`<output-dir>/database_frags_dict.pkl`, excludes ligands without a CCD template (after OpenBabel
-fallback perception), and uses CCD chemistry throughout. No `--ccd`/`--bond-radius` mode — a
-non-CCD ligand needs a CCD-style template with the exact PDB residue name, then a rebuilt
-roster/dict.
+- Enumerates connected induced subgraphs (4–5 heavy atoms by default) and writes
+  `<output-dir>/database_frags_dict.pkl`.
+- Chemistry comes from CCD templates. To add a non-CCD ligand, add a CCD-style template under
+  the exact PDB residue name, then rebuild the roster and dictionary.
 
 ## 3. Select and generate vdGs
 
 A fragment qualifies if it passes `Frags.is_organic`, has no `UNDESIRED_ELEMENTS` (metals,
 lanthanides, noble gases, Si/Se/As/Te; boron allowed), ≤5 heavy atoms, is not a halogen
 oxyanion, and has support ≥ `--min-support` (distinct parent biounit stems, pooled across
-protonation variants, computed over the full dictionary). `--min-support` has no default and
-replaces `--min-instances`; lower thresholds via `--include-only`, raising one requires a
-rebuild.
+protonation variants, computed over the full dictionary).
+`include-only` does not lower a threshold: it builds only explicitly named fragments 
+regardless of support. Raising the threshold changes the selected vocabulary and requires 
+a fresh library build.
 
 ```bash
 python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py \
@@ -86,58 +90,60 @@ python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py \
 Outputs cluster under `nr_vdgs/<subset-size>/<pos|neut|neg|unreadable>/`. No overwrite/resume
 flag.
 
-**Geometry/symmetry:** Stage 1 does deterministic sphere-exclusion (Butina/GROMOS) clustering on
-CG atoms plus each vdM's N/CA/C; stage 2 subdivides by flanking sequence and CA similarity. Pose
-distance minimizes over the CG automorphism group and interchangeable same-label vdM slots
-(stored atom order is not authoritative). Fragment-generation symmetry intentionally differs
-from hit-finder `CalcRMS` symmetry. Each SMARTS bond must satisfy the Cordero envelope
-`0.70 <= d/(r_cov,i+r_cov,j) <= 1.25` or that row is rejected (`stream_skipped_cg_bond_geometry`;
-calibrated per-element bounds are deferred). Automorphism normalization: terminal N/O/S atoms on
-one B/C/N/O/P/S/Cl/Br/I center may exchange within element (not substituted/bridging/aromatic
-atoms; ≥4 terminal atoms with mixed charges keep charge distinctions) — recorded in
-`cg_symmetry.npz`, never hand-derived. Environments are reconstructed once per fragment for all
-requested subset sizes.
+**Geometry and symmetry:**
+
+- Stage 1 uses deterministic sphere-exclusion (Butina/GROMOS) clustering on CG atoms and each
+  vdM's N/CA/C. Stage 2 subdivides by flanking sequence and CA similarity.
+- Pose distance minimizes over the CG automorphism group and interchangeable same-label vdM
+  slots. Stored atom order is not authoritative.
+- Fragment-generation symmetry differs from hit-finder `CalcRMS` symmetry.
+- Each SMARTS bond must satisfy the Cordero envelope
+  `0.70 <= d/(r_cov,i+r_cov,j) <= 1.25`; otherwise the row is rejected
+  (`stream_skipped_cg_bond_geometry`). Per-element calibration is deferred.
+- `cg_symmetry.npz` records automorphism normalization. Terminal N/O/S atoms on one
+  B/C/N/O/P/S/Cl/Br/I center may exchange within element, except substituted, bridging, or
+  aromatic atoms. With four or more terminal atoms, mixed charges retain their distinctions.
+- Environments are reconstructed once per fragment for all requested subset sizes.
 
 ### SGE (Wynton)
 
 ```bash
 python ligand_vdgs/generate_vdgs/make_sge_scripts_for_frags.py \
-  --max-h-rt <HH:MM:SS> --vdg-lib-dir <library> --pdb-dir <pdb-dir> \
+  --vdg-lib-dir <library> --pdb-dir <pdb-dir> \
   --log-dir <logs> --sge-out-dir <empty-script-dir> \
-  --frags-dict resources/database_frags_dict.pkl
-for script in <empty-script-dir>/*.sh; do qsub "$script"; done
+  --frags-dict resources/database_frags_dict.pkl --min-support <n>
+python ligand_vdgs/generate_vdgs/submit_frag_jobs_by_size.py <empty-script-dir>
 ```
 
-`--max-h-rt` is required; cost (from `--pdb-dir` or `--frag-cost-estimate`) only sizes jobs.
-Fragment prep is memoized under `$VDG_SCRATCH/prepared_fragments/`; submission order is
-descending `-pe smp` slot count.
+Cost is estimated inline by sampling `--pdb-dir` (`--sample-size`/`--estimate-procs` control the
+sample) and sizes jobs into tiers; `--h-rt`/`--num-procs` fix a single value for every fragment
+instead. Fragment prep is memoized under `$VDG_SCRATCH/prepared_fragments/`; the generated
+`submission_order.tsv` controls submission, descending by slots and then estimated tier count.
 
 ```bash
 MIN_SUPPORT=<n> ./run_production_frags.sh --mode threshold-plus-include --no-submit
-MIN_SUPPORT=<n> MAX_H_RT=36:00:00 ./run_production_frags.sh --mode threshold-plus-include
+MIN_SUPPORT=<n> ./run_production_frags.sh --mode threshold-plus-include
 ```
 
-`threshold-plus-include` requires an empty library and builds the threshold set plus INCLUDE;
-`include-only` requires an existing library and builds only INCLUDE. `--no-submit` still updates
-aliases. Requires `resources/frag_cost_estimate.tsv`, regenerated after the dictionary changes:
+`threshold-plus-include` requires no existing fragment directories and builds the threshold set
+plus INCLUDE. `include-only` requires an existing library and builds only explicitly named
+INCLUDE fragments, without applying the threshold. `--no-submit` generates scripts and still
+updates `fragment_aliases.tsv`; it does not submit jobs. Job tiers use SMARTS passes over
+`--pdb-dir`. Force a wanted fragment with INCLUDE/`--include`.
 
-```bash
-python ligand_vdgs/generate_vdgs/estimate_frag_cost.py \
-  --pdb-dir <pdb-dir> --output resources/frag_cost_estimate.tsv
-```
-
-Estimates are SMARTS passes over `--pdb-dir`, not CCD counts. Force a wanted low-count fragment
-with INCLUDE/`--include`.
-
-If an SGE job was killed mid-fragment, rerun script generation with `--resume --clear-partial`
-and the same inputs: `--resume` skips completed fragments, `--clear-partial` removes unfinished
-directories after checking `qstat` (otherwise remove the partial directory by hand first).
+For direct script generation, `--resume` requires matching library provenance and skips
+fragments whose completion marker is present. It rewrites scripts for unfinished fragments, but
+does not clean partial output directories; remove a leftover non-empty fragment directory before
+resubmitting it because the wrapper refuses that output path. The production shell wrapper
+rebuilds its script directory each run, and top-up mode filters completed fragments and reports
+partial directories before submission.
 
 ### SLURM or another scheduler
 
 ```bash
 python ligand_vdgs/generate_vdgs/extract_fragment_smiles.py \
-  --frags-dict resources/database_frags_dict.pkl --output <fragment-work-list.txt>
+  --frags-dict resources/database_frags_dict.pkl --min-support <n> \
+  --output <fragment-work-list.txt>
 ```
 
 Pass `--vdg-lib-dir` so aliases land at `<vdg-lib-dir>/fragment_aliases.tsv` (otherwise a
@@ -160,16 +166,16 @@ done < fragment-work-list.txt
 <library>/<cg_label>/nr_vdgs/{1,2}/{pos,neut,neg,unreadable}/<aa_bucket>.npz
 ```
 
-Buckets hold disjoint `nr_*` rows (coordinate-bearing cluster representatives) and `mem_*` rows
-(identity only, linked by `mem_cluster_id`): observations = nr+mem, clusters = nr.
-`cluster_size` is raw observations; `cluster_num_parents` is distinct PDB
-entries/depositions (not support or cluster size); selection support is distinct biounit stems.
-`aa_bucket_parts` is the only slot-permutability source; `bb` is a backbone role, `X` is
-noncanonical. Parent records store a biounit stem and `parent_pdb_dir` — use
-`vdg_npz_utils.resolve_parent_pdb_path` for a copied library and
-`vdg_npz_utils.rederive_member_coords` for member coordinates. H-class fields use negative values
-for unreadable atoms (zero is a real count). Carbonyl-O coordinates are separate and excluded
-from RMSD.
+- `nr_*` rows are coordinate-bearing cluster representatives; `mem_*` rows are identity-only
+  members linked by `mem_cluster_id`. Observations are `nr+mem`; clusters are `nr`.
+- `cluster_size` counts observations. `cluster_num_parents` counts distinct PDB
+  entries/depositions, not support or cluster size. Selection support counts distinct biounit
+  stems.
+- Parent records store a biounit stem and `parent_pdb_dir`. For copied libraries, use
+  `vdg_npz_utils.resolve_parent_pdb_path`; use `vdg_npz_utils.rederive_member_coords` for member
+  coordinates.
+- H-class fields use negative values for unreadable atoms; zero is a real count. Carbonyl-O
+  coordinates are separate and excluded from RMSD.
 
 After the fleet drains:
 

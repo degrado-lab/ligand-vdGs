@@ -22,7 +22,6 @@
 # Usage:
 #   ./run_production_frags.sh --mode threshold-plus-include --no-submit
 #   ./run_production_frags.sh --mode threshold-plus-include
-#   MAX_H_RT=24:00:00 ./run_production_frags.sh --mode threshold-plus-include
 #
 #   # main build, plus fragments you need whatever the sampling estimate said
 #   INCLUDE='cnnnn' ./run_production_frags.sh --mode threshold-plus-include
@@ -35,12 +34,8 @@ set -euo pipefail
 PDB_DIR="${PDB_DIR:-/wynton/group/degradolab/skt/docking/databases/prepwizard_BioLiP2_repaired/}"
 VDG_LIB_DIR="${VDG_LIB_DIR:-/wynton/home/degradolab/skt/docking/frag_lib}"
 LOG_DIR="${LOG_DIR:-/wynton/home/degradolab/skt/docking/frag_sge_logs}"
-ESTIMATE="${ESTIMATE:-resources/frag_cost_estimate.tsv}"
 
-MAX_H_RT="${MAX_H_RT:-36:00:00}"
 MIN_SUPPORT="${MIN_SUPPORT:-}"
-MEM_FREE="${MEM_FREE:-4G}"
-SCRATCH="${SCRATCH:-20G}"
 
 # Fragments to build regardless of their estimated count, space-separated.
 INCLUDE="${INCLUDE:-}"
@@ -115,13 +110,12 @@ else
         exit 1
     fi
 fi
-[ -f "$ESTIMATE" ] || { echo "ERROR: missing $ESTIMATE (run estimate_frag_cost.py)." >&2; exit 1; }
 # Refuse rather than substitute a number. --include-only skips the threshold pass
 # entirely, so it legitimately needs none.
 if [ "$TOP_UP" -eq 0 ] && [ -z "$MIN_SUPPORT" ]; then
     echo "ERROR: MIN_SUPPORT is unset and has no default." >&2
     echo "  It is the minimum number of distinct parent biounits a fragment must" >&2
-    echo "  appear in, with every atom observed, to be built (DR-5). It decides the" >&2
+    echo "  appear in, with every atom observed, to be built. It decides the" >&2
     echo "  library's permanent vocabulary, so it must come from the frontier table," >&2
     echo "  not from a previous run: the flag it replaced counted CG occurrences, a" >&2
     echo "  different unit that does not convert." >&2
@@ -134,8 +128,7 @@ mkdir -p "$LOG_DIR"
 # --- generate --------------------------------------------------------------
 # Regenerated from scratch every run: the generator refuses a non-empty output
 # directory, and the scripts are derived output (gitignored, reproducible from
-# the dict + estimate + flags). Reusing them would silently keep a stale
-# MAX_H_RT, which is the one value most likely to change between runs.
+# the dict + estimate + flags).
 rm -rf "$SCRIPT_DIR"
 
 # --min-support is required=True in the generator, but --include-only skips the
@@ -155,49 +148,22 @@ if [ -n "$INCLUDE" ]; then
     [ "$TOP_UP" -eq 1 ] && INCLUDE_ARGS+=(--include-only)
 fi
 
-# --frag-cost-estimate rather than the inline default so the submission order
-# below is derived from exactly the counts the tiers were assigned from.
 python ligand_vdgs/generate_vdgs/make_sge_scripts_for_frags.py \
     --frags-dict resources/database_frags_dict.pkl \
-    --frag-cost-estimate "$ESTIMATE" \
     --min-support "$MIN_SUPPORT_ARG" \
     ${INCLUDE_ARGS[@]+"${INCLUDE_ARGS[@]}"} \
     --pdb-dir "$PDB_DIR" \
     --vdg-lib-dir "$VDG_LIB_DIR" \
     --log-dir "$LOG_DIR" \
     --sge-out-dir "$SCRIPT_DIR" \
-    --max-h-rt "$MAX_H_RT" \
-    --mem-free "$MEM_FREE" \
-    --scratch "$SCRATCH" \
     --subset-sizes 1 2
 
 # --- order -----------------------------------------------------------------
-# Descending -pe smp slot count, ties in path order. Slots, not estimated
-# runtime, set the queue wait: the scheduler takes far longer to assemble a
-# 20-core reservation than a 10-core one, so the widest jobs have to go in first
-# or they sit behind a wall of narrow ones. A long 10-core job still starts
-# sooner than a short 20-core one, which is why runtime is not a tiebreaker.
-# The count is read back out of the rendered script rather than re-derived from
-# $ESTIMATE, so the order is exactly what was requested; a script with no -pe
-# line is a generator bug and stops the run.
+# The generator's manifest is authoritative: slots descending, then estimated
+# tier count descending. The submitter checks each script's actual slot request.
 ORDER_FILE=$(mktemp)
 trap 'rm -f "$ORDER_FILE"' EXIT
-python - "$SCRIPT_DIR" > "$ORDER_FILE" <<'PY'
-import os, re, sys
-script_dir, = sys.argv[1:]
-slots_re = re.compile(r'^#\$\s*-pe\s+smp\s+(\d+)', re.MULTILINE)
-rows = []
-for name in sorted(os.listdir(script_dir)):
-    if not name.endswith('.sh'):
-        continue
-    path = os.path.join(script_dir, name)
-    match = slots_re.search(open(path).read())
-    if not match:
-        sys.exit(f'[ERROR] no "#$ -pe smp N" line in {path}')
-    rows.append((-int(match.group(1)), path))
-for neg_slots, path in sorted(rows):
-    print(f'{-neg_slots}\t{path}')
-PY
+python ligand_vdgs/generate_vdgs/submit_frag_jobs_by_size.py "$SCRIPT_DIR" --print-order > "$ORDER_FILE"
 
 # In include-only mode, refuse fragments the library already holds. Nothing
 # downstream checks this before submission: the job would qsub cleanly, sit in
@@ -242,8 +208,7 @@ fi
 
 TOTAL=$(wc -l < "$ORDER_FILE")
 echo
-echo "Submission order: $TOTAL job(s), most -pe smp slots first."
-echo "h_rt ceiling: $MAX_H_RT."
+echo "Submission order: $TOTAL job(s), manifest order (num slots then estimated cost)."
 echo
 
 if [ "$NO_SUBMIT" -eq 1 ]; then
