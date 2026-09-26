@@ -16,7 +16,7 @@ import sys
 
 import pytest
 
-from ligand_vdgs.functions import Frags, utils
+from ligand_vdgs.functions import ligand_structure, utils
 from ligand_vdgs.functions.db_identity import identity_of
 from ligand_vdgs.generate_vdgs import make_sge_scripts_for_frags as mk
 
@@ -48,7 +48,7 @@ def _setup(tmp_path, support=500, shipped_template=False):
 
     dict_path = tmp_path / 'frags.pkl'
     with open(dict_path, 'wb') as handle:
-        pickle.dump({'key_schema': Frags.KEY_SCHEMA,
+        pickle.dump({'key_schema': ligand_structure.KEY_SCHEMA,
                      'frags': {'CCOO': {ACID: ['LIG']},
                                'CCCCN': {PYRIDINE: ['PYR']},
                                'CO': {ETHER: ['MET']}},
@@ -205,7 +205,7 @@ def test_resume_does_not_rewrite_the_original_provenance(monkeypatch, tmp_path):
     assert json.loads(prov.read_text()) == original
 
 def test_tiers_key_on_occurrences_not_structures(monkeypatch, tmp_path):
-    # DR-7. Every fragment shares one structure count (STRUCTURES, faked constant
+    # Every fragment shares one structure count (STRUCTURES, faked constant
     # and discarded by main()), so the tiers can only come apart if the OCCURRENCE
     # return value is what keys them.
     cheap, dear = mk.TIER_1[0] // 4, mk.RESOURCE_TIERS[-2][0] * 10
@@ -238,7 +238,7 @@ def test_manifest_orders_widest_jobs_first(monkeypatch, tmp_path):
     assert [int(row['order']) for row in rows] == list(range(len(rows)))
 
 def test_resume_refuses_a_changed_max_size(monkeypatch, tmp_path):
-    # The silent-mix case DR-6 makes fatal: a resume at a different --max-size
+    # The silent-mix case that must be fatal: a resume at a different --max-size
     # would emit jobs mining a second vocabulary into the existing library, and
     # because a resume deliberately does not rewrite the provenance record,
     # nothing afterwards would show it.
@@ -327,7 +327,7 @@ def test_a_library_in_the_same_vocabulary_is_accepted(monkeypatch, tmp_path):
     argv = _setup(tmp_path)
     _run(monkeypatch, argv)
     prov = json.loads((tmp_path / 'lib' / 'library_provenance.json').read_text())
-    assert prov['key_schema'] == Frags.KEY_SCHEMA, prov
+    assert prov['key_schema'] == ligand_structure.KEY_SCHEMA, prov
     for name in _scripts(tmp_path):
         os.remove(tmp_path / 'sge' / name)
     _finish(tmp_path, ACID)

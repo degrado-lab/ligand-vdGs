@@ -1,4 +1,4 @@
-"""DR-61 fallout in hit_finder_core.py: load_vdg_bucket is now per charge-sign
+"""Charge-sign partitioning in hit_finder_core.py: load_vdg_bucket is now per charge-sign
 partition (no all-signs mode), and _combo_worker's task-level exception
 handling must still abort score_one_model's nprocs>1 path on a real failure
 (e.g. BucketSchemaMismatch) instead of silently degrading to a clean-looking
@@ -12,8 +12,8 @@ import numpy as np
 
 from ligand_vdgs.functions import clus_helpers, vdg_npz_utils
 from ligand_vdgs.generate_vdgs import clus_and_deduplicate_vdgs as clus
-from ligand_vdgs.score_poses.hit_finder_core import (
-    _load_vdg_bucket_all_signs, _raise_if_combo_task_errors)
+from ligand_vdgs.functions.vdg_npz_utils import load_vdg_bucket_all_signs
+from ligand_vdgs.score_poses.hit_finder_core import _raise_if_combo_task_errors
 
 from tests.test_bucket_schema_pass import _record
 
@@ -34,7 +34,7 @@ class LoadAllSignsMerges(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             _write(tmp, [_record()], sign="neg")
             _write(tmp, [_record(), _record()], sign="pos")
-            bucket = _load_vdg_bucket_all_signs(tmp, "", 2, "GLY_ALA")
+            bucket = load_vdg_bucket_all_signs(tmp, "", 2, "GLY_ALA")
             self.assertEqual(bucket["cg"].shape[0], 3)
             self.assertEqual(bucket["cluster_id"].shape[0], 3)
             self.assertEqual(bucket["aa_bucket_parts"], ["GLY", "ALA"])
@@ -48,21 +48,42 @@ class LoadAllSignsMerges(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             _write(tmp, [_record(), _record()], sign="neg")
             self.assertEqual(
-                _load_vdg_bucket_all_signs(tmp, "", 2, "GLY_ALA")["cg"].shape[0], 2)
+                load_vdg_bucket_all_signs(tmp, "", 2, "GLY_ALA")["cg"].shape[0], 2)
 
     def test_no_sign_present_returns_none(self):
         with tempfile.TemporaryDirectory() as tmp:
-            self.assertIsNone(_load_vdg_bucket_all_signs(tmp, "", 2, "GLY_ALA"))
+            self.assertIsNone(load_vdg_bucket_all_signs(tmp, "", 2, "GLY_ALA"))
+
+    def test_fields_subset_and_per_row_cg_elements(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _write(tmp, [_record()], sign="neg")
+            _write(tmp, [_record(), _record()], sign="pos")
+            full = load_vdg_bucket_all_signs(tmp, "", 2, "GLY_ALA")
+            self.assertEqual(full["cg_elements"].shape, full["cg"].shape[:2])
+            self.assertEqual(set(load_vdg_bucket_all_signs(tmp, "", 2, "GLY_ALA", fields=("cg",))),
+                             {"cg", "aa_bucket_parts", "charge_signs", "partition_indices"})
+
+class IterBucketFiles(unittest.TestCase):
+    def test_yields_every_sign_file_only_for_a_completed_job(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _write(tmp, [_record()], sign="neg")
+            _write(tmp, [_record()], sign="pos")
+            self.assertEqual(list(vdg_npz_utils.iter_bucket_files(tmp, "")), [], "incomplete job must be skipped")
+            with open(os.path.join(tmp, "_log"), "w") as f:
+                f.write("Job completed.\n")
+            got = [(k, sign, b, os.path.exists(p)) for k, sign, b, p in vdg_npz_utils.iter_bucket_files(tmp, "")]
+            self.assertEqual(got, [(2, "pos", "GLY_ALA", True), (2, "neg", "GLY_ALA", True)])
+            self.assertEqual(list(vdg_npz_utils.iter_bucket_files(tmp, "", subset=1)), [])
 
     def test_legacy_v2_bucket_raises_loud_not_swallowed_to_none(self):
-        # A pre-DR-61 flat bucket (no <sign>/ level) must still refuse loud
+        # A flat schema-v2 bucket (no <sign>/ level) must still refuse loud
         # through this merge helper -- silently returning None here would
         # read as "zero matches" for every fragment in a v2 library.
         with tempfile.TemporaryDirectory() as tmp:
             os.makedirs(os.path.join(tmp, "nr_vdgs", "2"))
             open(os.path.join(tmp, "nr_vdgs", "2", "GLY_ALA.npz"), "w").close()
             with self.assertRaises(vdg_npz_utils.BucketSchemaMismatch):
-                _load_vdg_bucket_all_signs(tmp, "", 2, "GLY_ALA")
+                load_vdg_bucket_all_signs(tmp, "", 2, "GLY_ALA")
 
 class ComboTaskErrorsAbort(unittest.TestCase):
     def test_no_errors_is_a_no_op(self):

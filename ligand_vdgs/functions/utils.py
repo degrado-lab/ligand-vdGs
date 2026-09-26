@@ -593,7 +593,10 @@ def _singular_values_3x3(H):
     s3 = np.minimum(np.sqrt(eig3), s2)
     return np.stack((s1, s2, s3), axis=1)
 
-def kabsch_ssd(X, Y, chunk_size=30000):
+def kabsch_ssd(X, Y, chunk_size=30000, mask=None):
+    """Post-superposition SSD per structure. With a boolean `mask` of shape (M, n), X must be
+    (M, n, 3) and each row is fit over its masked-in points only; masked-out coordinates may
+    be non-finite and are ignored."""
     X = np.asarray(X, dtype=np.float32)
     Y = np.asarray(Y, dtype=np.float32)
 
@@ -608,6 +611,8 @@ def kabsch_ssd(X, Y, chunk_size=30000):
     if X.ndim == 3 and X.shape[0] != Y.shape[0]:
         raise ValueError(
             f"kabsch_ssd: batch mismatch, X has {X.shape[0]} structures, Y has {Y.shape[0]}")
+    if mask is not None:
+        return _masked_kabsch_ssd(X, Y, np.asarray(mask, dtype=bool), chunk_size)
     if not np.isfinite(X).all() or not np.isfinite(Y).all():
         raise ValueError(
             "Non-finite values detected in kabsch_ssd input. "
@@ -639,13 +644,39 @@ def kabsch_ssd(X, Y, chunk_size=30000):
             H = np.matmul(np.transpose(Xc_b, (0, 2, 1)), Yc)
             xn = np.add.reduce(np.add.reduce(Xc_b * Xc_b, axis=2), axis=1)
 
-        sv = _singular_values_3x3(H)
-        d = np.where(_det3(H) < 0.0, -1.0, 1.0)
-        y_norm = np.add.reduce(np.add.reduce(Yc * Yc, axis=2), axis=1)
-        trace = sv[:, 0] + sv[:, 1] + d * sv[:, 2]
-        chunks.append(np.maximum(xn + y_norm - 2.0 * trace, 0.0))
+        chunks.append(_centered_kabsch_ssd(H, xn, Yc))
 
     return np.concatenate(chunks, axis=0) if len(chunks) > 1 else chunks[0]
+
+_ANALYTIC_SV_MIN_BATCH = 200   # below this, the analytic path's ~0.3 ms fixed overhead loses to LAPACK
+
+def _centered_kabsch_ssd(H, xn, Yc):
+    """SSD = |Xc|^2 + |Yc|^2 - 2(s1 + s2 + sign(det H) s3) for centered inputs."""
+    sv = (_singular_values_3x3(H) if len(H) >= _ANALYTIC_SV_MIN_BATCH
+          else np.linalg.svd(H, compute_uv=False))
+    return np.maximum(xn + np.add.reduce(np.add.reduce(Yc * Yc, axis=2), axis=1) - 2.0
+                      * (sv[:, 0] + sv[:, 1] + np.where(_det3(H) < 0.0, -1.0, 1.0) * sv[:, 2]),
+                      0.0)
+
+def _masked_kabsch_ssd(X, Y, mask, chunk_size):
+    """Rows fit over masked-in points only; centroids use the per-row masked-in count."""
+    if X.ndim != 3 or mask.shape != Y.shape[:2]:
+        raise ValueError(
+            f"kabsch_ssd: mask needs X of shape (M, n, 3) and mask of shape (M, n); got "
+            f"X.shape={X.shape}, mask.shape={mask.shape}")
+    keep = mask[..., None]
+    if not (np.isfinite(X) | ~keep).all() or not (np.isfinite(Y) | ~keep).all():
+        raise ValueError("Non-finite values at masked-in kabsch_ssd points. "
+                         f"X.shape={X.shape}; Y.shape={Y.shape}")
+    inv_n = 1.0 / np.maximum(mask.sum(axis=1), 1)[:, None, None]
+    chunks = []
+    for start in range(0, Y.shape[0], chunk_size):
+        rows = slice(start, start + chunk_size)
+        Xc, Yc = [np.where(keep[rows], c - np.add.reduce(c, axis=1)[:, None, :] * inv_n[rows], 0.0)
+                  for c in (np.where(keep[rows], a[rows], 0.0).astype(np.float64) for a in (X, Y))]
+        chunks.append(_centered_kabsch_ssd(np.matmul(np.transpose(Xc, (0, 2, 1)), Yc),
+                                           np.add.reduce(np.add.reduce(Xc * Xc, axis=2), axis=1), Yc))
+    return np.concatenate(chunks) if chunks else np.empty((0,), dtype=np.float64)
 
 def kabsch(X, Y, chunk_size=30000):
     X = np.asarray(X, dtype=np.float32)

@@ -1,8 +1,8 @@
 """The undesired-element filter must parse atoms, never match strings.
 
 REMOVED BEHAVIOUR, recorded here because the removal is deliberate and is FORCED BY
-THE SUPPORT UNIT, not a convenience. Support is counted in distinct parent biounits
-(DR-5), so a ligand that exists only as a SMILES string has no biounit to count and
+THE SUPPORT UNIT, not a convenience. Support is counted in distinct parent biounits,
+so a ligand that exists only as a SMILES string has no biounit to count and
 can never clear any threshold; and an instance whose resname has no CCD template
 falls back to OpenBabel perception, which the roster excludes, so it contributes no
 support either. Neither can reach the vocabulary, so neither needs a SMILES path.

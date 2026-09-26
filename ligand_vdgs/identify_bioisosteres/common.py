@@ -13,7 +13,8 @@ import math
 import os
 import numpy as np
 
-from ligand_vdgs.functions.Frags import check_vdg_job_status
+from ligand_vdgs.functions import utils
+from ligand_vdgs.functions.ligand_structure import check_vdg_job_status
 from ligand_vdgs.functions.vdg_npz_utils import CHARGE_SIGNS
 from ligand_vdgs.functions.vdg_struct_utils import BB_LABEL, BB_LABELS, NONCANONICAL_AA_LABEL
 from ligand_vdgs.tools.reference_values import AA_background_freq, AA_sidechain_size, BB_HEAVY_ATOMS
@@ -186,3 +187,11 @@ def calc_aa_pair_propensities(nr_vdgs_dir, norm_method='bg_weighted', counts=Non
             propensities[bucket] = val
 
     return propensities
+
+def fragment_keys_nested(key_a, key_b):
+    '''True if one fragment key embeds in the other with identical per-atom
+    annotations, i.e. the two fragments share observations and their profiles are
+    correlated by construction. Equivalent keys count as nested.'''
+    small, big = sorted((utils.fragment_key_query_mol(key_a), utils.fragment_key_query_mol(key_b)),
+                        key=lambda m: m.GetNumAtoms())
+    return big.HasSubstructMatch(small)

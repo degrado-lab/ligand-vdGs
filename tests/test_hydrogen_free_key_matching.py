@@ -11,7 +11,7 @@ import tempfile
 import pytest
 from rdkit import Chem, RDLogger
 
-from ligand_vdgs.functions import Frags
+from ligand_vdgs.functions import ligand_structure
 from ligand_vdgs.generate_vdgs.estimate_frag_cost import add_vdg_miner_paths
 
 RDLogger.DisableLog('rdApp.*')
@@ -80,7 +80,7 @@ def test_hydrogens_are_what_break_it(protonated_pdb):
 
 
 def test_query_ligand_mol_is_h_free_and_reads_degrees(protonated_pdb):
-    mol = Frags.get_query_ligand_mol(protonated_pdb, 'CCO')
+    mol = ligand_structure.get_query_ligand_mol(protonated_pdb, 'CCO')
     assert mol is not None
     assert not [a for a in mol.GetAtoms() if a.GetAtomicNum() == 1]
     counts = {sm: len(mol.GetSubstructMatches(Chem.MolFromSmarts(sm)))

@@ -14,8 +14,8 @@ need re-measuring after a rebuild unless one starts looking wrong in practice.
 
 `hit_finder_core.BB_SLOT_SIDECHAIN_CLASH` (3.4 Å) and `PRO_NH_DONOR_CUTOFF`
 (3.5 Å) let a single `bb` bucket label stay safe without splitting by donor
-residue: at read time, the query residue's real sidechain/CD/backbone-N is
-checked against the CG directly (`backbone_slot_blockers`).
+residue: at read time, the query residue's virtual CB (none for Gly) and Pro backbone N are
+checked against the CG directly (`vcb_slot_blockers`); no side-chain coordinates are read.
 
 **Sidechain clash (stands in for a glycine-specific check).** Reconstructed CB
 position (standard virtual-CB from N/CA/C) to nearest CG atom, over all

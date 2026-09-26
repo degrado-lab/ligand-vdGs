@@ -8,33 +8,20 @@ import numpy as np
 _NAN3 = np.array([np.nan, np.nan, np.nan], dtype=np.float32)
 
 
-# ---------------------------------------------------------------------------
-# Occupancy protocol
-# ---------------------------------------------------------------------------
-#
-# The B-factor-free occupancy column encodes each atom's role in a vdG PDB, and
-# for CG atoms also its slot index (which fixes their order):
-#
-#   CG atom i          3.00 + 0.01 * i   (band closed at 100 slots; >= 4.0 reserved)
-#   vdM residue        2.0
-#   other ligand atom  1.0
-#
-# Readers use only the *order* of the CG occupancies and their distinctness,
-# never the value. The vdG-miner submodule is not
-# importable and carries its own copy of these numbers -- change both together.
+# Occupancy protocol: CG slot i = 3.00 + .01*i (100 slots); vdM = 2, other ligand = 1.
+# Keep in sync with the unimportable vdG-miner copy; readers rely on CG order/distinctness.
 CG_OCC_BASE = 3.0
 CG_OCC_STEP = 0.01
 CG_OCC_CAPACITY = 100  # slots per band: 3.00 .. 3.99
 VDM_OCC = 2.0
 NONCG_LIGAND_OCC = 1.0
-# Half a step outside the end slots, so float error in a written-then-parsed
-# occupancy cannot move slot 0 or the last slot out of the band.
+# Half-step margins tolerate PDB round trips without admitting adjacent bands.
 _CG_OCC_MIN = CG_OCC_BASE - CG_OCC_STEP / 2.0
 _CG_OCC_MAX = CG_OCC_BASE + (CG_OCC_CAPACITY - 0.5) * CG_OCC_STEP
 
 
 def cg_slot_occupancy(slot_index):
-    """Occupancy encoding CG slot ``slot_index``. Raises past the top of the band."""
+    """Encode a CG slot occupancy; reject indices outside the 100-slot band."""
     if not 0 <= slot_index < CG_OCC_CAPACITY:
         raise ValueError(
             f'CG slot {slot_index} is outside the occupancy band '
@@ -49,12 +36,7 @@ def select_cg_atoms(prody_obj):
 
 
 def sort_cg_atoms_by_slot(cg):
-    """CG atoms in slot order, or None if their occupancies do not encode one.
-
-    A shared slot is not a tie to break arbitrarily -- it means the encoding was
-    lost (duplicated slot upstream, or a PDB round-trip that rounded two slots
-    together). Rounding matches the PDB occupancy column's two decimals.
-    """
+    """Sort CG atoms by slot; duplicate two-decimal occupancies make order unknown."""
     atoms = sorted(cg, key=lambda a: a.getOccupancy())
     if len({round(float(a.getOccupancy()), 2) for a in atoms}) != len(atoms):
         return None
@@ -73,11 +55,7 @@ def get_res_iden(vdm_obj):
 
 
 def found_chain_break(flanking_seq_dict, chain_break_ind, label=None):
-    # Overwrite the flanking residue at chain_break_ind and every position beyond
-    # it (in that direction) with `label`: past a break these are not the vdM's
-    # sequence neighbours. chain_break_ind is +/-1..+/-(num_flanking+1); the
-    # outermost value overwrites nothing. 0 is never passed.
-    # Mutates and returns flanking_seq_dict.
+    # A break invalidates that flank and every farther position in its direction.
     if label is None:
         label = FLANK_CHAIN_BREAK
     if chain_break_ind == 0:
@@ -111,26 +89,12 @@ def is_valid_backbone_coords(coords):
 
 
 def build_flank_lookup_index(prody_obj):
-    """Precompute the residues ``get_AA_and_CA_coords`` can answer without a select().
-
-    Each ProDy selection costs ~250-300 us of fixed overhead, and the flank walk
-    makes three per flank residue (~8 ms per environment at ``--flank 2``).
-
-    Only residues with an unambiguous answer are indexed: all atoms flagged
-    protein, exactly one resname, exactly one atom named CA. Everything else --
-    non-protein, mixed resnames, no CA, altloc duplicates, unknown resindices
-    (incl. the negative ones the flank walk produces at chain edges) -- is absent,
-    so the caller falls through to the selection path with its warnings and altloc
-    handling. Returns None if the atomgroup cannot be indexed, which is also a 
-    fall-through.
-    """
+    """Index protein residues with one resname and one CA; omit ambiguous residues."""
     try:
         resindices = prody_obj.getResindices()
         resnames = prody_obj.getResnames()
         names = prody_obj.getNames()
         coords = prody_obj.getCoords()
-        # Resname-based, and verified to agree with `sel.protein is None` on
-        # MSE/SEP/TPO/UNK/HOH/nucleic as well as the standard 20.
         protein = prody_obj.getFlags('protein')
     except Exception:
         return None
@@ -138,8 +102,7 @@ def build_flank_lookup_index(prody_obj):
         return None
 
     is_ca = names == 'CA'
-    # Group by resindex through one sort rather than a per-residue mask over the
-    # whole atomgroup, which would be O(atoms x residues).
+    # One sort avoids scanning the full atomgroup once per residue.
     order = np.argsort(resindices, kind='stable')
     unique_resindices = np.unique(resindices)
     starts = np.searchsorted(resindices[order], unique_resindices, side='left')
@@ -150,7 +113,6 @@ def build_flank_lookup_index(prody_obj):
         rows = order[start:end]
         residue_resnames = set(resnames[rows])
         ca_rows = rows[is_ca[rows]]
-        # len(ca_rows) != 1: none, or altloc copies to resolve by occupancy.
         if not protein[rows].all() or len(residue_resnames) != 1 or len(ca_rows) != 1:
             continue
         index[int(resindex)] = (residue_resnames.pop(),
@@ -159,15 +121,7 @@ def build_flank_lookup_index(prody_obj):
 
 
 def get_AA_and_CA_coords(prody_obj, current_resindex, flank_index=None):
-    '''
-    Return (AA, CA_coords) for a residue index.
-    If the residue is missing, non-protein, ambiguous, or has no usable CA,
-    returns AA=FLANK_MISSING and CA_coords = [nan, nan, nan]. That marker is
-    deliberately not NONCANONICAL_AA_LABEL ('X').
-
-    ``flank_index`` is an optional build_flank_lookup_index() result; a miss in
-    it falls through to the selection path.
-    '''
+    """Return residue name and CA, or the unreadable-flank marker and NaNs."""
     unreadable = (FLANK_MISSING, _NAN3.copy())
     if flank_index is not None:
         hit = flank_index.get(int(current_resindex))
@@ -214,10 +168,7 @@ def get_bb_coords(obj):
 
 
 def get_bb_o_coords(obj):
-    """Backbone carbonyl O of one residue, float32 (3,), NaN-filled when absent.
-
-    Not a Stage-1 atom: it is stored beside N/CA/C (``nr_vdm_o_coords``) so
-    contact statistics can see the acceptor, and never enters an RMSD."""
+    """Return a residue's carbonyl O, or float32 NaNs when absent."""
     try:
         atom_obj = obj.select('name O')
         if atom_obj is None or len(atom_obj) == 0:
@@ -229,13 +180,7 @@ def get_bb_o_coords(obj):
 
 
 def get_cg_atoms(prody_obj, pdbpath):
-    """Ordered CG atoms of one vdG.
-
-    Returns ``(coords, names, elements, seg, chain, resnum, resname)``. The last
-    four are *scalars*: a CG is a substructure of a single ligand residue, so a
-    CG whose atoms disagree is an upstream bug (a SMARTS match straddling two
-    residues, or a mis-set slot occupancy) and is skipped, not averaged away.
-    """
+    """Return ordered CG data and its single-residue identity, or None if invalid."""
     cg = select_cg_atoms(prody_obj)
     if cg is None:
         return None
@@ -267,16 +212,8 @@ def get_res_AA_identity(res_obj):
     return resnames[0]
 
 
-# ---------------------------------------------------------------------------
-# Residue-slot classification
-# ---------------------------------------------------------------------------
-#
-# Canonical heavy-atom names of the 20 standard residues (mirrors
-# vdg_miner/constants.py `protein_atoms` with hydrogens dropped.
-#
-# The point of this table is that a resname cannot be trusted on its own: a GFP
-# chromophore is deposited as a residue named GLY carrying a fused imidazolinone
-# ring, so ProDy calls it a GLY with a non-empty `sidechain`.
+# Canonical heavy-atom names (mirrors vdg_miner/constants.py without hydrogens).
+# Atom names, rather than residue labels or ProDy flags, identify modified chemistry.
 CANONICAL_HEAVY_ATOMS = {
     'ALA': {'C', 'CA', 'CB', 'N', 'O'},
     'ARG': {'C', 'CA', 'CB', 'CD', 'CG', 'CZ', 'N', 'NE', 'NH1', 'NH2', 'O'},
@@ -302,77 +239,39 @@ CANONICAL_HEAVY_ATOMS = {
     'VAL': {'C', 'CA', 'CB', 'CG1', 'CG2', 'N', 'O'},
 }
 
-# C-terminal carboxylate oxygen (and depositors' alternate names): canonical, but
-# neither backbone nor sidechain, matching ProDy's own split.
+# Terminal carboxylate oxygens are canonical but outside backbone/sidechain.
 _TERMINAL_HEAVY_ATOMS = {'OXT', 'OT1', 'OT2'}
 
 BACKBONE_HEAVY_ATOMS = {'N', 'CA', 'C', 'O'}
 
-# Alternate heavy atoms a canonical resname legitimately carries. Se-Met is
-# renamed MSE -> MET (by prepwizard, and by s01 via
-# _prep_filters.MODIFIED_RESIDUE_RENAMES) while keeping SE in place of SD; calling
-# it non-canonical would discard real MET observations (~51% of every `X` slot in
-# the pre-change library). Selenocysteine is renamed SEC -> CYS the same way.
+# Se-Met and selenocysteine are renamed MET/CYS while retaining their SE atom.
 _ALTERNATE_HEAVY_ATOMS = {'MET': {'SE'}, 'CYS': {'SE'}}
 
-# Label for a residue slot whose non-canonical atoms contact the CG. Not a
-# resname (the true residue is in nr_scrr_resname). Unreachable by hit finding,
-# which is the point.
+# Label for slots whose non-canonical atoms contact the CG; true resname is stored separately.
 NONCANONICAL_AA_LABEL = 'X'
 
-# Label for a slot whose *backbone* contacts the CG -- one label covering every
-# residue, GLY and PRO included. Their backbones really aren't substitutable, but
-# that is a per-vdG property, not a per-bucket one, so the read path tests it
-# directly (hit_finder_core.backbone_slot_blockers / backbone_slots_can_host)
-# against the query's own sidechain. See docs/aa_bucket_treatment.md for the
-# measurements. BB_LABELS stays a set for importers and for a possible future
-# backbone label that is not a query-side property. 
+# One backbone label for all residues; hostability is checked per vdG against query virtual CB/Pro N.
 BB_LABEL = 'bb'
 BB_LABELS = frozenset((BB_LABEL,))
 
 
 def bb_label_for(resname):
-    """Which backbone label a generated slot on `resname` gets."""
+    """Return the generated backbone-contact label."""
     return BB_LABEL
 
 
 def query_slot_labels(resname):
-    """Labels a *query* residue named `resname` may be matched under.
-
-    Counterpart of `bb_label_for` on the read path: every residue may be matched
-    as its own sidechain identity or as a backbone contact. Whether a backbone
-    geometry is physically hostable is decided per-vdG in
-    hit_finder_core.backbone_slots_can_host, not here.
-
-    Glycine's 'GLY' option matches nothing in practice (the write path cannot
-    produce it), but is kept so BSR enumeration stays a uniform 2^n; the cost is
-    one missing-file lookup per glycine per combo.
-    """
+    """Return the identity and backbone labels allowed for a query residue."""
     return (resname, BB_LABEL)
 
 
-# Flanking-sequence markers, deliberately not 'X': a flanking position says
-# nothing about chemistry. FLANK_MISSING = the residue is absent, non-protein,
-# ambiguous, or has no usable CA (it may be perfectly ordinary, just unreadable).
+# Flank markers describe unreadability, not chemistry, so they differ from 'X'.
 
 FLANK_MISSING = '-'
 FLANK_CHAIN_BREAK = '!'
 FLANK_UNCOMPARABLE = frozenset((FLANK_MISSING, FLANK_CHAIN_BREAK))
 
-# Per-slot provenance, written to the npz as `nr_slot_flag` (int8):
-#
-#   bits 0-1  which moiety of the *canonical* residue is nearest the CG
-#   bit 2     whether the residue carries non-canonical heavy atoms at all
-#
-# Kept disjoint from the bucket label so nothing is recorded twice: the label
-# already says which moiety contacts whenever that is not canonical ('X') or not
-# a sidechain (BB_LABELS), leaving the flag free to describe the canonical
-# residue underneath -- on an 'X' slot it says what the real sidechain was doing.
-#
-# SLOT_NO_SC is chemistry on a glycine and missing density anywhere else; since
-# the backbone label no longer distinguishes them, check `nr_scrr_resname`
-# against 'GLY' rather than pooling. The two are lopsided (253,992 vs 227 slots
-# in one measured library), so do not design around the rare one.
+# nr_slot_flag: bits 0-1 encode the nearest canonical moiety; bit 2 marks modified residues.
 SLOT_SC          = 0      # sidechain is the closest canonical moiety
 SLOT_NO_SC       = 1      # no sidechain heavy atoms present
 SLOT_BB_CLOSER   = 2      # sidechain present, but a backbone atom is closer
@@ -391,11 +290,7 @@ def slot_is_modified(flag):
 
 
 def is_hydrogen(name, element):
-    """Hydrogen/deuterium test that tolerates a blank element column.
-
-    Falls back to the PDB atom-name convention (optional leading digit, then the
-    element letter), common in older or hand-edited files.
-    """
+    """Identify H/D from the element, falling back to the PDB atom name."""
     el = (element or '').strip().upper()
     if el:
         return el in ('H', 'D')
@@ -403,19 +298,7 @@ def is_hydrogen(name, element):
 
 
 def split_residue_heavy_atoms(res_obj, resname):
-    """Split a residue's heavy atoms into (backbone, sidechain, non-canonical) coords.
-
-    Decided by atom *name* against CANONICAL_HEAVY_ATOMS, not ProDy's
-    backbone/sidechain flags, which call a GFP chromophore's fused ring a
-    sidechain. One table drives both
-    questions, so an atom cannot be canonical for one and not the other. A
-    canonical name is accepted whatever element the file declares (the element
-    column is blank or wrong often enough that gating on it would relabel
-    ordinary residues as non-canonical).
-
-    Returns (None, None, None) when `resname` is outside the 20.
-    Hydrogens are dropped here, so a stray H is never reported as non-canonical.
-    """
+    """Split heavy atom coordinates into backbone, sidechain and non-canonical groups."""
     canonical = CANONICAL_HEAVY_ATOMS.get(resname)
     if canonical is None:
         return None, None, None
@@ -433,3 +316,34 @@ def split_residue_heavy_atoms(res_obj, resname):
     is_term = np.array([n in _TERMINAL_HEAVY_ATOMS for n in names],
                        dtype=bool).reshape(-1)
     return coords[known & is_bb], coords[known & ~is_bb & ~is_term], coords[heavy & ~known]
+
+def virtual_cb(bb):
+    """Ideal CB (ProteinMPNN constants) from (..., 3, 3) N/CA/C backbone coords."""
+    bb = np.asarray(bb, np.float64)
+    b, c = bb[..., 1, :] - bb[..., 0, :], bb[..., 2, :] - bb[..., 1, :]
+    return (bb[..., 1, :] - 0.58273431 * np.cross(b, c) + 0.56802827 * b - 0.54067466 * c).astype(np.float32)
+
+def vcb_slot_blockers(bsr_bb, slot_labels, slot_resnames):
+    """Side-chain-free slot blockers for bb-labelled slots: the virtual CB (none for Gly) and the
+    Pro N. bsr_bb: (n_slots, 3, 3) N/CA/C. Returns [(blocker_atoms, pro_n or None)] or None."""
+    return [(virtual_cb(bb)[None] if rn != "GLY" else np.empty((0, 3), np.float32),
+             np.asarray(bb[0], np.float32) if rn == "PRO" else None)
+            for bb, label, rn in zip(bsr_bb, slot_labels, map(str, slot_resnames))
+            if label in BB_LABELS] or None
+
+def receptor_bb_vcb_coords(struct):
+    """(P, 3) N/CA/C/O of every protein residue plus the virtual CB of every non-Gly residue with
+    N/CA/C; the side-chain-free receptor for hit_finder_core `min_bb_dist`."""
+    bb = struct.select("protein and name N CA C O")
+    if bb is None:
+        return np.empty((0, 3), np.float32)
+    return np.concatenate([bb.getCoords().astype(np.float32), virtual_cb(np.reshape(
+        [[a.getCoords() for a in atoms] for atoms in ([r.getAtom(n) for n in ("N", "CA", "C")]
+                                                      for r in bb.getHierView().iterResidues()
+                                                      if r.getResname() != "GLY") if None not in atoms],
+        (-1, 3, 3)))])
+
+def bsr_contact_atoms(bsr_bb, slot_resnames):
+    """(P, 3) side-chain-free contact atoms of a BSR combo: N/CA/C plus the virtual CB of non-Gly slots."""
+    bsr_bb = np.asarray(bsr_bb, np.float32)
+    return np.concatenate((bsr_bb.reshape(-1, 3), virtual_cb(bsr_bb[[str(r) != "GLY" for r in slot_resnames]])))

@@ -4,8 +4,8 @@ Both toolkits count explicit H atoms in the SMARTS `D` primitive, so on a proton
 parent database -- which is what the pipeline mines -- a hydroxyl O reads `D2` and
 `[O;D1;!R]` matches nothing. The fragment is then sized from a zero occurrence count
 and lands in the shortest queue tier, where it is killed at h_rt (selection itself no
-longer runs off this count -- it uses biounit support, DR-5 -- but job sizing does,
-DR-7). The estimate has to route through functions/ligand_perception, not build its own
+longer runs off this count -- it uses biounit support -- but job sizing does). The
+estimate has to route through functions/ligand_perception, not build its own
 OBMol, so it cannot drift from what the miner actually matches.
 
 The discriminating input is an *explicitly protonated* ligand; a file without hydrogens
@@ -52,10 +52,9 @@ class HydrogenFreeCountingTests(unittest.TestCase):
         self.assertNotIn(1, counts,
                          f'[C;D1][O;D2] must not match a hydroxyl; got {counts}')
 
-    def test_an_unreadable_block_is_a_read_failure_not_a_zero_count(self):
-        """Counting an unparsable ligand as zero occurrences undercounts the fragment
-        and can under-size its job into a queue too short to finish; it is tallied
-        separately instead."""
+    def test_an_unreadable_block_is_tallied_as_a_read_failure(self):
+        """An unparsable ligand contributes no occurrences (the miner skips it too)
+        but is tallied separately so the pass can warn about it."""
         d = os.path.join(self.tmp, 'ba')
         os.makedirs(d)
         bad = os.path.join(d, '1bad.pdb')
@@ -65,7 +64,7 @@ class HydrogenFreeCountingTests(unittest.TestCase):
         self.assertFalse(unreadable)
         self.assertEqual(counts, {})
         self.assertEqual(read_failures, 1)
-        # The structure's one ligand is present but fails perception -- B8's
+        # The structure's one ligand is present but fails perception -- the
         # all-failed case, distinct from unreadable (file couldn't be read at all).
         self.assertTrue(all_failed)
 

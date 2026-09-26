@@ -6,508 +6,86 @@ many models in one process reuses the library arrays.
 """
 
 import io
-import logging
 import multiprocessing as mp
 import os
-import re
 import tempfile
 import traceback
-from collections import Counter, OrderedDict
-from contextlib import contextmanager, redirect_stdout, redirect_stderr
-from functools import lru_cache
+from contextlib import redirect_stdout, redirect_stderr
 
 import numpy as np
 import prody as pr
-from rdkit import rdBase, Chem
-
-from ligand_vdgs.functions import Frags
+from ligand_vdgs.functions import ligand_structure
 from ligand_vdgs.functions import dock_utils as dock
 from ligand_vdgs.functions import vdg_npz_utils as vdg_npz
-from ligand_vdgs.functions import vdg_struct_utils as struct_utils
-from ligand_vdgs.functions.utils import (kabsch, kabsch_ssd, best_inplace_symmetry_rmsd,
-    filename_to_smiles, smiles_to_filename, normalize_rmsd, init_query_ring_info,
-    fragment_keys_equivalent)
+from ligand_vdgs.functions.vdg_struct_utils import bsr_contact_atoms, vcb_slot_blockers
+from ligand_vdgs.functions.utils import kabsch, kabsch_ssd, best_inplace_symmetry_rmsd, normalize_rmsd
 from ligand_vdgs.functions.vdg_fp_utils import (fp_tolerances,
     prefilter_query_indices_pair, prefilter_query_indices_single)
+from ligand_vdgs.score_poses import hit_finder_matching as _matching
+from ligand_vdgs.score_poses.hit_finder_matching import (
+    BUCKET_CACHE_MAX_BYTES, CACHE_MISS, _BoundedBucketCache, _cg_symmetry_for,
+    _combo_worker_struct,
+    _struct_id_from_pdbfile, _worker_bucket_cache, bsr_label_to_string,
+    cg_atom_order_smarts, init_rdkit_logging, init_worker, lib_entries,
+    match_library_frags_to_query, query_resonance_forms)
+from ligand_vdgs.score_poses.hit_finder_geometry import (
+    ACCEPTOR_ELEMENTS, BB_SLOT_SIDECHAIN_CLASH, PLACEMENT_CHUNK as _PLACEMENT_CHUNK,
+    PRO_NH_DONOR_CUTOFF, _dist, _min_dist2,
+    backbone_slots_can_host, backbone_slots_host_mask, cg_bb_dist, cg_center,
+    fp_pair_from_ca_and_cgcom, fp_single_from_ca_and_cgcom,
+    has_any_bsr_atom_cg_contact, held_out_placement,
+    proper_rotation_mask as _proper_rotation_mask)
 
 EXCELLENT_MATCH_CUTOFF = 0.3
-BUCKET_CACHE_MAX_BYTES = 128 * 1024**2
+MATCH_MODES = ("joint", "bb")
 
-def _struct_id_from_pdbfile(pdbfile):
-    basename = os.path.basename(os.fspath(pdbfile))
-    for extension in (".pdb.gz", ".cif.gz", ".pdb", ".cif", ".gz"):
-        if basename.lower().endswith(extension):
-            basename = basename[:-len(extension)]
-            break
+def _hit_record(common, bucket, nr_idx, match_mode, rmsd, aa_perm_idx, site_idx, perm_idx,
+                grouped_q_cg_perms, R, t, R_bb, t_bb, bb_rmsd, held_out, lever):
+    rec = dict(common, charge_sign=str(bucket["charge_signs"][nr_idx]),
+               vdg_index=int(bucket["partition_indices"][nr_idx]),
+               vdg_cluster_id=int(bucket["cluster_id"][nr_idx]),
+               vdg_cluster_num_parents=int(bucket["cluster_num_parents"][nr_idx]),
+               vdg_rmsd=f"{rmsd:.4f}", aa_perm_idx=int(aa_perm_idx), q_site_idx=int(site_idx), q_cg_perm_idx=int(perm_idx),
+               q_atom_indices=";".join(str(i) for i in sorted(
+                   grouped_q_cg_perms[site_idx][perm_idx][-1])),
+               match_mode=match_mode, bb_rmsd=f"{bb_rmsd:.4f}",
+               held_out_cg_rmsd=f"{held_out:.4f}", cg_bb_dist=f"{lever:.4f}")
+    for prefix, M, v in (("", R, t), ("bb", R_bb, t_bb)):
+        M, v = np.round(M, 4), np.round(v, 4)
+        rec.update({f"R{prefix}{i}{j}": f"{M[i, j]:.4f}" for i in range(3) for j in range(3)})
+        rec.update({f"t{prefix}{k}": f"{v[k]:.4f}" for k in range(3)})
+    return rec
 
-    structure, separator, pose = basename.rpartition("_")
-    if separator and structure and pose.isdecimal():
-        return structure
-    return basename
-
-_WORKER_MOL_CACHE: dict | None = None
-_WORKER_MOL_CACHE_ENTRIES: frozenset | None = None
-_WORKER_PATTERN_ELEMENTS: dict | None = None
-_warned_incomplete_frags = set()
-
-def _bucket_nbytes(bucket):
-    if bucket is None:
-        return 0
-    return sum(
-        value.nbytes
-        for value in bucket.values()
-        if isinstance(value, np.ndarray))
-
-CACHE_MISS = object()
-
-class _BoundedBucketCache:
-    def __init__(self, max_bytes=BUCKET_CACHE_MAX_BYTES):
-        self.max_bytes = max_bytes
-        self._entries = OrderedDict()
-        self._nbytes = 0
-
-    def get(self, key):
-        try:
-            value, nbytes = self._entries.pop(key)
-        except KeyError:
-            return CACHE_MISS
-        self._entries[key] = (value, nbytes)
-        return value
-
-    def put(self, key, value):
-        nbytes = _bucket_nbytes(value)
-        if nbytes > self.max_bytes:
-            return
-
-        if value is not None:
-            for array in value.values():
-                if isinstance(array, np.ndarray):
-                    array.flags.writeable = False
-
-        old = self._entries.pop(key, None)
-        if old is not None:
-            self._nbytes -= old[1]
-
-        self._entries[key] = (value, nbytes)
-        self._nbytes += nbytes
-        while self._nbytes > self.max_bytes:
-            _, (_, evicted_nbytes) = self._entries.popitem(last=False)
-            self._nbytes -= evicted_nbytes
-
-_WORKER_BUCKET_CACHE: _BoundedBucketCache | None = None
-
-def _worker_bucket_cache():
-    global _WORKER_BUCKET_CACHE
-    if _WORKER_BUCKET_CACHE is None:
-        _WORKER_BUCKET_CACHE = _BoundedBucketCache()
-    return _WORKER_BUCKET_CACHE
-
-_WORKER_STRUCT_CACHE: tuple | None = None
-
-def _combo_worker_struct(pdb_path):
-    global _WORKER_STRUCT_CACHE
-    if _WORKER_STRUCT_CACHE is None or _WORKER_STRUCT_CACHE[0] != pdb_path:
-        _WORKER_STRUCT_CACHE = (pdb_path, pr.parseCIF(pdb_path)
-                                 if pdb_path.endswith((".cif", ".cif.gz"))
-                                 else pr.parsePDB(pdb_path))
-    return _WORKER_STRUCT_CACHE[1]
-
-def init_worker(lib_entries):
-    global _WORKER_MOL_CACHE, _WORKER_MOL_CACHE_ENTRIES, _WORKER_BUCKET_CACHE
-    global _WORKER_PATTERN_ELEMENTS
-    _WORKER_BUCKET_CACHE = None
-    entries = frozenset(lib_entries)
-    mol_cache = {}
-    for entry in entries:
-        mol = init_query_ring_info(Chem.MolFromSmarts(filename_to_smiles(entry)))
-        if mol is not None:
-            mol_cache[entry] = mol
-    _WORKER_MOL_CACHE = mol_cache
-    _WORKER_PATTERN_ELEMENTS = {
-        name: Counter(a.GetAtomicNum() for a in mol.GetAtoms() if a.GetAtomicNum())
-        for name, mol in mol_cache.items()}
-    _WORKER_MOL_CACHE_ENTRIES = entries
-
-def _pattern_element_counts(db_name):
-    return _WORKER_PATTERN_ELEMENTS[db_name]
-
-def _ensure_worker_mol_cache(lib_entries):
-    entries = frozenset(lib_entries)
-    if (_WORKER_MOL_CACHE is None
-            or _WORKER_MOL_CACHE_ENTRIES != entries):
-        init_worker(entries)
-
-@contextmanager
-def init_rdkit_logging(stream_like):
-    rdBase.LogToPythonLogger()
-    logger = logging.getLogger("rdkit")
-    previous = logger.level, logger.propagate
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-    h = logging.StreamHandler(stream_like)
-    h.setFormatter(logging.Formatter("%(levelname)s [%(name)s]: %(message)s"))
-    logger.addHandler(h)
-    try:
-        yield
-    finally:
-        h.flush()
-        logger.removeHandler(h)
-        h.close()
-        logger.setLevel(previous[0])
-        logger.propagate = previous[1]
-
-def bsr_label_to_string(bsr_combo):
-    return ";".join(f"{seg}:{chain}:{resnum}" for (seg, chain, resnum) in bsr_combo)
-
-@lru_cache(maxsize=512)
-def _cg_symmetry_for(vdg_lib_dir, db_name):
-    return vdg_npz.load_cg_symmetry(vdg_lib_dir, db_name)
-
-@lru_cache(maxsize=512)
-def _cg_order_pattern(vdg_lib_dir, db_name):
-    smarts = _cg_symmetry_for(vdg_lib_dir, db_name)[0]
-    pattern = init_query_ring_info(Chem.MolFromSmarts(smarts))
-    if pattern is None:
-        raise ValueError(f"Fragment {db_name!r}: recorded cg_smarts {smarts!r} "
-                         "does not parse as SMARTS")
-    return pattern
-
-def cg_atom_order_smarts(vdg_lib_dir, db_name):
-    return _cg_symmetry_for(vdg_lib_dir, db_name)[0]
-
-def _expand_site_by_cg_automorphisms(site, automorphisms):
-    if len(automorphisms) <= 1:
-        return site
-    n_auto = len(automorphisms[0])
-    expanded, seen = [], set()
-    for sub, perm_inds, orig_mol_inds in site:
-        if sub.GetNumAtoms() != n_auto:
-            raise ValueError(
-                f"CG automorphisms are over {n_auto} atoms but the query "
-                f"fragment has {sub.GetNumAtoms()}; the library's recorded "
-                "symmetry does not describe this fragment")
-        for auto in automorphisms:
-            new_perm = tuple(perm_inds[i] for i in auto)
-            key = (new_perm, tuple(orig_mol_inds))
-            if key in seen:
-                continue
-            try:
-                expanded.append((Chem.RenumberAtoms(Chem.Mol(sub), list(auto)),
-                                 new_perm, orig_mol_inds))
-            except Exception:
-                continue
-            seen.add(key)
-    return expanded or site
-
-_warned_unsearchable_libs = set()
-
-def _warn_unsearchable_entries(vdg_lib_dir, vdg_lib_entries, warn):
-    if warn is None or vdg_lib_dir in _warned_unsearchable_libs:
-        return
-    _warned_unsearchable_libs.add(vdg_lib_dir)
-    unparsed = [e for e in sorted(set(vdg_lib_entries) - set(_WORKER_MOL_CACHE))
-                if os.path.isdir(os.path.join(vdg_lib_dir, e))]
-    if unparsed:
-        warn(f"{len(unparsed)} fragment directory name(s) in {vdg_lib_dir} do not "
-             f"parse as SMARTS, so their vdGs cannot be searched for: {unparsed}")
-
-_warned_charge_only_frags = set()
-_SMARTS_CHARGE = re.compile(r"([A-Za-z])([+-]\d*)([;\]])")
-
-@lru_cache(maxsize=None)
-def _neutralized_pattern(db_name):
-    neutral, n_subs = _SMARTS_CHARGE.subn(r"\1\3", filename_to_smiles(db_name))
-    if not n_subs:
-        return None
-    pattern = init_query_ring_info(Chem.MolFromSmarts(neutral))
-    return None if pattern is None else (pattern, neutral)
-
-def _library_entry_for_key(key):
-    exact = smiles_to_filename(key)
-    if exact in _WORKER_MOL_CACHE:
-        return exact
-    for entry in sorted(_WORKER_MOL_CACHE):
-        try:
-            if fragment_keys_equivalent(key, filename_to_smiles(entry)):
-                return entry
-        except Exception:
-            continue
-    return None
-
-def _warn_charge_only_miss(lig_mol, db_name, vdg_lib_dir, frags_in_lib, warn):
-    if warn is None or db_name in _warned_charge_only_frags:
-        return
-    neutralized = _neutralized_pattern(db_name)
-    if neutralized is None:
-        return
-    pattern, neutral_smarts = neutralized
-    if not lig_mol.HasSubstructMatch(pattern):
-        return
-    _warned_charge_only_frags.add(db_name)
-    twin = _library_entry_for_key(neutral_smarts)
-    if twin is None:
-        twin_usable = False
-    elif twin in frags_in_lib:
-        twin_usable = frags_in_lib[twin]
-    else:
-        twin_usable = Frags.check_vdg_job_status(twin, vdg_lib_dir)
-    if twin_usable:
-        warn(f"Fragment {db_name!r} is charged and did not match this ligand, which "
-             f"carries that moiety as {neutral_smarts!r}. Its neutral twin is in the "
-             f"library and is searched instead, so the moiety is covered, but this "
-             f"key's own vdGs are not reachable for this query.")
-    else:
-        warn(f"Fragment {db_name!r} is charged and did not match this ligand, but its "
-             f"neutral form {neutral_smarts!r} does: the ligand carries that moiety in "
-             f"the other protonation state. No usable neutral twin is in the library "
-             f"to fall back on, so this moiety is unsearchable for this query and its "
-             f"vdGs are silently absent from the results.")
-
-_MAX_QUERY_FRAG_MATCHES = 1000
-
-def match_library_frags_to_query(lig_mol, vdg_lib_dir, vdg_lib_entries,
-                                 frags_in_lib=None, warn=None):
-    if frags_in_lib is None:
-        frags_in_lib = {}
-    filtered_frags = {}
-    query_frag_map = {}
-
-    _ensure_worker_mol_cache(vdg_lib_entries)
-    _warn_unsearchable_entries(vdg_lib_dir, vdg_lib_entries, warn)
-    Chem.GetSymmSSSR(lig_mol)
-    n_graph_h = sum(1 for a in lig_mol.GetAtoms() if a.GetAtomicNum() == 1)
-    if n_graph_h:
-        raise ValueError(
-            f'query ligand mol has {n_graph_h} hydrogen atoms in the graph; the '
-            'library\'s keys carry heavy-atom degree (`D<n>`), which counts them, '
-            'so matching must run on an H-free mol (see Frags.get_query_ligand_mol).')
-    lig_elements = Counter(a.GetAtomicNum() for a in lig_mol.GetAtoms())
-    n_lig_atoms = lig_mol.GetNumAtoms()
-    for db_name in sorted(_WORKER_MOL_CACHE):
-        pattern = _WORKER_MOL_CACHE[db_name]
-        if pattern.GetNumAtoms() > n_lig_atoms:
-            continue
-        if any(count > lig_elements.get(atomic_num, 0)
-               for atomic_num, count in _pattern_element_counts(db_name).items()):
-            continue
-        if not lig_mol.HasSubstructMatch(pattern):
-            _warn_charge_only_miss(lig_mol, db_name, vdg_lib_dir,
-                                   frags_in_lib, warn)
-            continue
-
-        if db_name not in frags_in_lib:
-            frags_in_lib[db_name] = Frags.check_vdg_job_status(db_name, vdg_lib_dir)
-            if (not frags_in_lib[db_name] and warn is not None
-                    and db_name not in _warned_incomplete_frags):
-                _warned_incomplete_frags.add(db_name)
-                warn(f"Fragment {db_name!r} directory exists in {vdg_lib_dir} but "
-                     f"its vdG-generation job has not completed (no 'Job completed.' "
-                     f"in its log); treating it as absent from the library.")
-        if not frags_in_lib[db_name]:
-            continue
-
-        target_smarts, automorphisms = _cg_symmetry_for(vdg_lib_dir, db_name)
-        try:
-            matches = lig_mol.GetSubstructMatches(
-                _cg_order_pattern(vdg_lib_dir, db_name), uniquify=False,
-                maxMatches=_MAX_QUERY_FRAG_MATCHES)
-        except ValueError as e:
-            if warn is not None:
-                warn(f"{e}; skipping this fragment.")
-            continue
-        if not matches:
-            continue
-        if len(matches) >= _MAX_QUERY_FRAG_MATCHES:
-            if warn is not None:
-                warn(f"Fragment {db_name!r} hit the {_MAX_QUERY_FRAG_MATCHES}-match "
-                     f"cap on this ligand, so its labelings would be incomplete; "
-                     f"skipping it.")
-            continue
-
-        filtered_frags[db_name] = [
-            _expand_site_by_cg_automorphisms(site, automorphisms)
-            for site in Frags.group_lig_sites_by_overlap(
-                [(Frags.submol_from_match(lig_mol, match), tuple(match),
-                  tuple(sorted(match))) for match in matches])]
-        query_frag_map[db_name] = target_smarts
-
-    return filtered_frags, query_frag_map, frags_in_lib
-
-def cg_center(cg_coords):
-    return np.asarray(cg_coords, dtype=np.float32).mean(axis=0, dtype=np.float32)
-
-def _dist(a, b):
-    d = a - b
-    return float(np.sqrt(np.sum(d * d, dtype=np.float32), dtype=np.float32))
-
-def fp_single_from_ca_and_cgcom(ca_coords, cg_com):
-    return _dist(ca_coords[0], cg_com)
-
-def fp_pair_from_ca_and_cgcom(ca_coords, cg_com):
-    return (_dist(ca_coords[0], cg_com), _dist(ca_coords[1], cg_com),
-            _dist(ca_coords[0], ca_coords[1]))
-
-def get_residue_all_atom_coords(struct, seg, chain, resnum):
-    terms = []
-    if seg not in (None, "", "_"):
-        terms.append(f"segment {seg}")
-    if chain not in (None, "", "_"):
-        terms.append(f"chain {chain}")
-    terms.append(f"resnum {resnum}")
-    sel = struct.select(" and ".join(terms))
-    if sel is None:
-        return None
-
-    coords = sel.getCoords()
-    if coords is None or len(coords) == 0:
-        return None
-
-    try:
-        elems, names = sel.getElements(), sel.getNames()
-    except Exception:
-        elems = names = None
-
-    if elems is not None and names is not None:
-        mask = np.array([not struct_utils.is_hydrogen(n, e)
-                         for n, e in zip(names, elems)], dtype=bool)
-        if not np.any(mask):
-            return None
-        coords = coords[mask]
-
-    return np.asarray(coords, dtype=np.float32)
-
-def get_bsr_all_atom_coords(struct, bsr_combo):
-    chunks = []
-    for seg, chain, resnum in bsr_combo:
-        c = get_residue_all_atom_coords(struct, seg, chain, resnum)
-        if c is not None and len(c) > 0:
-            chunks.append(c)
-    if not chunks:
-        return None
-    return np.concatenate(chunks, axis=0).astype(np.float32, copy=False)
-
-BB_SLOT_SIDECHAIN_CLASH = 3.4
-PRO_NH_DONOR_CUTOFF = 3.5
-
-def backbone_slot_blockers(struct, bsr_combo, slot_labels, slot_resnames):
-    blockers = []
-    for (seg, chain, resnum), label, resname in zip(bsr_combo, slot_labels, slot_resnames):
-        if label not in struct_utils.BB_LABELS:
-            continue
-        terms = []
-        if seg not in (None, "", "_"):
-            terms.append(f"segment {seg}")
-        if chain not in (None, "", "_"):
-            terms.append(f"chain {chain}")
-        terms.append(f"resnum {resnum}")
-        sel = struct.select(" and ".join(terms))
-        if sel is None:
-            continue
-        _bb, sc, extra = struct_utils.split_residue_heavy_atoms(sel, str(resname))
-        if sc is None:
-            continue
-        if extra is not None and len(extra):
-            sc = np.concatenate((sc, extra), axis=0) if len(sc) else extra
-        n_coord = None
-        if str(resname) == "PRO":
-            n_sel = sel.select("name N")
-            if n_sel is not None and len(n_sel):
-                n_coord = np.asarray(n_sel.getCoords()[0], dtype=np.float32)
-        if len(sc) or n_coord is not None:
-            blockers.append((np.asarray(sc, dtype=np.float32), n_coord))
-    return blockers or None
-
-def backbone_slots_can_host(blockers, cg_coords, cg_is_acceptor):
-    if not blockers:
-        return True
-    cg_coords = np.asarray(cg_coords, dtype=np.float32)
-    for sc, n_coord in blockers:
-        if len(sc):
-            d2 = ((sc[:, None, :] - cg_coords[None, :, :]) ** 2).sum(-1)
-            if d2.min() < BB_SLOT_SIDECHAIN_CLASH ** 2:
-                return False
-        if n_coord is not None and cg_is_acceptor is not None and cg_is_acceptor.any():
-            d2 = ((cg_coords[cg_is_acceptor] - n_coord) ** 2).sum(-1)
-            if d2.min() < PRO_NH_DONOR_CUTOFF ** 2:
-                return False
-    return True
-
-def has_any_bsr_atom_cg_contact(bsr_atom_coords, cg_coords, cutoff=3.8):
-    if bsr_atom_coords is None or len(bsr_atom_coords) == 0:
-        return False
-    cg_coords = np.asarray(cg_coords, dtype=np.float32)
-    if cg_coords.size == 0:
-        return False
-    diff = bsr_atom_coords[:, None, :] - cg_coords[None, :, :]
-    return bool(np.any(np.sum(diff * diff, axis=2, dtype=np.float32)
-                      <= np.float32(cutoff * cutoff)))
-
-def deduplicate_hits(match_records, min_shared_atoms=3):
-    def _parse_atom_indices(rec):
-        s = rec.get("q_atom_indices", "")
-        if not s:
-            return None
-        try:
-            return frozenset(int(x) for x in s.split(";") if x)
-        except ValueError:
-            return None
-
-    def _bsr_residue_set(rec):
-        return frozenset(t for t in str(rec["bsr_combo"]).split(";") if t)
-
-    kept = []
-    kept_atoms = []
-    kept_bsr = []
-
-    for rec in sorted(match_records, key=lambda r: float(r["vdg_rmsd"])):
-        bsr = _bsr_residue_set(rec)
-        q_atoms = _parse_atom_indices(rec)
-
-        is_dup = False
-        if q_atoms is not None:
-            for k_bsr, k_atoms in zip(kept_bsr, kept_atoms):
-                if k_bsr != bsr:
-                    continue
-                if k_atoms is None:
-                    continue
-                if len(q_atoms & k_atoms) >= min_shared_atoms:
-                    is_dup = True
-                    break
-
-        if not is_dup:
-            kept.append(rec)
-            kept_atoms.append(q_atoms)
-            kept_bsr.append(bsr)
-
-    return kept
-
-_BUCKET_ROW_FIELDS = ("cluster_id", "cluster_num_parents", "cg", "bb", "resnames", "slot_flags")
-
-def _load_vdg_bucket_all_signs(vdg_lib_dir, frag_name, subset_size, aa_bucket):
-    loaded = [(sign, vdg_npz.load_vdg_bucket(vdg_lib_dir, frag_name, subset_size, sign,
-                                              aa_bucket))
-              for sign in vdg_npz.CHARGE_SIGNS]
-    loaded = [(sign, bucket) for sign, bucket in loaded if bucket is not None]
-    if not loaded:
-        return None
-    return dict(
-        aa_bucket_parts=loaded[0][1]["aa_bucket_parts"],
-        charge_signs=np.concatenate([np.full(len(bucket["cluster_id"]), sign, dtype="U11")
-                                     for sign, bucket in loaded]),
-        partition_indices=np.concatenate([np.arange(len(bucket["cluster_id"]), dtype=np.int32)
-                                          for _sign, bucket in loaded]),
-        **{field: np.concatenate([bucket[field] for _sign, bucket in loaded])
-           for field in _BUCKET_ROW_FIELDS})
+def _compact_record(common, bucket, match_mode, sel, vdg_rmsd, bb_rmsd, held_out, lever, placed, q_lig_idx,
+                    **extra):
+    """One record for all hits of a bucket; per-hit fields are arrays (hits.npz contract)."""
+    return dict(common, match_mode=match_mode, compact=True, vdg_index=bucket["partition_indices"][sel],
+                charge_sign=bucket["charge_signs"][sel], vdg_cluster_id=bucket["cluster_id"][sel],
+                vdg_cluster_num_parents=bucket["cluster_num_parents"][sel].astype(np.int32),
+                nr_parent_biounit=bucket["parent_biounit"][sel], vdg_rmsd=np.asarray(vdg_rmsd, np.float32),
+                bb_rmsd=np.asarray(bb_rmsd, np.float32), held_out_cg_rmsd=np.asarray(held_out, np.float32),
+                cg_bb_dist=np.asarray(lever, np.float32), placed_cg=np.asarray(placed, np.float32),
+                q_lig_atom_idx=np.asarray(q_lig_idx, np.int32), placed_cg_element=bucket["cg_elements"][sel],
+                **extra)
 
 def _score_one_bsr_combo(pdbfile, struct, frag_name, query_frag, grouped_q_cg_perms,
-                          combo_item, vdg_lib_dir, bucket_cache, bsr_atom_coords_cache,
-                          bb_blockers_cache, rmsd_threshold, contact_cutoff,
-                          lig_instance_label):
+                          combo_item, vdg_lib_dir, bucket_cache, bb_blockers_cache,
+                           rmsd_threshold, contact_cutoff,
+                          lig_instance_label, match_mode="joint", compact=False):
+    """Hits of one fragment on one BSR combo. No mode reads side chains. match_mode='joint' matches
+    on bb+CG RMSD <= tau (slot gate and contact filter on the query CG vs backbone + virtual CB);
+    'bb' (placement, DR-36) matches on the backbone alone, sqrt(SSD_bb / n_atoms) <= tau, reads
+    neither the query CG nor side chains (slot gate = virtual CB + Pro N on the placed CG), and
+    reports the held-out CG error of the bb-only placement.
+    compact: one record per bucket whose per-hit fields are arrays (`_compact_record`)."""
+    if match_mode not in MATCH_MODES:
+        raise ValueError(f"[ERROR] match_mode must be one of {MATCH_MODES}, got {match_mode!r}")
+    if match_mode == "bb" and contact_cutoff is not None:
+        raise ValueError("[ERROR] contact_cutoff reads the query CG and side chains; it is joint-mode only.")
     combo, bsr_combo, _bsr_AAs, coords = combo_item
     match_records = []
-    paired = sorted(zip(combo, coords, bsr_combo, _bsr_AAs), key=lambda x: x[0])
     (bsr_incl_bb_identities, input_bsr_bb_coords, bsr_combo,
-     bsr_resnames) = zip(*paired)
+     bsr_resnames) = zip(*sorted(zip(combo, coords, bsr_combo, _bsr_AAs), key=lambda x: x[0]))
     bsr_incl_bb_identities = list(bsr_incl_bb_identities)
     bsr_combo = list(bsr_combo)
     input_bsr_bb_coords = np.asarray(input_bsr_bb_coords, np.float32)
@@ -527,25 +105,13 @@ def _score_one_bsr_combo(pdbfile, struct, frag_name, query_frag, grouped_q_cg_pe
                       if rmsd_threshold is None else rmsd_threshold)
     fp_tol = fp_tolerances(effective_rmsd, n_atoms, N_cg, subset_size)
 
-    combo_key = tuple(bsr_combo)
-    if combo_key in bsr_atom_coords_cache:
-        bsr_atom_coords = bsr_atom_coords_cache[combo_key]
-    else:
-        bsr_atom_coords = get_bsr_all_atom_coords(struct, bsr_combo)
-        bsr_atom_coords_cache[combo_key] = bsr_atom_coords
-        if bsr_atom_coords is None and contact_cutoff is not None:
-            print(f"[WARNING] ({pdbfile}) No non-H atoms for BSR combo "
-                  f"{bsr_label_to_string(bsr_combo)}; the contact filter "
-                  f"cannot pass, so this combo is skipped.", flush=True)
-    if bsr_atom_coords is None and contact_cutoff is not None:
-        return match_records
-
-    blocker_key = (combo_key, tuple(bsr_incl_bb_identities))
+    # Joint-mode contact filter: backbone + virtual CB only (no side chains in any mode).
+    bsr_atom_coords = None if contact_cutoff is None else bsr_contact_atoms(input_bsr_bb_coords, bsr_resnames)
+    blocker_key = (tuple(bsr_combo), tuple(bsr_incl_bb_identities))
     if blocker_key in bb_blockers_cache:
         bb_blockers = bb_blockers_cache[blocker_key]
     else:
-        bb_blockers = backbone_slot_blockers(
-            struct, bsr_combo, bsr_incl_bb_identities, bsr_resnames)
+        bb_blockers = vcb_slot_blockers(input_bsr_bb_coords, bsr_incl_bb_identities, bsr_resnames)
         bb_blockers_cache[blocker_key] = bb_blockers
 
     Y = np.empty((total_q_perms, n_atoms, 3), np.float32)
@@ -579,8 +145,8 @@ def _score_one_bsr_combo(pdbfile, struct, frag_name, query_frag, grouped_q_cg_pe
                 query_contact_ok[idx] = has_any_bsr_atom_cg_contact(
                     bsr_atom_coords, q_cg_coords, cutoff=contact_cutoff)
 
-            query_bb_slot_ok[idx] = backbone_slots_can_host(
-                bb_blockers, q_cg_coords, q_acceptor)
+            if match_mode == "joint":
+                query_bb_slot_ok[idx] = backbone_slots_can_host(bb_blockers, q_cg_coords, q_acceptor)
 
             if subset_size == 1:
                 fp_q0[idx] = fp_single_from_ca_and_cgcom(
@@ -602,18 +168,19 @@ def _score_one_bsr_combo(pdbfile, struct, frag_name, query_frag, grouped_q_cg_pe
     if contact_cutoff is not None and not np.any(query_contact_ok):
         return match_records
 
-    if not np.any(query_bb_slot_ok):
+    if match_mode == "bb":  # placement: no query-CG gate; the slot gate acts on the placed CG
+        query_bb_slot_ok[:] = True
+    elif not np.any(query_bb_slot_ok):
         return match_records
 
     bucket_key = (vdg_lib_dir, frag_name, subset_size, aa_bucket)
     bucket = bucket_cache.get(bucket_key)
     if bucket is CACHE_MISS:
-        bucket = _load_vdg_bucket_all_signs(vdg_lib_dir, frag_name, subset_size, aa_bucket)
+        bucket = vdg_npz.load_vdg_bucket_all_signs(vdg_lib_dir, frag_name, subset_size, aa_bucket)
         bucket_cache.put(bucket_key, bucket)
     if bucket is None:
         return match_records
 
-    cluster_num_parents = bucket["cluster_num_parents"]
     bucket_cg      = bucket["cg"]
     bucket_bb      = bucket["bb"]
     n_nr_vdgs    = bucket_cg.shape[0]
@@ -627,18 +194,63 @@ def _score_one_bsr_combo(pdbfile, struct, frag_name, query_frag, grouped_q_cg_pe
     resind_perms = vdg_npz.aa_perm_indices(bucket_parts)
 
     n_perms = len(resind_perms)
-    bb_rmsd_all = np.sqrt(kabsch_ssd(
-        bb_flat,
-        bucket_bb[:, np.asarray(resind_perms, dtype=np.intp), :, :].reshape(
-            n_nr_vdgs * n_perms, -1, 3),
-    ) / n_atoms).reshape(n_nr_vdgs, n_perms)
+    perms_arr = np.asarray(resind_perms, dtype=np.intp)
+    bb_ssd = kabsch_ssd(bb_flat, bucket_bb[:, perms_arr, :, :].reshape(
+        n_nr_vdgs * n_perms, -1, 3)).reshape(n_nr_vdgs, n_perms)
+    # Both modes match on sqrt(SSD_bb / n_atoms) <= tau, i.e. bb_rmsd = sqrt(SSD_bb / N_bb)
+    # <= tau * sqrt(n_atoms / N_bb): every joint hit is also a placement hit.
+    bb_rmsd_all = np.sqrt(bb_ssd / n_atoms)
+    q_ok = query_bb_slot_ok & query_contact_ok if contact_cutoff is not None else query_bb_slot_ok
+    if not q_ok.any():
+        return match_records
+    q_cgs, q_meta = Y[q_ok, N_bb:], meta[q_ok]
+    q_lever = [cg_bb_dist(q, bb_flat) for q in q_cgs]
+    # Query-ligand atom index per CG atom of each labeling (placed atom j <-> q_cgs[k][j]).
+    q_lig_idx = np.array([grouped_q_cg_perms[s][p][3] for s, p in q_meta], np.int32)
+    common = dict(pdbfile=pdbfile, struct_id=_struct_id_from_pdbfile(pdbfile),
+                  lig_instance=lig_instance_label, frag=frag_name, query_frag=query_frag,
+                  subset_size=subset_size, bsr_combo=bsr_label_to_string(bsr_combo),
+                  aa_bucket=aa_bucket, rmsd_threshold=f"{effective_rmsd:.4f}")
 
+    if match_mode == "bb":
+        if bucket_cg.shape[1] != N_cg:
+            return match_records
+        matched = bb_rmsd_all <= effective_rmsd
+        nr_sel = np.flatnonzero(matched.any(axis=1))
+        if nr_sel.size == 0:
+            return match_records
+        best_p = np.where(matched, bb_rmsd_all, np.inf)[nr_sel].argmin(axis=1)
+        vdg_bb_sel = bucket_bb[nr_sel[:, None], perms_arr[best_p]].reshape(nr_sel.size, N_bb, 3)
+        vdg_cg_sel = bucket_cg[nr_sel]
+        R_bb, t_bb, held_out, k, placed = held_out_placement(vdg_bb_sel, vdg_cg_sel, bb_flat, q_cgs)
+        # Joint fit at the placement's correspondence, for vdg_rmsd and R/t.
+        R, t, joint_ssd = kabsch(np.concatenate((vdg_bb_sel, vdg_cg_sel), axis=1),
+                                 np.concatenate((np.broadcast_to(bb_flat, vdg_bb_sel.shape),
+                                                 q_cgs[k]), axis=1))
+        ok = _proper_rotation_mask(R) & _proper_rotation_mask(R_bb)
+        if not ok.all():
+            print(f"[WARNING] ({pdbfile}) {int((~ok).sum())} non-unitary rotation(s) in bucket "
+                  f"{aa_bucket}; discarding those hits.", flush=True)
+        ok &= backbone_slots_host_mask(bb_blockers, placed, np.isin(bucket["cg_elements"][nr_sel], ACCEPTOR_ELEMENTS))
+        if compact:
+            sel = nr_sel[ok]
+            match_records.append(_compact_record(
+                common, bucket, "bb", sel, np.sqrt(joint_ssd[ok] / n_atoms),
+                np.sqrt(bb_ssd[sel, best_p[ok]] / N_bb), held_out[ok],
+                np.asarray(q_lever, np.float32)[k[ok]], placed[ok], q_lig_idx[k[ok]]))
+            return match_records
+        match_records.extend(
+            _hit_record(common, bucket, nr_idx, "bb", np.sqrt(joint_ssd[i] / n_atoms), best_p[i],
+                        *q_meta[k[i]], grouped_q_cg_perms, R[i], t[i], R_bb[i], t_bb[i],
+                        np.sqrt(bb_ssd[nr_idx, best_p[i]] / N_bb), held_out[i], q_lever[k[i]])
+            for i, nr_idx in enumerate(nr_sel) if ok[i])
+        return match_records
+
+    joint_hits = []  # compact: (nr_idx, vdg_rmsd, bb_rmsd, held_out, lever, placed, q_lig_idx, in-sample cg_rmsd)
     for nr_idx in range(n_nr_vdgs):
         vdg_cg      = bucket_cg[nr_idx]
         vdg_bb      = bucket_bb[nr_idx]
         vdg_idx     = int(nr_idx)
-        clus_id     = int(bucket["cluster_id"][nr_idx])
-        clus_num_parents = int(cluster_num_parents[nr_idx])
 
         if vdg_cg.shape[0] != N_cg:
             continue
@@ -646,13 +258,10 @@ def _score_one_bsr_combo(pdbfile, struct, frag_name, query_frag, grouped_q_cg_pe
         vdg_cg_com = cg_center(vdg_cg)
 
         best_rmsd = best_aa_perm_idx = best_q_site_idx = None
-        best_q_cg_perm_idx = best_R = best_t = None
-        best_R_bb = best_t_bb = None
+        best_query = best_R = best_t = None
 
         for aa_perm_idx, resind_perm in enumerate(resind_perms):
-            resind_perm_arr = np.asarray(resind_perm, dtype=np.intp)
-
-            res_subset_bb = vdg_bb[resind_perm_arr]
+            res_subset_bb = vdg_bb[np.asarray(resind_perm, dtype=np.intp)]
             res_subset_ca = res_subset_bb[:, 1, :]
 
             if subset_size == 1:
@@ -679,14 +288,13 @@ def _score_one_bsr_combo(pdbfile, struct, frag_name, query_frag, grouped_q_cg_pe
             if idxs.size == 0:
                 continue
 
-            vdg_perm_bb = res_subset_bb.reshape(-1, 3)
             if bb_rmsd_all[nr_idx, aa_perm_idx] > effective_rmsd:
                 continue
 
             Y_sub = Y[idxs]
 
             db_bb_and_cg = np.concatenate(
-                (vdg_perm_bb, vdg_cg), axis=0).astype(np.float32,
+                (res_subset_bb.reshape(-1, 3), vdg_cg), axis=0).astype(np.float32,
                                                      copy=False)
             if db_bb_and_cg.shape[0] != n_atoms:
                 continue
@@ -717,70 +325,50 @@ def _score_one_bsr_combo(pdbfile, struct, frag_name, query_frag, grouped_q_cg_pe
                     best_rmsd          = rmsd_loc
                     best_aa_perm_idx   = aa_perm_idx
                     best_q_site_idx    = int(meta[idxs[local_idx], 0])
-                    best_q_cg_perm_idx = int(meta[idxs[local_idx], 1])
+                    # Keep the labeling paired with the best fit; later candidates may lose.
+                    best_query         = (int(meta[idxs[local_idx], 1]), Y_sub[local_idx, N_bb:])
                     best_R             = R_cand
                     best_t             = t_one[0]
-                    R_bb_one, t_bb_one, _ = kabsch(vdg_perm_bb, bb_flat[None])
-                    best_R_bb          = R_bb_one[0]
-                    best_t_bb          = t_bb_one[0]
 
                     if best_rmsd <= EXCELLENT_MATCH_CUTOFF:
                         break
 
         if best_rmsd is not None:
-            struct_id = _struct_id_from_pdbfile(pdbfile)
-            R_rounded = np.round(best_R, 4)
-            t_rounded = np.round(best_t, 4)
+            # Joint rows: held out over the automorphisms of the joint fit's own site only.
+            same_site = np.flatnonzero(q_meta[:, 0] == best_q_site_idx)
+            R_bb, t_bb, held_out, k, placed = held_out_placement(
+                vdg_bb[perms_arr[best_aa_perm_idx]].reshape(1, N_bb, 3), vdg_cg[None],
+                bb_flat, q_cgs[same_site])
+            k = same_site[k]
+            if compact:
+                joint_hits.append((nr_idx, best_rmsd, np.sqrt(bb_ssd[nr_idx, best_aa_perm_idx] / N_bb),
+                                   held_out[0], q_lever[k[0]], placed[0], q_lig_idx[k[0]],
+                                   np.sqrt(np.mean(np.sum((vdg_cg @ best_R + best_t - best_query[1]) ** 2, axis=1)))))
+                continue
+            match_records.append(_hit_record(
+                common, bucket, nr_idx, "joint", best_rmsd, best_aa_perm_idx, best_q_site_idx,
+                best_query[0], grouped_q_cg_perms, best_R, best_t, R_bb[0], t_bb[0],
+                np.sqrt(bb_ssd[nr_idx, best_aa_perm_idx] / N_bb), held_out[0],
+                q_lever[k[0]]))
 
-            best_orig_mol_inds = grouped_q_cg_perms[best_q_site_idx][best_q_cg_perm_idx][-1]
-            q_atom_indices_str = ";".join(
-                str(i) for i in sorted(best_orig_mol_inds))
-
-            rec = dict(
-                pdbfile=pdbfile,
-                struct_id=struct_id,
-                lig_instance=lig_instance_label,
-                frag=frag_name,
-                query_frag=query_frag,
-                subset_size=subset_size,
-                bsr_combo=bsr_label_to_string(bsr_combo),
-                aa_bucket=aa_bucket,
-                charge_sign=str(bucket["charge_signs"][vdg_idx]),
-                vdg_index=int(bucket["partition_indices"][vdg_idx]),
-                vdg_cluster_id=clus_id,
-                vdg_cluster_num_parents=clus_num_parents,
-                vdg_rmsd=f"{best_rmsd:.4f}",
-                rmsd_threshold=f"{effective_rmsd:.4f}",
-                aa_perm_idx=int(best_aa_perm_idx),
-                q_site_idx=int(best_q_site_idx),
-                q_cg_perm_idx=int(best_q_cg_perm_idx),
-                q_atom_indices=q_atom_indices_str,)
-            rec.update({f"R{i}{j}": f"{R_rounded[i, j]:.4f}"
-                        for i in range(3) for j in range(3)})
-            rec.update({f"t{k}": f"{t_rounded[k]:.4f}" for k in range(3)})
-            Rbb_rounded = np.round(best_R_bb, 4)
-            tbb_rounded = np.round(best_t_bb, 4)
-            rec.update({f"Rbb{i}{j}": f"{Rbb_rounded[i, j]:.4f}"
-                        for i in range(3) for j in range(3)})
-            rec.update({f"tbb{k}": f"{tbb_rounded[k]:.4f}" for k in range(3)})
-
-            match_records.append(rec)
-
+    if compact and joint_hits:
+        cols = list(zip(*joint_hits))
+        match_records.append(_compact_record(common, bucket, "joint", np.asarray(cols[0], np.intp), *cols[1:7],
+                                             in_sample_cg_rmsd=np.asarray(cols[7], np.float32)))
     return match_records
 
 def _combo_worker(task):
     (pdbfile, pdb_path, frag_name, query_frag, grouped_q_cg_perms, combo_item,
-     vdg_lib_dir, rmsd_threshold, contact_cutoff, lig_instance_label) = task
-    struct = _combo_worker_struct(pdb_path)
-    bucket_cache = _worker_bucket_cache()
+     vdg_lib_dir, rmsd_threshold, contact_cutoff, lig_instance_label, match_mode, compact) = task
     local_buf = io.StringIO()
     with redirect_stdout(local_buf), redirect_stderr(local_buf), init_rdkit_logging(local_buf):
         try:
-            match_records = _score_one_bsr_combo(
-                pdbfile, struct, frag_name, query_frag, grouped_q_cg_perms,
-                combo_item, vdg_lib_dir, bucket_cache, {}, {},
-                rmsd_threshold, contact_cutoff, lig_instance_label)
-            return local_buf.getvalue(), match_records, None
+            # Scoring writes into the buffer; read it only after scoring returns.
+            records = _score_one_bsr_combo(
+                pdbfile, _combo_worker_struct(pdb_path), frag_name, query_frag, grouped_q_cg_perms,
+                combo_item, vdg_lib_dir, _worker_bucket_cache(), {}, rmsd_threshold,
+                contact_cutoff, lig_instance_label, match_mode, compact)
+            return local_buf.getvalue(), records, None
         except Exception:
             return local_buf.getvalue(), [], traceback.format_exc()
 
@@ -790,6 +378,8 @@ def _raise_if_combo_task_errors(errors, n_tasks):
             f"{len(errors)}/{n_tasks} combo tasks failed; first traceback:\n{errors[0]}")
 
 def _match_record_sort_key(rec):
+    if rec.get("compact"):  # one record per (frag, combo, bucket); fields are arrays
+        return rec["frag"], rec["bsr_combo"], rec["aa_bucket"]
     return (rec["frag"], rec["bsr_combo"], rec["aa_bucket"], rec["charge_sign"],
             rec["vdg_index"],
             rec["aa_perm_idx"], rec["q_site_idx"], rec["q_cg_perm_idx"])
@@ -797,10 +387,10 @@ def _match_record_sort_key(rec):
 def score_one_model(
     pdbfile, pdb_path, lig_smiles, vdg_lib_dir, rmsd_threshold=None,
     ref_lig_mol=None, print_bsr_selection=False, contact_cutoff=None,
-    vdg_lib_entries=None, deduplicate=True, min_shared_atoms=3, lig_instance_label='',
-    nprocs=1,):
+    vdg_lib_entries=None, lig_instance_label='',
+    nprocs=1, match_mode="joint", compact=False):
     if vdg_lib_entries is None:
-        vdg_lib_entries = set(os.listdir(vdg_lib_dir))
+        vdg_lib_entries = lib_entries(vdg_lib_dir)
 
     lig_rmsd_value = None
     match_records = []
@@ -816,7 +406,7 @@ def score_one_model(
                       else pr.parsePDB(pdb_path))
 
             try:
-                lig_mol_noH = Frags.get_query_ligand_mol(struct, lig_smiles)
+                lig_mol_noH = ligand_structure.get_query_ligand_mol(struct, lig_smiles)
             except (ValueError, TypeError) as e:
                 print(f"[WARNING] ({pdbfile}) Ligand extraction failed: {e}\n"
                       f"  Skipping this structure.", flush=True)
@@ -835,7 +425,7 @@ def score_one_model(
                 lig_rmsd_value = best_inplace_symmetry_rmsd(ref_lig_mol, lig_mol_noH)
 
             try:
-                _, ligname = Frags.identify_ligand_selection(struct, lig_smiles)
+                _, ligname = ligand_structure.identify_ligand_selection(struct, lig_smiles)
             except ValueError as e:
                 print(f"[ERROR] ({pdbfile}) {e}; if the structure has partial "
                       f"occupancies or multiple ligands, filter before running the "
@@ -853,7 +443,6 @@ def score_one_model(
             all_bsr_combos = dock.get_bsr_combinations(
                 struct, ligname, quiet=not print_bsr_selection, pdbfile=pdbfile)
 
-            bsr_atom_coords_cache = {}
             bb_blockers_cache = {}
 
             frag_q_cg_perms = {}
@@ -868,11 +457,10 @@ def score_one_model(
                         for sub, perm_inds, orig_mol_inds in site:
                             q_cg_coords = np.asarray(dock.get_query_cg_coords(
                                 sub, cg_order_smarts), np.float32)
-                            q_cg_com = cg_center(q_cg_coords)
                             q_acceptor = np.array(
-                                [a.GetSymbol() in ("N", "O", "S")
+                                [a.GetSymbol() in ACCEPTOR_ELEMENTS
                                  for a in sub.GetAtoms()], dtype=bool)
-                            perms.append((q_cg_coords, q_cg_com, q_acceptor,
+                            perms.append((q_cg_coords, cg_center(q_cg_coords), q_acceptor,
                                           perm_inds, orig_mol_inds))
                         if perms:
                             grouped_q_cg_perms.append(perms)
@@ -888,7 +476,8 @@ def score_one_model(
 
             tasks = [
                 (pdbfile, pdb_path, frag_name, query_frag, grouped_q_cg_perms, combo_item,
-                 vdg_lib_dir, rmsd_threshold, contact_cutoff, lig_instance_label)
+                 vdg_lib_dir, rmsd_threshold, contact_cutoff, lig_instance_label, match_mode,
+                 compact)
                 for frag_name, (query_frag, grouped_q_cg_perms) in frag_q_cg_perms.items()
                 for combo_item in all_bsr_combos]
 
@@ -908,13 +497,9 @@ def score_one_model(
                     for combo_item in all_bsr_combos:
                         match_records.extend(_score_one_bsr_combo(
                             pdbfile, struct, frag_name, query_frag, grouped_q_cg_perms,
-                            combo_item, vdg_lib_dir, bucket_cache, bsr_atom_coords_cache,
+                            combo_item, vdg_lib_dir, bucket_cache,
                             bb_blockers_cache, rmsd_threshold, contact_cutoff,
-                            lig_instance_label))
-
-        if deduplicate and match_records:
-            match_records = deduplicate_hits(match_records,
-                                             min_shared_atoms=min_shared_atoms)
+                            lig_instance_label, match_mode, compact))
 
         return buf.getvalue(), match_records, frags_in_lib, lig_rmsd_value, filtered_frags
 
@@ -931,7 +516,7 @@ def score_one_model_multi_instance(pdbfile, pdb_path, lig_smiles, vdg_lib_dir, *
     struct = (pr.parseCIF(pdb_path) if pdb_path.endswith((".cif", ".cif.gz"))
               else pr.parsePDB(pdb_path))
     try:
-        ligname, instances = Frags.classify_ligand_instances(struct, lig_smiles)
+        ligname, instances = ligand_structure.classify_ligand_instances(struct, lig_smiles)
     except ValueError:
         instances = []
     if len(instances) <= 1:
@@ -942,7 +527,7 @@ def score_one_model_multi_instance(pdbfile, pdb_path, lig_smiles, vdg_lib_dir, *
         with tempfile.NamedTemporaryFile(suffix='.pdb', delete=False) as tf:
             instance_path = tf.name
         try:
-            pr.writePDB(instance_path, Frags.select_struct_for_ligand_instance(
+            pr.writePDB(instance_path, ligand_structure.select_struct_for_ligand_instance(
                 struct, ligname, [r for r, _ in instances if r != resindex]))
             log_text, recs, this_frags_in_lib, _, this_filtered = score_one_model(
                 pdbfile, instance_path, lig_smiles, vdg_lib_dir,
@@ -958,11 +543,11 @@ def score_one_model_multi_instance(pdbfile, pdb_path, lig_smiles, vdg_lib_dir, *
 
 def process_work_item(args):
     (pdbfile, pdb_path, lig_smiles, vdg_lib_dir, rmsd_threshold, ref_lig_mol,
-     print_bsr_selection, contact_cutoff, deduplicate, min_shared_atoms) = args
-    vdg_lib_entries = _WORKER_MOL_CACHE_ENTRIES
+     print_bsr_selection, contact_cutoff, match_mode) = args
+    vdg_lib_entries = _matching._WORKER_MOL_CACHE_ENTRIES
 
     if vdg_lib_entries is None:
-        vdg_lib_entries = frozenset(os.listdir(vdg_lib_dir))
+        vdg_lib_entries = lib_entries(vdg_lib_dir)
         init_worker(vdg_lib_entries)
     try:
         log_text, match_records, frags_in_lib, lig_rmsd_value, _ = score_one_model_multi_instance(
@@ -970,7 +555,7 @@ def process_work_item(args):
             vdg_lib_dir=vdg_lib_dir, rmsd_threshold=rmsd_threshold,
             ref_lig_mol=ref_lig_mol, print_bsr_selection=print_bsr_selection,
             contact_cutoff=contact_cutoff, vdg_lib_entries=vdg_lib_entries,
-            deduplicate=deduplicate, min_shared_atoms=min_shared_atoms)
+            match_mode=match_mode)
         return pdbfile, log_text, lig_rmsd_value, match_records, frags_in_lib, None
     except Exception:
         error_text = (f"Worker failed for pdbfile={pdbfile}, pdb_path={pdb_path}\n"

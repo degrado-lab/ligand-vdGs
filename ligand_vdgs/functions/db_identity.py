@@ -8,8 +8,10 @@ compare this identity and treat the path as informational.
 
 The identity is a sha256 over the sorted ``(relative path, byte size)`` of every
 structure in the parent db, plus the structure count. That is one directory walk with a
-stat per file -- no file contents are read -- so it is cheap enough to compute on demand
-and is cached in ``<pdb_dir>/DB_IDENTITY``.
+stat per file -- no file contents are read -- so it is computed fresh on every call.
+``<pdb_dir>/DB_IDENTITY`` is a provenance stamp written by
+``scripts/remap_chain_ids.py``, never read back as the identity: a stamp goes stale
+when the database changes, and trusting it would pass every same-database check.
 
 Its limit, stated rather than implied: it detects added, removed, renamed and
 resized files, not an edit that leaves every size unchanged. It is a
@@ -26,7 +28,7 @@ IDENTITY_FILENAME = 'DB_IDENTITY'
 IDENTITY_VERSION = 1
 
 
-def compute_identity(pdb_dir):
+def identity_of(pdb_dir):
     '''{'sha256', 'n_structures', 'version'} from a walk of *pdb_dir*.
 
     Only the parent DB's structures count, so the DB_IDENTITY file itself, logs and
@@ -48,60 +50,22 @@ def identity_path(pdb_dir):
     return os.path.join(pdb_dir, IDENTITY_FILENAME)
 
 
-def read_identity(pdb_dir):
-    '''The cached record, or None if absent or unreadable.
-
-    Unreadable is treated as absent on purpose: a truncated or hand-edited file must
-    fall back to recomputing, not abort a build that was otherwise fine.
-    '''
-    path = identity_path(pdb_dir)
-    if not os.path.isfile(path):
-        return None
-    try:
-        with open(path) as handle:
-            record = json.load(handle)
-    except (ValueError, OSError):
-        return None
-    if record.get('version') != IDENTITY_VERSION or not record.get('sha256'):
-        return None
-    return record
-
-
 def write_identity(pdb_dir, source_dir=None, record=None):
-    '''Cache *record* (default: computed now) to <pdb_dir>/DB_IDENTITY. Returns it.
+    '''Stamp *record* (default: computed now) to <pdb_dir>/DB_IDENTITY. Returns it.
 
     *source_dir* is recorded for provenance only and is deliberately not part of the
     hash -- a copy of a database is the same database, so its identity must not depend
     on where it was produced.
     '''
-    record = dict(record or compute_identity(pdb_dir))
+    record = dict(record or identity_of(pdb_dir))
     record['written'] = time.strftime('%Y-%m-%dT%H:%M:%S')
     if source_dir:
         record['repaired_from'] = os.path.abspath(source_dir)
     final = identity_path(pdb_dir)
     tmp = final + '.tmp'
-    # tmp + rename, like the library provenance: a crash mid-dump would otherwise leave
-    # JSON that read_identity has to discard, silently costing a full walk every run.
+    # tmp + rename, like the library provenance: a crash mid-dump leaves no truncated stamp.
     with open(tmp, 'w') as handle:
         json.dump(record, handle, indent=2, sort_keys=True)
         handle.write('\n')
     os.replace(tmp, final)
-    return record
-
-
-def identity_of(pdb_dir, cache=True):
-    '''The cached identity if there is one, else compute it and try to cache it.
-
-    Caching is best effort: a read-only db (a shared database another group owns)
-    must still be usable, so a failed write is not an error.
-    '''
-    record = read_identity(pdb_dir)
-    if record is not None:
-        return record
-    record = compute_identity(pdb_dir)
-    if cache:
-        try:
-            record = write_identity(pdb_dir, record=record)
-        except OSError:
-            pass
     return record

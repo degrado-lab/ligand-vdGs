@@ -6,82 +6,54 @@ positions from crystal structures.
 
 Outputs (in --outdir)
 ---------------------
-hits.tsv       one row per vdG hit (all hits within --search-threshold)
-fragments.tsv  one row per fragment per structure
+hits.tsv       joint mode only: one row per vdG hit
+hits.npz       every hit, both modes; pinned contract in NPZ_FIELDS (plan_W4.md). One file per
+               structure: --outdir/hits.npz, or --outdir/<name>/hits.npz with --yaml.
+fragments.tsv  one row per fragment per structure per subset_scope (all, 1, 2)
 
 hits.tsv columns
-    structure, fragment, cg_rmsd, held_out_cg_rmsd, vdg_rmsd, bsr_combo,
-    aa_bucket, charge_sign, subset_size, vdg_cluster_id, vdg_cluster_num_parents, vdg_index
+    structure, fragment, match_mode, cg_rmsd, held_out_cg_rmsd, bb_rmsd, cg_bb_dist, vdg_rmsd,
+    bsr_combo, aa_bucket, charge_sign, subset_size, vdg_cluster_id, vdg_cluster_num_parents,
+    vdg_index
 
 fragments.tsv columns
-    structure, fragment, in_library, n_hits, best_cg_rmsd,
-    best_held_out_cg_rmsd, best_vdg_rmsd
+    structure, fragment, match_mode, subset_scope, in_library, n_hits, and for each selection
+    rule in (oracle, top_bb, top_support): <rule>_held_out_cg_rmsd, <rule>_cg_bb_dist,
+    <rule>_bb_rmsd, <rule>_cluster_num_parents
 
-WHAT THIS FILE DOES NOT MEASURE
--------------------------------
-Do not report a "recovery rate" from these outputs. Two separate circularities:
+Quantities (hit finder, DR-36)
+------------------------------
+- `held_out_cg_rmsd`: vdG CG placed by the backbone-only fit (N/CA/C), RMSD (/N_cg) to the
+  nearest crystal CG labeling (`bb` rows: every site x CG automorphism; `joint` rows: the
+  automorphisms of the joint fit's `q_site_idx`). The CG never enters the fit.
+- `cg_rmsd`: CG-only residual of the joint bb+CG fit -- IN-SAMPLE, bounded by
+  `vdg_rmsd * sqrt(n_atoms / N_cg)`. Reference only.
+- `cg_bb_dist`: lever arm, mean CG-atom distance to the nearest BSR N/CA/C. Held-out error is
+  expected to grow with it.
+- Selection rules per fragment: `oracle` = min held_out over hits (picks by the truth; an upper
+  bound on recovery), `top_bb` = min bb_rmsd, `top_support` = max vdg_cluster_num_parents
+  (ties -> min bb_rmsd). Only the last two are deployable predictions.
 
-1. `cg_rmsd` is IN-SAMPLE. `score_one_model` fits R/t over backbone + query CG
-   jointly, so the crystal CG is part of the target the transform was fitted to.
-   `cg_rmsd` is that fit's CG-only residual, bounded by construction at
-   `vdg_rmsd * sqrt(n_atoms / N_cg)` -- NOT by `vdg_rmsd` itself, since
-   `vdg_rmsd` normalizes the joint residual by n_atoms = N_bb + N_cg while
-   `cg_rmsd` normalizes by N_cg alone. So `cg_rmsd` exceeding `vdg_rmsd`
-   (or the search threshold) is expected, not evidence of a leak.
-   `held_out_cg_rmsd` removes this circularity: it applies the BACKBONE-ONLY
-   transform (Rbb/tbb), so the CG never enters the objective.
-
-2. SELECTION is still CG-dependent, and `held_out_cg_rmsd` does NOT fix it. A
-   vdG becomes a hit only if its joint backbone+CG RMSD clears the threshold, so
-   the hit pool was chosen for agreeing with the crystal CG. A min over hits
-   therefore answers "among library vdGs already known to match the crystal CG,
-   how well does the best one match it" -- not "can the library place this CG".
-   An honest recovery number needs a search that never sees the query CG; that
-   does not exist yet (see DR-17).
-
-So: `held_out_cg_rmsd` is CG placement error under backbone-only alignment,
-among CG-selected hits. It does not stand in for a recovery number in EITHER
-direction.
-
-Name the quantity, not just the direction: in RMSD this column is >= an oracle's,
-which in RECOVERY-RATE terms makes it a lower bound. Same fact, opposite words --
-that inversion has already caused one wrong claim.
-
-The subset argument, stated with the threshold it actually holds at. Search
-thresholds a joint RMSD normalized by n_atoms = N_bb + N_cg (hit_finder_core
-:865, :1048), while a backbone-only search would normalize by N_bb. So a
-joint pass at tau gives
-
-    SSD_bb^bbfit <= SSD_bb^joint <= n_atoms * tau^2
-    =>  RMSD_bb^bbfit <= tau * sqrt(n_atoms / N_bb)
-
-i.e. the joint-selected pool is a subset of what a backbone-only search returns
-only at the RELAXED threshold tau * sqrt(n_atoms/N_bb), not at tau itself. That
-factor is ~1.4-1.7 at subset_size 1 (3-4 backbone atoms against a 4-5 atom CG),
-so it is not negligible. Do not quote the subset claim without the threshold.
-
-Against a deployable top-k-by-support prediction it is bounded in no proven
-direction at all.
+Match mode (`--match-mode`)
+---------------------------
+- `joint`: bb+CG RMSD <= tau. The hit pool is selected for agreeing with the crystal CG, so
+  held-out error over it is not a recovery number.
+- `bb` (placement): sqrt(SSD_bb / n_atoms) <= tau, i.e. bb_rmsd <= tau * sqrt(n_atoms / N_bb),
+  reading neither the query CG nor side chains (the backbone-slot gate is a virtual-CB clash + Pro N
+  check on the placed CG); joint hits are a subset at equal tau. SITE-KNOWN: BSR combos are every
+  subset of residues with any atom within 4.5 A of the whole crystal ligand
+  (dock_utils.get_bsr_combinations; the current BSR definition, like a ligand-defined docking box),
+  not the CG's own contacts; no per-CG contact filter.
+- tau defaults to the hit finder's derived `normalize_rmsd(n_atoms, 'cgvdmbb')`.
 
 Downstream analysis (pandas):
 
     import pandas as pd
-    hits  = pd.read_csv("hits.tsv",      sep="\\t")
     frags = pd.read_csv("fragments.tsv", sep="\\t")
-
-    # Fit quality (NOT recovery): CDF of vdg_rmsd, the joint bb+CG residual.
-    import matplotlib.pyplot as plt
-    vq = hits["vdg_rmsd"].sort_values()
-    plt.plot(vq.values, np.linspace(0, 1, len(vq)))
-    plt.xlabel("vdg_rmsd (Å) -- fit quality, not recovery")
-    plt.ylabel("fraction"); plt.show()
-
-    # CG placement error under bb-only alignment, among CG-selected hits.
-    # Label any figure from this with that whole phrase; it is not recovery.
-    ho = pd.to_numeric(frags[frags["in_library"]]["best_held_out_cg_rmsd"],
-                       errors="coerce").dropna().sort_values()
-    plt.plot(ho.values, np.linspace(0, 1, len(ho)))
-    plt.xlabel("best held_out_cg_rmsd (Å)"); plt.ylabel("fraction"); plt.show()
+    f = frags[frags["in_library"] & (frags["n_hits"] > 0) & (frags["subset_scope"] == "2")]
+    for rule in ("oracle", "top_bb", "top_support"):
+        ho = pd.to_numeric(f[f"{rule}_held_out_cg_rmsd"])
+        print(rule, [(c, float((ho <= c).mean())) for c in (1.0, 1.5, 2.0)])
 
 Usage
 -----
@@ -101,7 +73,7 @@ YAML format:
         smiles: "CC(=O)Nc1ccc(cc1)O"
         name: my_structure          # optional
     vdg_lib_dir: /path/to/frag_lib
-    search_threshold: 2.0           # optional; Å (default 2.0)
+    search_threshold: 1.0           # optional; Å (default: derived per fragment)
 """
 
 import argparse
@@ -111,266 +83,119 @@ import yaml
 from pathlib import Path
 
 import numpy as np
+import prody
+from scipy.spatial import cKDTree
 
-from ligand_vdgs.functions import dock_utils as dock
-from ligand_vdgs.functions import vdg_npz_utils as vdg_npz
-from ligand_vdgs.score_poses.hit_finder_core import (
-    cg_atom_order_smarts,
-    init_worker,
-    score_one_model_multi_instance,
-)
+from ligand_vdgs.functions.vdg_struct_utils import receptor_bb_vcb_coords
+from ligand_vdgs.score_poses.hit_finder_core import MATCH_MODES, init_worker, lib_entries, score_one_model_multi_instance
 
+def _fmt(x): return "NA" if x is None else f"{x:.4f}"
 
-def _reconstruct_R_t(rec, prefix=""):
-    """prefix="" -> joint bb+CG fit; prefix="bb" -> backbone-only fit."""
-    R = np.array([[float(rec[f"R{prefix}{i}{j}"]) for j in range(3)] for i in range(3)],
-                 dtype=np.float32)
-    t = np.array([float(rec[f"t{prefix}{k}"]) for k in range(3)], dtype=np.float32)
-    return R, t
+# Pinned hits.npz contract (private/project_planning/plan_W4.md; W4 consumes it). nr_idx indexes the
+# (frag, subset_size, charge_sign, aa_bucket) bucket. vdg_rmsd is NaN in bb mode: that fit reads the
+# crystal CG. placed_cg: vdG CG placed by the bb-only fit, atoms in the library's stored CG order;
+# q_lig_atom_idx[j]: atom of ligand instance `lig_instance` (H-free mol from
+# ligand_structure.get_query_ligand_mol) matched to placed atom j under the automorphism chosen by
+# the crystal CG (evaluation only). placed_cg_element: library CG elements. min_bb_dist: min over placed
+# atoms of the distance to the nearest receptor N/CA/C/O or virtual CB (no side chains).
+NPZ_FIELDS = ("frag", "subset_size", "match_mode", "charge_sign", "aa_bucket", "nr_idx", "bb_rmsd",
+              "vdg_rmsd", "held_out_cg_rmsd", "cg_bb_dist", "cluster_num_parents", "nr_parent_biounit",
+              "lig_instance", "min_bb_dist", "placed_cg", "q_lig_atom_idx", "placed_cg_element")
+_PADDED = dict(placed_cg=(np.nan, np.float32), q_lig_atom_idx=(-1, np.int32), placed_cg_element=("", "U2"))
+RULES = ("oracle", "top_bb", "top_support")
+SCOPES = ("all", "1", "2")
 
+def _hit_arrays(records, receptor_tree):
+    """frag -> dict of per-hit NPZ_FIELDS arrays, from compact records. receptor_tree: cKDTree over
+    vdg_struct_utils.receptor_bb_vcb_coords."""
+    out = {}
+    for rec in records:
+        (n, m, _), bb = rec["placed_cg"].shape, rec["match_mode"] == "bb"
+        cols = dict(frag=np.full(n, rec["frag"]), subset_size=np.full(n, int(rec["subset_size"]), np.int8),
+                    match_mode=np.full(n, rec["match_mode"]), charge_sign=np.asarray(rec["charge_sign"], str),
+                    aa_bucket=np.full(n, rec["aa_bucket"]), nr_idx=np.asarray(rec["vdg_index"], np.int32),
+                    bb_rmsd=rec["bb_rmsd"], vdg_rmsd=np.full(n, np.nan, np.float32) if bb else rec["vdg_rmsd"],
+                    held_out_cg_rmsd=rec["held_out_cg_rmsd"], cg_bb_dist=rec["cg_bb_dist"],
+                    cluster_num_parents=np.asarray(rec["vdg_cluster_num_parents"], np.int32),
+                    nr_parent_biounit=np.asarray(rec["nr_parent_biounit"], str),
+                    lig_instance=np.full(n, rec["lig_instance"]),
+                    min_bb_dist=receptor_tree.query(rec["placed_cg"].reshape(-1, 3))[0].reshape(n, m).min(
+                        axis=1, initial=np.inf).astype(np.float32),
+                    placed_cg=rec["placed_cg"], q_lig_atom_idx=rec["q_lig_atom_idx"],
+                    placed_cg_element=np.asarray(rec["placed_cg_element"], "U2"))
+        d = out.setdefault(rec["frag"], {k: [] for k in NPZ_FIELDS})
+        for k, v in cols.items(): d[k].append(v)
+    return {f: {k: np.concatenate(v) for k, v in d.items()} for f, d in out.items()}
 
-def _build_crystal_cg_cache(filtered_frags, vdg_lib_dir):
-    """
-    Return crystal CG coords keyed by (db_name, site_idx, perm_idx).
+def write_hits_npz(path, arrays):
+    """One row per hit (NPZ_FIELDS); per-atom fields padded to max_N_cg (`_PADDED`: placed_cg NaN,
+    q_lig_atom_idx -1, placed_cg_element ''). Zero hits -> empty arrays."""
+    hs = list(arrays.values())
+    n, m = sum(len(h["bb_rmsd"]) for h in hs), max((h["placed_cg"].shape[1] for h in hs), default=0)
+    padded = {k: np.full((n, m, 3) if k == "placed_cg" else (n, m), fill, dt) for k, (fill, dt) in _PADDED.items()}
+    i = 0
+    for h in hs:
+        j, c = len(h["bb_rmsd"]), h["placed_cg"].shape[1]
+        for k in _PADDED: padded[k][i:i + j, :c] = h[k]
+        i += j
+    empty = dict(subset_size=np.int8, nr_idx=np.int32, cluster_num_parents=np.int32)
+    cols = {k: np.concatenate([h[k] for h in hs]) if hs else
+            np.zeros(0, empty.get(k, np.float32 if k.endswith(("rmsd", "dist")) else "U1"))
+            for k in NPZ_FIELDS if k not in _PADDED}
+    np.savez_compressed(path, **cols, **padded)
 
-    Takes the post-mapped filtered_frags from score_one_model to ensure site_idx
-    and perm_idx align with hit records (q_site_idx / q_cg_perm_idx). This avoids
-    redundant PDB parsing, fragmentation, and library mapping.
-    """
-    cache = {}
-    for db_name, grouped_sites in filtered_frags.items():
-        # The mols were reordered to the library's recorded CG atom order, which
-        # is not necessarily the library directory name.
-        order_smarts = cg_atom_order_smarts(vdg_lib_dir, db_name)
-        cache[db_name] = {}
-        for site_idx, site in enumerate(grouped_sites):
-            cache[db_name][site_idx] = {}
-            for perm_idx, (sub_mol, _perm_inds, _orig_mol_inds) in enumerate(site):
-                try:
-                    cache[db_name][site_idx][perm_idx] = np.asarray(
-                        dock.get_query_cg_coords(sub_mol, order_smarts), np.float32)
-                except Exception as e:
-                    print(f"  [WARNING] CG coords unavailable for {db_name} "
-                          f"site {site_idx} perm {perm_idx}: {e}")
-    return cache
-
-
-def compute_cg_placement_rmsd(hit_rec, crystal_cg_cache, vdg_lib_dir, bucket_cache):
-    """
-    Apply the hit's R/t to the library CG and return RMSD vs the crystal CG (Å).
-
-    Caveat: the crystal CG coords are part of the target that R/t were fitted to
-    (score_one_model aligns backbone + query CG jointly), so this is the CG-only
-    residual of that fit, not an independent measurement of pose recovery.
-    It is bounded by vdg_rmsd * sqrt(n_atoms / N_cg), NOT by vdg_rmsd itself:
-    the normalizers differ (n_atoms = N_bb + N_cg vs N_cg alone).
-    Use `compute_held_out_cg_rmsd` instead; this
-    value is kept only as the in-sample reference, and is scored at the stored
-    `q_cg_perm_idx` so it is not pointwise comparable to the held-out one.
-    """
-    frag      = hit_rec["frag"]
-    subset    = int(hit_rec["subset_size"])
-    aa_bucket = hit_rec["aa_bucket"]
-    vdg_idx   = int(hit_rec["vdg_index"])
-    site_idx  = int(hit_rec["q_site_idx"])
-    perm_idx  = int(hit_rec["q_cg_perm_idx"])
-
-    charge_sign = hit_rec["charge_sign"]
-    bucket_key = (frag, subset, charge_sign, aa_bucket)
-    if bucket_key not in bucket_cache:
-        bucket_cache[bucket_key] = vdg_npz.load_vdg_bucket(
-            vdg_lib_dir, frag, subset, charge_sign, aa_bucket)
-    bucket = bucket_cache[bucket_key]
-    if bucket is None or vdg_idx >= bucket["cg"].shape[0]:
-        return None
-
-    lib_cg     = bucket["cg"][vdg_idx].astype(np.float32)
-    crystal_cg = crystal_cg_cache.get(frag, {}).get(site_idx, {}).get(perm_idx)
-    if crystal_cg is None or lib_cg.shape != crystal_cg.shape:
-        return None
-
-    R, t = _reconstruct_R_t(hit_rec)
-    diff = lib_cg @ R + t - crystal_cg
-    return float(np.sqrt(np.mean(np.sum(diff * diff, axis=1))))
-
-
-# Rounding an exact proper rotation to 4dp reaches |det-1| ~ 1.8e-4 and
-# ortho_err ~ 1.6e-4 by itself; these bounds are that envelope, not a quality bar.
-_ROT_DET_TOL, _ROT_ORTHO_TOL = 3e-4, 3e-4
-
-def _is_proper_rotation(R):
-    return (abs(float(np.linalg.det(R)) - 1.0) <= _ROT_DET_TOL
-            and float(np.max(np.abs(R.T @ R - np.eye(3)))) <= _ROT_ORTHO_TOL)
-
-
-def _load_hit_bucket(hit_rec, vdg_lib_dir, bucket_cache):
-    """Return the hit's library CG coords, or None if the bucket is unavailable."""
-    frag = hit_rec["frag"]
-    key = (frag, int(hit_rec["subset_size"]), hit_rec["charge_sign"],
-           hit_rec["aa_bucket"])
-    if key not in bucket_cache:
-        bucket_cache[key] = vdg_npz.load_vdg_bucket(
-            vdg_lib_dir, frag, key[1], key[2], key[3])
-    bucket = bucket_cache[key]
-    vdg_idx = int(hit_rec["vdg_index"])
-    if bucket is None or vdg_idx >= bucket["cg"].shape[0]: return None
-    return bucket["cg"][vdg_idx].astype(np.float32)
-
-
-def compute_held_out_cg_rmsd(hit_rec, crystal_cg_cache, vdg_lib_dir, bucket_cache):
-    """
-    CG placement error (Å) with the CG HELD OUT of the superposition.
-
-    Applies the hit's BACKBONE-ONLY transform (Rbb/tbb from score_one_model) to
-    the library CG and scores it against the crystal CG. Because the CG never
-    enters the Kabsch objective, this is a prediction error rather than the
-    in-sample residual `compute_cg_placement_rmsd` returns.
-
-    Minimizes over every CG permutation recorded for the hit's site -- that set
-    is the CG automorphism group, so a symmetric CG (nitro, carboxylate,
-    tetrazole) is not charged for a relabeling. The hit's own `q_cg_perm_idx` is
-    deliberately NOT used: the joint fit chose that perm with the crystal CG in
-    the objective, so reusing it would leak the held-out quantity back in.
-
-    Only the SUPERPOSITION is held out. The correspondence it is applied to --
-    aa_perm_idx (library slot <-> query residue), vdg_idx, q_site_idx -- was
-    still chosen by the joint fit, with the crystal CG in the objective. A
-    residual leak, not addressed here.
-
-    NOT pointwise comparable to `cg_rmsd`. At a FIXED correspondence the joint
-    fit minimizes SSD_bb + SSD_cg while this one minimizes SSD_bb alone, so
-    SSD_cg(joint) <= SSD_cg(bb-only) always. That ordering is only guaranteed at
-    the same perm: `cg_rmsd` is scored at the stored `q_cg_perm_idx` while this
-    minimizes over the automorphism group, so this value can land BELOW
-    `cg_rmsd` on a symmetric CG. That is the comparison being ill-posed, not a
-    bug. Compare the two only at a fixed perm, or min over perms on both sides.
-
-    NOT a recovery metric: the hit pool itself was selected on joint bb+CG RMSD.
-    See the "WHAT THIS FILE DOES NOT MEASURE" section of the module docstring.
-    """
-    if "Rbb00" not in hit_rec: return None
-    lib_cg = _load_hit_bucket(hit_rec, vdg_lib_dir, bucket_cache)
-    if lib_cg is None: return None
-
-    site_perms = crystal_cg_cache.get(hit_rec["frag"], {}).get(int(hit_rec["q_site_idx"]))
-    if not site_perms: return None
-
-    R, t = _reconstruct_R_t(hit_rec, prefix="bb")
-    # _is_proper_rotation only catches a corrupted/malformed R (bad det or
-    # non-orthogonal) -- e.g. TSV read/write corruption. It CANNOT catch a
-    # genuinely rank-deficient backbone fit (collinear or near-collinear
-    # points): utils.kabsch's reflection correction (_proper_kabsch_rotations)
-    # always returns a proper, orthogonal rotation by construction, even when
-    # the fit is non-unique, so a degenerate fit passes this guard silently.
-    # Tolerance is the 4-decimal STORAGE rounding envelope: rounding an exact
-    # proper rotation to 4dp reaches |det-1| ~ 1.8e-4 on its own (measured over
-    # 20k random rotations), so a tighter bound would reject valid fits.
-    if not _is_proper_rotation(R): return None
-    placed = lib_cg @ R + t
-    best = None
-    for crystal_cg in site_perms.values():
-        if crystal_cg is None or crystal_cg.shape != placed.shape: continue
-        diff = placed - crystal_cg
-        rmsd = float(np.sqrt(np.mean(np.sum(diff * diff, axis=1))))
-        if best is None or rmsd < best: best = rmsd
-    return best
-
+def _select(h):
+    """Index per rule. Oracle picks by the truth; top_bb (ties: more support) and top_support
+    (ties: lower bb_rmsd) are CG-free."""
+    return dict(oracle=int(np.argmin(h["held_out_cg_rmsd"])),
+                top_bb=int(np.lexsort((-h["cluster_num_parents"], h["bb_rmsd"]))[0]),
+                top_support=int(np.lexsort((h["bb_rmsd"], -h["cluster_num_parents"]))[0]))
 
 def analyze_structure(pdb_path, lig_smiles, name, vdg_lib_dir, vdg_lib_entries,
-                      search_threshold):
-    """Run hit-finding and return (hit_rows, fragment_rows)."""
+                      search_threshold, match_mode="joint"):
+    """Run hit-finding (metrics range over every hit). Returns (hit_rows,
+    fragment_rows, hit_arrays); hit_rows only in joint mode (placement hit counts reach 1e7)."""
     print(f"\n{'='*60}")
-    print(f"Structure: {name}  PDB: {pdb_path}  SMILES: {lig_smiles}")
+    print(f"Structure: {name}  PDB: {pdb_path}  SMILES: {lig_smiles}  match_mode={match_mode}")
     print(f"{'='*60}")
-
-    log_text, match_records, frags_in_lib, _, filtered_frags = score_one_model_multi_instance(
-        pdbfile=os.path.basename(pdb_path),
-        pdb_path=pdb_path,
-        lig_smiles=lig_smiles,
-        vdg_lib_dir=vdg_lib_dir,
-        rmsd_threshold=search_threshold,
-        vdg_lib_entries=vdg_lib_entries,
-        deduplicate=True,
-    )
+    log_text, match_records, frags_in_lib, _, _ = score_one_model_multi_instance(
+        pdbfile=os.path.basename(pdb_path), pdb_path=pdb_path, lig_smiles=lig_smiles,
+        vdg_lib_dir=vdg_lib_dir, rmsd_threshold=search_threshold,
+        vdg_lib_entries=vdg_lib_entries, match_mode=match_mode, compact=True)
     if log_text.strip():
         print(log_text)
-
-    try:
-        crystal_cg_cache = _build_crystal_cg_cache(filtered_frags, vdg_lib_dir)
-    except Exception as e:
-        print(f"  [WARNING] Could not extract crystal CG coords: {e}")
-        crystal_cg_cache = {}
-
-    bucket_cache = {}
-    hits_with_rmsd = [
-        (rec,
-         compute_cg_placement_rmsd(rec, crystal_cg_cache, vdg_lib_dir, bucket_cache),
-         compute_held_out_cg_rmsd(rec, crystal_cg_cache, vdg_lib_dir, bucket_cache))
-        for rec in match_records
-    ]
-
-    hit_rows = [
-        dict(
-            structure=name,
-            fragment=rec["frag"],
-            cg_rmsd=f"{cg_rmsd:.4f}" if cg_rmsd is not None else "NA",
-            held_out_cg_rmsd=f"{ho:.4f}" if ho is not None else "NA",
-            vdg_rmsd=f"{float(rec['vdg_rmsd']):.4f}",
-            bsr_combo=rec["bsr_combo"],
-            aa_bucket=rec["aa_bucket"],
-            charge_sign=rec["charge_sign"],
-            subset_size=rec["subset_size"],
-            vdg_cluster_id=rec["vdg_cluster_id"],
-            vdg_cluster_num_parents=rec["vdg_cluster_num_parents"],
-            vdg_index=rec["vdg_index"],
-        )
-        for rec, cg_rmsd, ho in hits_with_rmsd
-    ]
-
-    frag_hits = {}
-    for rec, cg_rmsd, ho in hits_with_rmsd:
-        frag_hits.setdefault(rec["frag"], []).append((rec, cg_rmsd, ho))
-
+    hit_rows = [dict(structure=name, fragment=rec["frag"], match_mode="joint", cg_rmsd=f"{c:.4f}",
+                     held_out_cg_rmsd=f"{h:.4f}", bb_rmsd=f"{b:.4f}", cg_bb_dist=f"{lv:.4f}",
+                     vdg_rmsd=f"{v:.4f}", bsr_combo=rec["bsr_combo"], aa_bucket=rec["aa_bucket"],
+                     charge_sign=s, subset_size=rec["subset_size"], vdg_cluster_id=int(ci),
+                     vdg_cluster_num_parents=int(npar), vdg_index=int(vi))
+                for rec in match_records if rec["match_mode"] == "joint"
+                for c, h, b, lv, v, s, ci, npar, vi in zip(
+                    rec["in_sample_cg_rmsd"], rec["held_out_cg_rmsd"], rec["bb_rmsd"], rec["cg_bb_dist"],
+                    rec["vdg_rmsd"], rec["charge_sign"], rec["vdg_cluster_id"],
+                    rec["vdg_cluster_num_parents"], rec["vdg_index"])]
+    arrays = _hit_arrays(match_records, cKDTree(receptor_bb_vcb_coords(prody.parsePDB(pdb_path))))
     fragment_rows = []
     for frag_smiles, in_lib in frags_in_lib.items():
-        frag_hit_pairs = frag_hits.get(frag_smiles, [])
-        n_hits = len(frag_hit_pairs)
-        if frag_hit_pairs:
-            best_vdg = min(float(rec["vdg_rmsd"]) for rec, _, _ in frag_hit_pairs)
-            cg_values = [cg for _, cg, _ in frag_hit_pairs if cg is not None]
-            ho_values = [ho for _, _, ho in frag_hit_pairs if ho is not None]
-            best_cg = min(cg_values) if cg_values else None
-            best_ho = min(ho_values) if ho_values else None
-        else:
-            best_vdg = None
-            best_cg  = None
-            best_ho  = None
-
-        fragment_rows.append(dict(
-            structure=name,
-            fragment=frag_smiles,
-            in_library=in_lib,
-            n_hits=n_hits,
-            best_cg_rmsd=f"{best_cg:.4f}" if best_cg is not None else "NA",
-            best_held_out_cg_rmsd=f"{best_ho:.4f}" if best_ho is not None else "NA",
-            best_vdg_rmsd=f"{best_vdg:.4f}" if best_vdg is not None else "NA",
-        ))
-
-        if not in_lib:
-            status = "NOT-IN-LIB"
-        elif n_hits == 0:
-            status = "NO-HIT"
-        elif best_ho is not None:
-            # Held-out is the honest per-fragment number; cg= is in-sample.
-            status = f"held-out cg={best_ho:.3f}Å"
-        elif best_cg is not None:
-            status = f"cg(in-sample)={best_cg:.3f}Å"
-        else:
-            status = f"vdg={best_vdg:.3f}Å"
-        print(f"  {frag_smiles:35s}  {status}  n_hits={n_hits}")
-
-    return hit_rows, fragment_rows
-
+        h_all = arrays.get(frag_smiles)
+        for scope in SCOPES:
+            h = (None if h_all is None else h_all if scope == "all" else
+                 {k: v[h_all["subset_size"] == int(scope)] for k, v in h_all.items()})
+            n = 0 if h is None else len(h["bb_rmsd"])
+            row = dict(structure=name, fragment=frag_smiles, match_mode=match_mode,
+                       subset_scope=scope, in_library=in_lib, n_hits=n)
+            picks = _select(h) if n else {}
+            for rule in RULES:
+                i = picks.get(rule)
+                row.update({f"{rule}_{k}": "NA" if i is None else
+                            (int(h[k][i]) if k == "cluster_num_parents" else f"{h[k][i]:.4f}")
+                            for k in ("held_out_cg_rmsd", "cg_bb_dist", "bb_rmsd", "cluster_num_parents")})
+            fragment_rows.append(row)
+            if scope == "all":
+                status = ("NOT-IN-LIB" if not in_lib else "NO-HIT" if not n else
+                          " ".join(f"{r}={row[f'{r}_held_out_cg_rmsd']}Å" for r in RULES))
+                print(f"  {frag_smiles:35s}  {status}  n_hits={n}")
+    return hit_rows, fragment_rows, arrays
 
 def main():
     parser = argparse.ArgumentParser(
@@ -384,8 +209,12 @@ def main():
     parser.add_argument("--name")
     parser.add_argument("--vdg-lib-dir", dest="vdg_lib_dir")
     parser.add_argument("--outdir", required=True)
-    parser.add_argument("--search-threshold", type=float, default=2.0,
-                        dest="search_threshold", metavar="Å")
+    parser.add_argument("--search-threshold", type=float, default=None,
+                        dest="search_threshold", metavar="Å",
+                        help="tau (Å); default: derived per fragment via normalize_rmsd, as in "
+                             "the hit finder.")
+    parser.add_argument("--match-mode", choices=MATCH_MODES, default="joint",
+                        help="joint (bb+CG) or bb (DR-36 placement mode).")
     args = parser.parse_args()
 
     if args.yaml:
@@ -398,7 +227,7 @@ def main():
                 parser.error(f"{args.yaml} is missing required key: {key}")
         structures       = cfg["structures"]
         vdg_lib_dir      = cfg["vdg_lib_dir"]
-        search_threshold = cfg.get("search_threshold", 2.0)
+        search_threshold = cfg.get("search_threshold")
     else:
         if not (args.pdb and args.smiles and args.vdg_lib_dir):
             parser.error("--pdb, --smiles, and --vdg-lib-dir are required without --yaml")
@@ -411,7 +240,7 @@ def main():
         parser.error(f"vdg_lib_dir not found: {vdg_lib_dir}")
 
     os.makedirs(args.outdir, exist_ok=True)
-    vdg_lib_entries = set(os.listdir(vdg_lib_dir))
+    vdg_lib_entries = lib_entries(vdg_lib_dir)
     # Eagerly populate the module-level mol cache. Direct core-library calls can
     # initialize it lazily, but doing it once here avoids work during analysis.
     init_worker(vdg_lib_entries)
@@ -420,16 +249,22 @@ def main():
     all_fragment_rows = []
 
     for struct_cfg in structures:
-        hit_rows, fragment_rows = analyze_structure(
+        hit_rows, fragment_rows, arrays = analyze_structure(
             pdb_path         = struct_cfg["pdb"],
             lig_smiles       = struct_cfg["smiles"],
             name             = struct_cfg.get("name", Path(struct_cfg["pdb"]).stem),
             vdg_lib_dir      = vdg_lib_dir,
             vdg_lib_entries  = vdg_lib_entries,
             search_threshold = search_threshold,
+            match_mode        = args.match_mode,
         )
         all_hit_rows.extend(hit_rows)
         all_fragment_rows.extend(fragment_rows)
+        name = struct_cfg.get("name", Path(struct_cfg["pdb"]).stem)
+        npz_dir = args.outdir if len(structures) == 1 else os.path.join(args.outdir, name)
+        os.makedirs(npz_dir, exist_ok=True)
+        write_hits_npz(os.path.join(npz_dir, "hits.npz"), arrays)
+        del arrays
 
     def _write_tsv(rows, path):
         if not rows:
@@ -446,6 +281,7 @@ def main():
         print("  No fragments analysed; fragments.tsv not written.")
     _write_tsv(all_hit_rows,      os.path.join(args.outdir, "hits.tsv"))
     _write_tsv(all_fragment_rows, os.path.join(args.outdir, "fragments.tsv"))
+    print("VERDICT benchmark_pose_recovery complete", flush=True)
 
 
 if __name__ == "__main__":

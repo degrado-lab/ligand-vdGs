@@ -162,7 +162,7 @@ class SidechainDefaultTests(unittest.TestCase):
     """The CLI writes sidechains unless told not to; the npz builder does not."""
 
     def _args(self, *extra):
-        argv = ["materialize_vdg_pdbs.py", "-c", "x/nr_vdgs", "-o", "out", *extra]
+        argv = ["materialize_vdg_pdbs.py", "-c", "x", "-o", "out", *extra]
         with mock.patch.object(sys, "argv", argv):
             return mat.parse_args()
 

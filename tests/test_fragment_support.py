@@ -1,4 +1,4 @@
-"""The ratified support definition (DR-5), tested on its two falsifiers.
+"""The ratified support definition, tested on its two falsifiers.
 
     support(f) = |{ biounit b : some ligand instance in b has a match of f with
                     every atom of m observed }|

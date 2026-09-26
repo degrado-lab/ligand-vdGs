@@ -61,7 +61,7 @@ python ligand_vdgs/generate_vdgs/fragment_database_ligs.py \
 
 ## 3. Select and generate vdGs
 
-A fragment qualifies if it passes `Frags.is_organic`, has no `UNDESIRED_ELEMENTS` (metals,
+A fragment qualifies if it passes `frag_enumeration.is_organic`, has no `UNDESIRED_ELEMENTS` (metals,
 lanthanides, noble gases, Si/Se/As/Te; boron allowed), ≤5 heavy atoms, is not a halogen
 oxyanion, and has support ≥ `--min-support` (distinct parent biounit stems, pooled across
 protonation variants, computed over the full dictionary).
@@ -177,34 +177,25 @@ done < fragment-work-list.txt
 - H-class fields use negative values for unreadable atoms; zero is a real count. Carbonyl-O
   coordinates are separate and excluded from RMSD.
 
-After the fleet drains:
+Wait for all library-writing jobs, including downstream `hold_jid` jobs. Then run:
 
 ```bash
-python scripts/check_library_after_build.py --vdg-lib-dir <library>
-python ligand_vdgs/tools/h_class_diagnostic.py --lib <library> --out h_class.tsv
+python ligand_vdgs/generate_vdgs/check_library_after_build.py --vdg-lib-dir <library>
 ```
 
-The first checks aliases, charged-forward resolution, completion markers, and H-class fields. A
-directory's existence doesn't prove completion — direct walkers must call
-`Frags.check_vdg_job_status` (as `load_vdg_bucket` does). Run the H-class diagnostic after every
-full build/rebuild and whenever fragment keys change.
-
-Optional, for troubleshooting: the H-class check above only runs `h_class_diagnostic.py
---dry-run` internally and reports pass/fail. If it fails, or you want to see which buckets are
-affected, run the same check standalone for detail:
-
-```bash
-python ligand_vdgs/tools/h_class_diagnostic.py --lib <library> --dry-run
-```
+The checker validates aliases, completion, buckets, symmetry, provenance, and H-class fields.
+Gate on exit zero and the final `All post-build checks passed.` verdict. Keep that verdict
+and build provenance together. Run again when fragment keys change.
+Keys pool ligand H states; see `docs/pitfalls.md`.
 
 ## 5. Inspect selected vdGs
 
-`materialize_vdg_pdbs.py` writes PDBs for PyMOL. `-c` must be a fragment's `nr_vdgs/` directory;
-`-o` must be empty or absent:
+`materialize_vdg_pdbs.py` writes PDBs for PyMOL. `--fragment-dir` takes a fragment's directory
+(`<library>/<cg_label>/`); `-o` must be empty or absent:
 
 ```bash
 python ligand_vdgs/generate_vdgs/materialize_vdg_pdbs.py \
-  -c <library>/<cg_label>/nr_vdgs/ -o <empty-output-dir> --top-clusters 10
+  --fragment-dir <library>/<cg_label>/ -o <empty-output-dir> --top-clusters 10
 ```
 
 Use `--aa-buckets`/`--subset-sizes` to filter. Default mode writes nr vdGs; `--members` adds

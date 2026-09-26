@@ -1,4 +1,4 @@
-"""`Frags.KEY_SCHEMA` must be bumped whenever the key vocabulary changes.
+"""`ligand_structure.KEY_SCHEMA` must be bumped whenever the key vocabulary changes.
 
 The failure this closes: `resources/database_frags_dict.pkl` and
 `resources/frag_cost_estimate.tsv` were both written in the pre-annotation
@@ -23,7 +23,7 @@ import unittest
 
 from rdkit import Chem
 
-from ligand_vdgs.functions import Frags
+from ligand_vdgs.functions import frag_enumeration, ligand_structure
 
 # (name, SMILES, atom-count window) -> expected keys.
 GOLDEN = {
@@ -52,23 +52,23 @@ GOLDEN = {
 def _keys(smiles, lo, hi):
     mol = Chem.MolFromSmiles(smiles)
     Chem.SanitizeMol(mol)
-    return set(Frags.enumerate_induced_fragments(mol, lo, hi))
+    return set(frag_enumeration.enumerate_induced_fragments(mol, lo, hi))
 
 
 class KeySchemaTests(unittest.TestCase):
 
     def test_key_schema_is_a_nonempty_version_string(self):
-        self.assertIsInstance(Frags.KEY_SCHEMA, str)
-        self.assertTrue(Frags.KEY_SCHEMA)
+        self.assertIsInstance(ligand_structure.KEY_SCHEMA, str)
+        self.assertTrue(ligand_structure.KEY_SCHEMA)
 
     def test_golden_keys_pin_the_vocabulary(self):
         for name, (smiles, lo, hi, expected) in GOLDEN.items():
-            with self.subTest(fragment=name, key_schema=Frags.KEY_SCHEMA):
+            with self.subTest(fragment=name, key_schema=ligand_structure.KEY_SCHEMA):
                 self.assertEqual(
                     _keys(smiles, lo, hi), expected,
                     f'{name} no longer keys as it did under KEY_SCHEMA '
-                    f'{Frags.KEY_SCHEMA!r}. If the change is intended, update the '
-                    f'golden key AND bump Frags.KEY_SCHEMA, so every artifact '
+                    f'{ligand_structure.KEY_SCHEMA!r}. If the change is intended, update the '
+                    f'golden key AND bump ligand_structure.KEY_SCHEMA, so every artifact '
                     f'written under the old vocabulary is refused.')
 
     def test_ring_sizes_are_not_interchangeable(self):

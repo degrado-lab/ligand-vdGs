@@ -6,7 +6,7 @@ from ligand_vdgs.functions.clus_helpers import calc_seq_similarity
 from ligand_vdgs.functions import vdg_struct_utils as struct_utils
 from ligand_vdgs.functions.vdg_struct_utils import (get_res_iden, found_chain_break,
     get_AA_and_CA_coords, get_bb_coords, get_bb_o_coords, build_flank_lookup_index)
-from ligand_vdgs.functions.utils import _det3, kabsch_ssd
+from ligand_vdgs.functions.utils import kabsch_ssd
 from ligand_vdgs.functions.vdg_fp_utils import (
     INTERNAL_DISTANCE_EPS, full_row_permutations, internal_distance_bound_matrix,
     precompute_internal_distance_descriptors)
@@ -648,32 +648,9 @@ def masked_kabsch_ssd(X, Y, chunk_size=30000):
    if X.ndim != 3 or X.shape[2] != 3:
       raise ValueError(f"masked_kabsch_ssd expected (M, n, 3), got {X.shape}")
 
-   M = X.shape[0]
-   if M == 0:
-      return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.int64)
-
    valid = np.isfinite(X).all(axis=2) & np.isfinite(Y).all(axis=2)
-   n_eff = valid.sum(axis=1).astype(np.int64)
-
-   ssd = np.empty(M, dtype=np.float64)
-   for start in range(0, M, chunk_size):
-      stop = min(start + chunk_size, M)
-      keep = valid[start:stop, :, None]
-      inv = 1.0 / np.maximum(n_eff[start:stop], 1)[:, None, None]
-      out = []
-      for arr in (X[start:stop], Y[start:stop]):
-         c = np.where(keep, arr, 0.0).astype(np.float64)
-         c -= np.add.reduce(c, axis=1)[:, None, :] * inv
-         out.append(np.where(keep, c, 0.0))
-      Xc, Yc = out
-      H = np.matmul(np.transpose(Xc, (0, 2, 1)), Yc)
-      sv = np.linalg.svd(H, compute_uv=False)
-      d = np.where(_det3(H) < 0.0, -1.0, 1.0)
-      norms = (np.add.reduce(np.add.reduce(Xc * Xc, axis=2), axis=1)
-               + np.add.reduce(np.add.reduce(Yc * Yc, axis=2), axis=1))
-      trace = sv[:, 0] + sv[:, 1] + d * sv[:, 2]
-      ssd[start:stop] = np.maximum(norms - 2.0 * trace, 0.0)
-   return ssd, n_eff
+   return (kabsch_ssd(X, Y, chunk_size=chunk_size, mask=valid),
+           valid.sum(axis=1).astype(np.int64))
 
 def _rmsd_rows(X, Y):
    ssd, n_eff = masked_kabsch_ssd(X, Y)

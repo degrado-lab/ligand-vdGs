@@ -26,11 +26,11 @@ Everything is still invoked by path from the repository root, e.g.
 
 For full instructions (prerequisites, database preparation, SGE/SLURM submission), see the [Database Generation Guide](docs/database_generation_guide.md).
 
-The core command, run once per fragment SMILES:
+The core command, run once per annotated fragment SMARTS key:
 
 ```bash
 python ligand_vdgs/generate_vdgs/vdg_generation_wrapper.py \
-    -s "<fragment SMILES, matched as SMARTS>" -c "<CG label; defaults to the SMARTS if omitted>" \
+    -s "<fragment SMARTS>" -c "<CG label; defaults to the SMARTS if omitted>" \
     -p <path/to/pdb_database/> \
     -o <path/to/vdg_library/> \
     --num-procs <n> \
@@ -41,15 +41,17 @@ All requested subset sizes share one environment-reconstruction pass. Buckets ar
 `nr_vdgs/<subset_size>/<pos|neut|neg|unreadable>/<aa_composition>.npz`.
 
 Each bucket npz holds one `nr_*` row per non-redundant vdG and one `mem_*` row per
-clustered vdG that is not the nr one, so `cluster_size == 1 + (mem_ rows)`. Stage-1
-clustering is sphere exclusion (Butina 1999 / GROMOS), which guarantees every member
-lies within the cutoff of the vdG that represents it; the achieved radius is stored
-per cluster. See
-[docs/database_generation_guide.md](docs/database_generation_guide.md) for the full
-array schema. A per-phase timing sidecar is written by default; `--no-profile-compute` skips it.
+remaining observation in that cluster, so each cluster's `cluster_size` is one plus
+its member-row count. Stage 1 uses sphere exclusion (Butina 1999 / GROMOS): every
+member is within the cutoff of its Stage 1 seed. Stage 2 selects a representative
+for each subgroup by minimizing its maximum pose distance to members. The stored
+`cluster_pose_radius` measures that representative's achieved radius; it can exceed
+the Stage 1 cutoff. See [docs/database_generation_guide.md](docs/database_generation_guide.md)
+for the output layout. A per-phase timing sidecar is written by default;
+`--no-profile-compute` skips it.
 
 `-c` (or its default, `-s`) is encoded with `utils.smiles_to_filename` before use,
-so a SMILES containing `/` or `\` can be passed as-is.
+so a fragment key containing `/` or `\` can be passed as-is.
 Exact graph automorphisms are derived automatically from `-s` in
 `clus_and_deduplicate_vdgs.py` and persisted to `nr_vdgs/cg_symmetry.npz`, which is
 what consumers read (`vdg_npz_utils.load_cg_symmetry`) — independent of the
@@ -120,11 +122,10 @@ python ligand_vdgs/score_poses/vdg_hit_finder.py \
 Scoring-relevant options, none of which appear above: `--rmsd-threshold`
 (default: derived per combo from `normalize_rmsd`, matching the window used
 during library clustering), `--contact-cutoff` (off by default; 3.8 Å is
-reasonable), `--ref-pdb`, `--min-shared-atoms`, and `--no-dedup`.
+reasonable), and `--ref-pdb`.
 
-**Hits are deduplicated by default.** Records sharing a BSR combo and
-overlapping ligand atoms collapse to the single lowest-RMSD hit, so
-`results_summary.txt` counts are post-dedup. Pass `--no-dedup` for raw counts.
+Hits are raw: the finder never deduplicates. Overlapping fragments are aggregated in scoring
+(see `docs/TODO.md`, overlapping fragments).
 
 On Wynton (SGE), `python ligand_vdgs/score_poses/make_sge_scripts_for_hit_finder.py`
 generates one job per query set.
@@ -143,7 +144,7 @@ Output is gzipped (`.pdb.gz`), which PyMOL opens directly, and
 directory names follow the same grammar as the library materializer — fields joined
 with a single `_`, residue tags of exactly four fields (`seg_chain_resnum_resname`),
 `~<n>` for duplicates — described under
-[Output file names](docs/database_generation_guide.md#output-file-names).
+[Inspect selected vdGs](docs/database_generation_guide.md#5-inspect-selected-vdgs).
 
 Each `<query>/vdg_matches/<frag>/<bsr>/` leaf must be empty when the run reaches
 it: files are never overwritten or skipped on write, so leftovers from an earlier

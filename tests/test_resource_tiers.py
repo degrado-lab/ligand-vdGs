@@ -6,13 +6,13 @@ two bands. NAMED FALSIFIERS, one per invariant:
   * a body that slices the table (a retired path dropped TIER_1 via
     `RESOURCE_TIERS[1:]`) -> test_boundaries. Injected after collection so
     expectations still came from the full table: [0-10] and [19999-10] failed
-    `assert 30 == 10` (DR-50 addendum, DR-57).
+    `assert 30 == 10`.
 """
 # Why the assertions key on SLOTS and not h_rt: the old table had four bands with
 # four h_rt values, so boundary cases could assert on h_rt. Both surviving bands
 # request 48:00:00, so an h_rt-keyed boundary test would now pass against ANY
-# implementation, including one ignoring the estimate entirely (DR-20, DR-24,
-# DR-27). test_boundary_cases_are_not_vacuous asserts the two bands really differ.
+# implementation, including one ignoring the estimate entirely.
+# test_boundary_cases_are_not_vacuous asserts the two bands really differ.
 import pytest
 
 from ligand_vdgs.generate_vdgs.make_sge_scripts_for_frags import (
@@ -24,7 +24,7 @@ def _boundary_cases():
     """(est_occurrences, expected slots) either side of every tier boundary.
 
     Derived from RESOURCE_TIERS, not written out: hard-coded counts went stale
-    silently once DR-7 rekeyed the tiers from structures onto occurrences.
+    silently once the tiers were rekeyed from structures onto occurrences.
     """
     cases = [(0, RESOURCE_TIERS[0][1])]
     for i, (upper, slots, _h_rt) in enumerate(RESOURCE_TIERS[:-1]):

@@ -6,7 +6,7 @@ import pickle as pkl
 from collections import defaultdict
 from itertools import groupby
 
-from ligand_vdgs.functions import Frags
+from ligand_vdgs.functions import ligand_structure
 
 from ligand_vdgs.functions import utils as utils_module
 from ligand_vdgs.functions.utils import (
@@ -28,10 +28,10 @@ def load_frags_dict(path):
     with open(path, 'rb') as handle:
         payload = pkl.load(handle)
     schema = payload.get('key_schema')
-    if schema != Frags.KEY_SCHEMA:
+    if schema != ligand_structure.KEY_SCHEMA:
         raise ValueError(
             f'{path} was written under key_schema {schema!r}, but this code emits '
-            f'{Frags.KEY_SCHEMA!r}. Regenerate it with fragment_database_ligs.py.')
+            f'{ligand_structure.KEY_SCHEMA!r}. Regenerate it with fragment_database_ligs.py.')
     return payload['frags'], payload['support_pooled'], {
         k: v for k, v in payload.items() if k not in ('frags', 'support', 'support_pooled')}
 

@@ -12,14 +12,10 @@ with no error anywhere:
    (`HCHA` on a HEM), so looking them up in the template before filtering rejects
    the whole instance. Measured: 5,453 of 5,906 instances on a 3,000-structure
    roster.
-3. OpenBabel atom IDs. `apply_template_to_obmol` regenerates the residue's atom
-   IDs from element symbols as a side effect of its `AddBond` calls, so
-   `pdb_atom_names` on a TEMPLATED instance can return `FE, FE, S, S` for a block
-   that deposited `FE1, FE2, S1, S2`. That is why the names are read from the PDB
-   block rather than from the perceived OBMol. Covered by
-   `test_ob_atom_ids_are_destroyed_by_templating`, which fails if OpenBabel ever
-   stops doing this -- at which point the block read is merely redundant, not
-   wrong.
+3. OpenBabel atom IDs. Template bond edits used to let OpenBabel rename atoms to
+   element symbols (`FE1` -> `FE`); `apply_template_to_obmol` now prevents it, and
+   the names are still read from the PDB block as an independent check
+   (`test_templated_names_match_the_block`).
 
 Unobserved atoms need no special handling and get a test anyway: they are simply
 absent from the block, which is exactly the "every atom observed" clause.
@@ -101,23 +97,16 @@ class OpenBabelAtomIdTests(unittest.TestCase):
         'HETATM 9602  S1  FES E 501       8.252  81.008  75.864  1.00 39.83           S\n'
         'HETATM 9603  S2  FES E 501      11.097  82.079  74.050  1.00 38.58           S\n')
 
-    def test_ob_atom_ids_are_destroyed_by_templating(self):
-        """Templating rewrites `FE1/FE2/S1/S2` to `FE/FE/S/S`.
+    def test_templated_names_match_the_block(self):
+        """`apply_template_to_obmol` keeps deposited IDs, so both reads agree.
 
-        If this ever starts passing the wrong way -- i.e. the IDs survive -- the
-        block read in `_canonical_names` becomes redundant rather than wrong, and
-        this test says so instead of silently protecting nothing.
+        Before `SetChainsPerceived` the bond edits let OpenBabel rename FE1/FE2/S1/S2 to
+        FE/FE/S/S; the block read is kept as the independent check.
         """
         perceived = ligand_perception.perceive_ligand_instance(self.FES_BLOCK, 'FES')
-        self.assertIsNotNone(perceived)
-        self.assertEqual(perceived.provenance,
-                         ligand_perception.PERCEPTION_CCD_TEMPLATE)
-        from_obmol = set(ligand_perception.pdb_atom_names(perceived.obmol).values())
-        from_block = set(_canonical_names('FES', self.FES_BLOCK))
-        self.assertEqual(from_block, {'FE1', 'FE2', 'S1', 'S2'})
-        self.assertNotEqual(from_obmol, from_block)
-        self.assertTrue(from_obmol.issubset({'FE', 'S'}),
-                        f'unexpected OB atom IDs: {from_obmol}')
+        self.assertEqual(perceived.provenance, ligand_perception.PERCEPTION_CCD_TEMPLATE)
+        self.assertEqual(set(ligand_perception.pdb_atom_names(perceived.obmol).values()),
+                         set(_canonical_names('FES', self.FES_BLOCK)))
 
 
 if __name__ == '__main__':

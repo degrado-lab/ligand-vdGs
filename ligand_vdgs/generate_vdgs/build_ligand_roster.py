@@ -2,7 +2,7 @@
 
 Each roster type is ``(CCD code, observed canonical heavy-atom names)``.  A
 biounit stores each type at most once, so NCS copies count as one observation.
-OpenBabel-fallback and unreadable instances are excluded and counted in stats.
+Excluded OpenBabel-fallback/unreadable instances are counted and loss-gated.
 """
 
 import argparse
@@ -76,16 +76,10 @@ def _canonical_names(resname, block):
     if template is None:
         return None
 
-    names = set()
-    for line in block.splitlines():
-        if not line.startswith('HETATM') or line[76:78].strip() in ('H', 'D'):
-            continue
-        entry = ccd_templates.index_by_name(template).get(line[12:16].strip())
-        if entry is None:
-            return None
-        if entry.element not in ('H', 'D'):
-            names.add(entry.name)
-    return tuple(sorted(names))
+    entries = ccd_templates.resolve_names(
+        [line[12:16].strip() for line in block.splitlines()
+         if line.startswith('HETATM') and line[76:78].strip() not in ('H', 'D')], template)
+    return None if entries is None else tuple(sorted({e.name for e in entries if e.element not in ('H', 'D')}))
 
 def build_roster(pdb_dir, num_procs=1, limit=None, progress_every=2000, log=print):
     """Build and return ``(types, biounits, stats, errors)``."""
@@ -180,15 +174,22 @@ def report(logfile, stats, errors, identity, ccd_identity, pdb_dir, limit):
                 handle.write(f'  ... and {len(errors) - 200} more\n')
 
 def check_loss_threshold(stats, pdb_dir, logfile):
-    """Refuse a roster if unreadable structures exceed the allowed fraction."""
+    """Refuse a roster if lost structures or excluded ligand instances exceed the allowed
+    fraction."""
+    limit = f'limit {100 * MAX_LOST_SAMPLE_FRACTION:.0f}%). See {logfile}.'
     lost = stats.get('num_unreadable_files', 0) + stats['num_errored_structures']
     fraction = lost / stats['num_structures'] if stats['num_structures'] else 0.0
     if fraction > MAX_LOST_SAMPLE_FRACTION:
         raise SystemExit(
             f'[ERROR] {lost} of {stats["num_structures"]} structures under {pdb_dir} '
-            f'were unreadable or raised ({100 * fraction:.0f}%, limit '
-            f'{100 * MAX_LOST_SAMPLE_FRACTION:.0f}%). '
-            f'See {logfile}.')
+            f'were unreadable or raised ({100 * fraction:.0f}%, {limit}')
+    dropped = stats.get('num_ob_fallback_instances', 0) + stats.get('num_unreadable_instances', 0)
+    seen = stats.get('num_instances', 0) + dropped
+    fraction = dropped / seen if seen else 0.0
+    if fraction > MAX_LOST_SAMPLE_FRACTION:
+        raise SystemExit(
+            f'[ERROR] {dropped} of {seen} ligand instances under {pdb_dir} were '
+            f'OpenBabel-fallback or unreadable ({100 * fraction:.0f}%, {limit}')
 
 def main():
     args = parse_args()

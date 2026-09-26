@@ -30,8 +30,7 @@ INTERNAL_DISTANCE_EPS = 1e-4
 def fp_tolerances(rmsd_threshold, n_total, n_cg, n_res):
     """Admissible per-fingerprint tolerances for an `rmsd_threshold` Å cutoff.
 
-    Returns one tolerance per fingerprint, in the order
-    `precompute_bucket_fingerprints` emits them: `(fp0,)` for one residue,
+    Returns one tolerance per fingerprint: `(fp0,)` for one residue,
     `(fp0, fp1, fp2)` for two.
 
     Every fingerprint is an *internal* distance, so it is invariant to the
@@ -73,43 +72,6 @@ def fp_tolerances(rmsd_threshold, n_total, n_cg, n_res):
         return (tol_com, tol_com, scale * math.sqrt(2.0 * n_total))
     raise ValueError(f'fp_tolerances: subset size {n_res} not supported '
                      f'(defined for {_MIN_SUBSET_SIZE}-{_MAX_SUBSET_SIZE})')
-
-
-def precompute_bucket_fingerprints(cgvdmbb_data, n_cg):
-    """
-    Vectorized fingerprint precomputation for all vdGs in one bucket.
-
-    cgvdmbb layout: [CG_atoms (n_cg) | N1, CA1, C1 | (N2, CA2, C2) ...]
-
-    Returns a dict:
-      size_subset==1: {'fp0': (N,) float32}
-      size_subset==2: {'fp0': (N,), 'fp1': (N,), 'fp2': (N,)}
-        fp0 = ||CA1 - CG_COM||,  fp1 = ||CA2 - CG_COM||,  fp2 = ||CA1 - CA2||
-    Returns an empty dict when there is nothing to fingerprint (no data, n_cg
-    == 0, or no backbone atoms); callers test truthiness before indexing.
-    Raises ValueError on a backbone block that is not 1 or 2 whole residues.
-    """
-    if cgvdmbb_data is None or len(cgvdmbb_data) == 0 or n_cg == 0:
-        return {}
-    arr = cgvdmbb_data.astype(np.float32, copy=False)
-    n_res, rem = divmod(arr.shape[1] - n_cg, 3)
-    if n_res == 0 and rem == 0:   # no backbone atoms: nothing to fingerprint
-        return {}
-    if rem != 0 or n_res > _MAX_SUBSET_SIZE:
-        raise ValueError(f'precompute_bucket_fingerprints: {arr.shape[1] - n_cg} backbone '
-                         f'atoms is not a supported subset size (defined for '
-                         f'{_MIN_SUBSET_SIZE}-{_MAX_SUBSET_SIZE} residues, 3 atoms each)')
-    cg_com = arr[:, :n_cg, :].mean(axis=1)
-    ca1    = arr[:, n_cg + 1, :]
-    fp0    = np.linalg.norm(ca1 - cg_com, axis=1).astype(np.float32)
-    if n_res == 2:
-        ca2 = arr[:, n_cg + 4, :]
-        return {
-            'fp0': fp0,
-            'fp1': np.linalg.norm(ca2 - cg_com, axis=1).astype(np.float32),
-            'fp2': np.linalg.norm(ca1 - ca2,    axis=1).astype(np.float32),
-        }
-    return {'fp0': fp0}
 
 
 def cross_residue_mask(n_res):

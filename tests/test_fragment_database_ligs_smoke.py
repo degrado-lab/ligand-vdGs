@@ -30,7 +30,7 @@ SCRIPT = os.path.join(HERE, '..', 'ligand_vdgs', 'generate_vdgs',
                       'fragment_database_ligs.py')
 sys.path.insert(0, os.path.join(HERE, '..'))
 
-from ligand_vdgs.functions import Frags, ccd_templates, ligand_perception  # noqa: E402
+from ligand_vdgs.functions import frag_enumeration, ligand_structure, ccd_templates, ligand_perception  # noqa: E402
 
 
 def _heavy_names(resname):
@@ -91,7 +91,7 @@ class FragmentDatabaseLigsSmokeTests(unittest.TestCase):
 
         self.assertEqual(proc.returncode, 0, proc.stderr[-3000:])
         self.assertIsNotNone(payload)
-        self.assertEqual(payload['key_schema'], Frags.KEY_SCHEMA)
+        self.assertEqual(payload['key_schema'], ligand_structure.KEY_SCHEMA)
         self.assertEqual(payload['db_identity']['sha256'], 'smoke')
         self.assertEqual(payload['ccd_identity'], ccd_templates.store_identity())
         self.assertEqual(payload['params']['support_unit'], 'distinct parent biounits')
@@ -118,16 +118,16 @@ class FragmentDatabaseLigsSmokeTests(unittest.TestCase):
         closure = re.compile(r'\](%?\d)')
         bgc = ligand_perception.perceive_ligand_graph('BGC').mol
         Chem.SanitizeMol(bgc)
-        bgc_ring_keys = [k for k in Frags.enumerate_induced_fragments(bgc, 5, 5) if 'r6' in k]
+        bgc_ring_keys = [k for k in frag_enumeration.enumerate_induced_fragments(bgc, 5, 5) if 'r6' in k]
         self.assertTrue(bgc_ring_keys)
         for key in bgc_ring_keys:
             self.assertIsNone(closure.search(key),
                               f'{key} closes a ring, but a 5-atom cut of a 6-ring '
-                              f'cannot -- max-frag-size 5 is settled (DR-5 addendum)')
+                              f'cannot -- max-frag-size 5 is settled')
         # Vacuity clause: a genuine 5-ring (not a hand-written string) must close.
         adp = ligand_perception.perceive_ligand_graph('ADP').mol
         Chem.SanitizeMol(adp)
-        adp_ring_keys = [k for k in Frags.enumerate_induced_fragments(adp, 5, 5) if 'r5' in k]
+        adp_ring_keys = [k for k in frag_enumeration.enumerate_induced_fragments(adp, 5, 5) if 'r5' in k]
         self.assertTrue(adp_ring_keys)
         self.assertTrue(any(closure.search(k) for k in adp_ring_keys),
                          'no r5 key closes a ring for a genuine 5-ring at max frag size 5')

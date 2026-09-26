@@ -1,4 +1,4 @@
-"""run_frag_cost_estimate.qsub must not hardcode --sample-size to today's exact structure
+"""estimate_frag_cost.py must not hardcode --sample-size to today's exact structure
 count, so the "census, not a sample" claim silently degraded into a sample the moment
 the mirror grew past that literal. --census fixes this by passing sample_size=None
 through to sample_pdb_paths, which takes every path regardless of the count.

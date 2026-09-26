@@ -15,7 +15,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 
-from ligand_vdgs.functions.Frags import check_vdg_job_status
+from ligand_vdgs.functions.ligand_structure import check_vdg_job_status
 
 from ligand_vdgs.identify_bioisosteres.common import (BB_MODES, load_bucket_counts,
     calc_single_aa_propensities, calc_aa_pair_propensities, is_bb_category)

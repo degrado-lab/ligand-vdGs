@@ -1,7 +1,7 @@
 """B2 -- estimate_frag_cost.py's occurrence count must not count a match that
 reaches a template-added phantom (unobserved heavy atom). The miner drops exactly
 these matches (cg.py:355), so counting them here inflates the occurrence column
-that keys the resource tiers (DR-7).
+that keys the resource tiers.
 
 Fixture: acetate (ACT) with its methyl carbon unmodelled -- the same partial-density
 fixture test_ccd_templates.py uses to establish that the phantom is a real, bonded

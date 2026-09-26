@@ -15,12 +15,11 @@ import unittest
 import numpy as np
 
 from ligand_vdgs.functions.utils import kabsch_ssd
-from ligand_vdgs.functions.vdg_fp_utils import (FP_SAFETY_FACTOR, fp_tolerances,
-                                                precompute_bucket_fingerprints)
+from ligand_vdgs.functions.vdg_fp_utils import FP_SAFETY_FACTOR, fp_tolerances
 
 
 def fingerprints(X, n_cg):
-    """The same quantities precompute_bucket_fingerprints emits, for one vdG."""
+    """The internal distances bounded by fp_tolerances, for one vdG."""
     com = X[:n_cg].mean(axis=0)
     ca1 = X[n_cg + 1]
     out = [np.linalg.norm(ca1 - com)]

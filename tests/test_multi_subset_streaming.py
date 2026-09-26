@@ -27,7 +27,7 @@ class _FakeAtomGroup:
     def getCoords(self): return np.zeros((0, 3), dtype=np.float32)
 
 def _shard_paths(bucket_dir):
-    """Every shard file under one subset-size dir's DR-61 sign subdirectories
+    """Every shard file under one subset-size dir's charge-sign subdirectories
     (_write_cg_pickles's synthetic annotations are all-zero-charge, so in
     practice only 'neut' is ever populated -- walking all four keeps this
     honest if a test ever varies charge)."""

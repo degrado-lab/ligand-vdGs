@@ -12,7 +12,7 @@ import unittest
 
 from rdkit import Chem, RDLogger
 
-from ligand_vdgs.functions.Frags import get_fragments, ring_query_for_atom
+from ligand_vdgs.functions.frag_enumeration import get_fragments, ring_query_for_atom
 from ligand_vdgs.functions.utils import (identify_mol_automorphisms,
                                          mol_from_fragment,
                                          fragment_keys_equivalent,

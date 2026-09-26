@@ -81,7 +81,7 @@ class EnvironmentApiTests(unittest.TestCase):
                 min_contact_area=2.5).min_contact_area, 2.5)
 
     def test_membership_thresholds_buried_plus_shared_not_buried_alone(self):
-        """Criterion B (DR-3). Exclusive area alone has a 0.9485 recall ceiling.
+        """Criterion B. Exclusive area alone has a 0.9485 recall ceiling.
 
         The discriminating case: a residue whose entire occluded patch is shared, so
         `buried_area` is 0 and only the shared term can admit it. A gate written as

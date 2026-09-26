@@ -186,7 +186,7 @@ def get_query_cg_coords(sub, cg_smarts):
         mol_elements.append(atom.GetSymbol())
 
     # The guard stays per-Mol: atom order is established separately for every
-    # permutation (by Frags, or by reorder_sub_to_target_smiles picking matches[0]),
+    # permutation (by frag_enumeration, or by reorder_sub_to_target_smiles picking matches[0]),
     # so validating one representative and trusting the rest would not be equivalent.
     cg_elements = cg_element_symbols(cg_smarts)
     if len(mol_elements) != len(cg_elements) or any(

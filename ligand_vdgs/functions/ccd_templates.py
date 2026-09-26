@@ -301,18 +301,26 @@ def get_template(comp_id):
     return Template(str(comp_id).strip(), atoms, bonds)
 
 
-def index_by_name(template):
-    """{atom name: TemplateAtom}, including alt names that do not collide.
-
-    Older depositions write the alt form (`1HB` for `HB1`, primes vs stars in
-    nucleotides), so matching on `atom_id` alone turns a perfectly good template
-    into a fallback.
-    """
+def _index_by_name(template):
+    """{atom name: TemplateAtom}, including alt names that do not collide."""
     by_name = {atom.name: atom for atom in template.atoms}
     for atom in template.atoms:
         if atom.alt_name and atom.alt_name not in by_name:
             by_name[atom.alt_name] = atom
     return by_name
+
+def resolve_names(names, template):
+    """[TemplateAtom per deposited name], or None unless one-to-one. See docs/pitfalls.md.
+
+    Merged current+alt names first (mixed depositions like 5GP map only there), then alt
+    alone: an alt name can be ANOTHER atom's current name (ABU legacy `CD` = current `C`).
+    """
+    # Only bridge from deposited to template names; callers must not build their own.
+    for table in (_index_by_name(template), {a.alt_name: a for a in template.atoms if a.alt_name}):
+        found = [table.get(name) for name in names]
+        if None not in found and len({a.name for a in found}) == len(found):
+            return found
+    return None
 
 
 def template_h_counts(template):

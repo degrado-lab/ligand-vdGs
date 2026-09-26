@@ -188,6 +188,12 @@ def perceive_ligand_instance(block, resname=None):
         return None
     mol.PerceiveBondOrders()
     mol.DeleteHydrogens()
+    # DeleteHydrogens keeps H with no heavy neighbour (unbonded, or H-H). In the
+    # parent DB these are misplaced prepwizard H; a kept one either blocks the
+    # template (unknown name) or maps to a template H and adds a phantom degree.
+    for atom in [mol.GetAtom(i) for i in range(1, mol.NumAtoms() + 1)
+                 if mol.GetAtom(i).GetAtomicNum() == 1]:
+        mol.DeleteAtom(atom)
     if mol.NumAtoms() == 0:
         return None
     template = _try_template(resname)
@@ -211,23 +217,16 @@ def apply_template_to_obmol(mol, template):
     already refuses any match that reaches an unnamed atom -- so a fragment
     with an unobserved atom is skipped, while one merely adjacent still mines.
     """
-    by_name = ccd_templates.index_by_name(template)
     h_counts = ccd_templates.template_h_counts(template)
-    atom_of_name, name_of_idx = {}, {}
-    for i in range(1, mol.NumAtoms() + 1):
-        atom = mol.GetAtom(i)
-        residue = atom.GetResidue()
-        name = residue.GetAtomID(atom).strip() if residue is not None else ''
-        entry = by_name.get(name)
-        if entry is None:
-            return False
-        name_of_idx[i] = entry.name
-        # Two observed atoms mapping to one template atom is a duplicate-name
-        # residue (docs: prepwizard re-emits orphan atoms under a ligand's
-        # resname); the template cannot say which is which.
-        if entry.name in atom_of_name:
-            return False
-        atom_of_name[entry.name] = i
+    # None on an unknown name or on two observed atoms mapping to one template
+    # atom (a duplicate-name residue: prepwizard re-emits orphan atoms under a
+    # ligand's resname, and the template cannot say which is which).
+    entries = ccd_templates.resolve_names(
+        [a.GetResidue().GetAtomID(a).strip() if a.GetResidue() is not None else ''
+         for a in (mol.GetAtom(i) for i in range(1, mol.NumAtoms() + 1))], template)
+    if entries is None:
+        return False
+    atom_of_name = {entry.name: i for i, entry in enumerate(entries, start=1)}
 
     # Phantoms first, so every template heavy atom has an index before bonds
     # are laid down. AddAtom appends, so the observed atoms keep their indices
@@ -273,20 +272,25 @@ def apply_template_to_obmol(mol, template):
         else:
             existing.SetAromatic(False)
 
-    for name, i in atom_of_name.items():
-        atom = mol.GetAtom(i)
-        entry = by_name[name]
+    for entry in template.atoms:
+        if entry.name not in atom_of_name:
+            continue
+        atom = mol.GetAtom(atom_of_name[entry.name])
         atom.SetFormalCharge(int(entry.charge))
         # The template's nominal H count, not the placed hydrogens: this is
         # what makes `H0`/`!H0` and cg_num_h independent of how the structure
         # was protonated.
-        atom.SetImplicitHCount(int(h_counts.get(name, 0)))
+        atom.SetImplicitHCount(int(h_counts.get(entry.name, 0)))
         atom.SetAromatic(bool(entry.aromatic))
 
     # Otherwise OpenBabel re-perceives on the first Match and overwrites all of
     # the above with its own guess from the geometry.
     mol.SetAromaticPerceived()
     mol.SetHybridizationPerceived()
+    # The bond edits above clear the chains flag, and the next GetResidue then
+    # re-perceives residues: every atom is renamed to its element symbol (FE1 ->
+    # FE) and phantoms gain a name, which breaks pdb_atom_names and phantom tests.
+    mol.SetChainsPerceived()
     return True
 
 

@@ -183,13 +183,13 @@ def test_a_template_built_graph_round_trips_through_the_key_writer():
     this is the check that the key writer accepts that graph at all -- a key
     that cannot match itself is the dedup failure mode.
     """
-    from ligand_vdgs.functions import Frags
+    from ligand_vdgs.functions import frag_enumeration
     from ligand_vdgs.functions.utils import fragment_keys_equivalent
     for comp_id in ('ATP', 'TYR', 'HEM'):
         mol = lp.perceive_ligand_graph(comp_id).mol
-        stripped = Frags.manually_remove_Hs(mol, 'single')
+        stripped = frag_enumeration.manually_remove_Hs(mol, 'single')
         assert stripped is not None, comp_id
-        keys = Frags.get_fragments(2, stripped[0][0], 4, 5)
+        keys = frag_enumeration.get_fragments(2, stripped[0][0], 4, 5)
         assert keys, comp_id
         for key in keys:
             assert fragment_keys_equivalent(key, key), (comp_id, key)
@@ -199,12 +199,12 @@ def test_aromatic_ring_atoms_pool_across_pyridine_and_pyrrole():
     # The vocabulary decision `ring_query_for_atom` documents: aromatic atoms
     # carry no ring-size primitive, so a 5- and a 6-ring aromatic carbon are
     # the same key atom. Template-built graphs must not break that.
-    from ligand_vdgs.functions import Frags
+    from ligand_vdgs.functions import frag_enumeration
     for comp_id in ('ATP', 'TYR'):
         mol = lp.perceive_ligand_graph(comp_id).mol
         for atom in mol.GetAtoms():
             if atom.GetIsAromatic():
-                assert Frags.ring_query_for_atom(atom) is None
+                assert frag_enumeration.ring_query_for_atom(atom) is None
 
 
 def _block_from_template(comp_id, drop=()):
@@ -243,15 +243,15 @@ def test_keys_written_from_the_graph_match_the_same_ligand_as_a_block(comp_id):
     key bond has to survive `apply_template_to_obmol` writing it and
     `SetAromaticPerceived` keeping OpenBabel from re-deriving it.
     """
-    from ligand_vdgs.functions import Frags
+    from ligand_vdgs.functions import frag_enumeration
     from ligand_vdgs.generate_vdgs.estimate_frag_cost import add_vdg_miner_paths
     add_vdg_miner_paths()
     import cg
 
     mol = lp.perceive_ligand_graph(comp_id).mol
-    stripped = Frags.manually_remove_Hs(mol, 'single')
+    stripped = frag_enumeration.manually_remove_Hs(mol, 'single')
     assert stripped is not None, comp_id
-    keys = sorted(Frags.get_fragments(2, stripped[0][0], 4, 5))
+    keys = sorted(frag_enumeration.get_fragments(2, stripped[0][0], 4, 5))
     assert keys, comp_id
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -273,10 +273,10 @@ def _any_key_aromatic(keys):
 
 def test_at_least_one_case_actually_exercises_aromatic_bonds():
     """Guard on the test above: it proves nothing if no key is aromatic."""
-    from ligand_vdgs.functions import Frags
+    from ligand_vdgs.functions import frag_enumeration
     mol = lp.perceive_ligand_graph('ATP').mol
-    stripped = Frags.manually_remove_Hs(mol, 'single')
-    keys = tuple(Frags.get_fragments(2, stripped[0][0], 4, 5))
+    stripped = frag_enumeration.manually_remove_Hs(mol, 'single')
+    keys = tuple(frag_enumeration.get_fragments(2, stripped[0][0], 4, 5))
     assert not [k for k in keys if Chem.MolFromSmarts(k) is None], keys
     assert_discriminates(_any_key_aromatic, [keys],
                          [('[C;D4]-[Cl;D1]', '[C;r6;D3]')], 'ATP keys aromatic')
@@ -299,10 +299,132 @@ def test_a_bond_openbabel_invents_is_deleted():
     assert _matches(templated.obmol, '[O;D1]') == 2
 
 
+# Real parent-DB block (1dp9 IMD 500): the CONECT naming a missing atom is ignored, so
+# HN1 (0.4 A from C5) stays unbonded and survives DeleteHydrogens under a template name.
+IMD_STRAY_H = """\
+HETATM 1269  N1  IMD A 500      47.634  53.196  34.362  1.00 26.80           N
+HETATM 1270  C2  IMD A 500      47.257  52.778  35.618  1.00 26.69           C
+HETATM 1271  N3  IMD A 500      47.433  51.426  35.682  1.00 25.85           N
+HETATM 1272  C4  IMD A 500      47.916  50.990  34.483  1.00 28.80           C
+HETATM 1273  C5  IMD A 500      48.043  52.099  33.653  1.00 27.12           C
+HETATM 1274  HN1 IMD A 500      47.982  52.527  33.690  1.00 26.80           H
+HETATM 1275  HC2 IMD A 500      46.899  53.496  36.341  1.00 26.69           H
+HETATM 1276  HC4 IMD A 500      48.123  49.941  34.333  1.00 28.80           H
+HETATM 1277  HC5 IMD A 500      48.383  52.211  32.634  1.00 27.12           H
+CONECT 1269 1270 1273 1320 1274
+CONECT 1270 1269 1271 1275
+CONECT 1271 1270 1272
+CONECT 1272 1271 1273 1276
+CONECT 1273 1269 1272 1277
+CONECT 1274 1269
+CONECT 1275 1270
+CONECT 1276 1272
+CONECT 1277 1273
+END
+"""
+
+def _raw_after_delete_hydrogens(block):
+    """The pre-fix path: read, perceive, DeleteHydrogens, nothing else."""
+    mol = ob.OBMol()
+    conv = ob.OBConversion()
+    conv.SetInFormat('pdb')
+    conv.ReadString(mol, block)
+    mol.PerceiveBondOrders()
+    mol.DeleteHydrogens()
+    return mol
+
+def _has_no_hydrogen(mol):
+    return all(mol.GetAtom(i).GetAtomicNum() != 1 for i in range(1, mol.NumAtoms() + 1))
+
+def test_a_hydrogen_deletehydrogens_keeps_under_a_template_name_is_removed():
+    # Falsifier: the kept HN1 maps to template HN1, the template bond N1-HN1 is laid
+    # down, and N1 reads D3 (a pyrrole-type n with a substituent) instead of D2.
+    templated = lp.perceive_ligand_instance(IMD_STRAY_H, 'IMD')
+    assert templated.provenance == lp.PERCEPTION_CCD_TEMPLATE
+    assert_discriminates(_has_no_hydrogen, [templated.obmol],
+                         [_raw_after_delete_hydrogens(IMD_STRAY_H)], 'IMD stray HN1')
+    assert _by_name(templated.obmol)['N1'] == (2, 1, 0)
+    assert _matches(templated.obmol, '[n;D2]') == 2 and _matches(templated.obmol, '[n;D3]') == 0
+
+def test_an_unbonded_hydrogen_with_an_unknown_name_does_not_block_the_template():
+    # A86/CLA/FAD pattern: a misplaced H whose name the template lacks sent the whole
+    # instance to OpenBabel.
+    stray = ACETATE.format(r='ACT').replace(
+        'END', 'HETATM    5  HQQ ACT A 900       6.000   6.000   6.000  1.00  0.00           H\nEND')
+    assert not _has_no_hydrogen(_raw_after_delete_hydrogens(stray)), 'case stopped discriminating'
+    perceived = lp.perceive_ligand_instance(stray, 'ACT')
+    assert perceived.provenance == lp.PERCEPTION_CCD_TEMPLATE
+    assert set(lp.pdb_atom_names(perceived.obmol).values()) == {'C', 'O', 'OXT', 'CH3'}
+
 def test_alt_atom_names_are_matched():
     # CCD alt_atom_id carries the star form of nucleotide primes and the
     # quoted `"N A"` form for heme/chlorophyll nitrogens. Matching atom_id
     # alone sent every CLA and HEC ligand to perception (4.5% of a census).
-    by_name = ccd_templates.index_by_name(ccd_templates.get_template('HEC'))
-    assert 'NA' in by_name and by_name['NA'].element == 'N'
-    assert 'N A' in by_name
+    template = ccd_templates.get_template('HEC')
+    assert ccd_templates.resolve_names(['NA'], template)[0].element == 'N'
+    assert ccd_templates.resolve_names(['N A'], template)[0].name == 'NA'
+
+ABU_LEGACY = """\
+HETATM 1410  N   ABU A1457      77.773  33.156  47.937  1.00 30.07           N1+
+HETATM 1411  CA  ABU A1457      77.466  34.521  48.359  1.00 28.85           C
+HETATM 1412  CB  ABU A1457      78.726  35.420  48.123  1.00 29.69           C
+HETATM 1413  CG  ABU A1457      79.157  35.943  49.499  1.00 30.77           C
+HETATM 1414  CD  ABU A1457      80.458  36.693  49.494  1.00 32.13           C
+HETATM 1415  OE1 ABU A1457      80.730  37.350  48.483  1.00 33.40           O
+HETATM 1416  OE2 ABU A1457      81.151  36.616  50.536  1.00 33.89           O1-
+HETATM 1417 H__1 ABU A1457      76.966  32.568  48.085  1.00 30.07           H
+HETATM 1420  HA1 ABU A1457      77.211  34.525  49.419  1.00 28.85           H
+HETATM 1422  HB1 ABU A1457      78.457  36.261  47.484  1.00 29.69           H
+END
+"""
+ABU_LEGACY_NAMES = ['N', 'CA', 'CB', 'CG', 'CD', 'OE1', 'OE2']
+ABU_CURRENT_NAMES = ['N', 'CD', 'CB', 'CG', 'C', 'O', 'OXT']
+
+def _one_to_one(table, names):
+    return all(n in table for n in names) and len({table[n].name for n in names}) == len(names)
+
+def test_a_fully_legacy_deposition_resolves_under_alt_names():
+    # 4atq ABU 1457 (67 roster instances): legacy CA/CD are current CD/C, so the merged
+    # table sends legacy CD to current CD and collides with legacy CA.
+    template = ccd_templates.get_template('ABU')
+    alt = {a.alt_name: a for a in template.atoms if a.alt_name}
+    assert_discriminates(lambda t: _one_to_one(t, ABU_LEGACY_NAMES), [alt],
+                         [ccd_templates._index_by_name(template)], 'ABU legacy names')
+    got = dict(zip(ABU_LEGACY_NAMES, (e.name for e in ccd_templates.resolve_names(ABU_LEGACY_NAMES, template))))
+    assert (got['CA'], got['CD'], got['OE2']) == ('CD', 'C', 'OXT')
+    perceived = lp.perceive_ligand_instance(ABU_LEGACY, 'ABU')
+    assert perceived.provenance == lp.PERCEPTION_CCD_TEMPLATE
+    # Chemistry follows the deposited atom: legacy CD is the carboxyl C.
+    by_name = _by_name(perceived.obmol)
+    assert by_name['CD'] == (3, 0, 0) and by_name['CA'][0] == 2
+
+def test_current_names_win_when_both_vocabularies_map():
+    # An alt-first resolver would read current CD (the alpha C) as legacy CD (carboxyl).
+    template = ccd_templates.get_template('ABU')
+    alt = {a.alt_name: a for a in template.atoms if a.alt_name}
+    partial = ['N', 'CD', 'CB', 'CG']   # carboxyl unobserved, so alt names also map
+    assert _one_to_one(alt, partial) and alt['CD'].name == 'C', 'case stopped discriminating'
+    assert [e.name for e in ccd_templates.resolve_names(partial, template)] == partial
+    assert [e.name for e in ccd_templates.resolve_names(ABU_CURRENT_NAMES, template)] == ABU_CURRENT_NAMES
+
+def test_a_genuine_duplicate_name_resolves_under_neither_vocabulary():
+    assert ccd_templates.resolve_names(['C', 'C', 'O'], ccd_templates.get_template('ACT')) is None
+
+FES_MISSING_S2 = """\
+HETATM 9600  FE1 FES E 501       8.958  81.453  73.804  1.00 40.05          Fe
+HETATM 9601  FE2 FES E 501      10.333  81.857  76.137  1.00 40.33          Fe
+HETATM 9602  S1  FES E 501       8.252  81.008  75.864  1.00 39.83           S
+END
+"""
+
+def test_templating_keeps_deposited_names_and_leaves_phantoms_unnamed():
+    # Falsifier: the template's bond edits clear OB's chains flag; re-perception on the
+    # next GetResidue renamed FE1 -> FE and named the phantom, so the miner stored
+    # names absent from the file and counted matches reaching unobserved atoms.
+    perceived = lp.perceive_ligand_instance(FES_MISSING_S2, 'FES')
+    assert perceived.provenance == lp.PERCEPTION_CCD_TEMPLATE
+    reperceived = ob.OBMol(perceived.obmol)
+    reperceived.UnsetFlag(ob.OB_CHAINS_MOL)
+    assert_discriminates(lambda m: sorted(lp.pdb_atom_names(m).values()) == ['FE1', 'FE2', 'S1'],
+                         [perceived.obmol], [reperceived], 'FES names after templating')
+    assert len(lp.phantom_atom_indices(perceived.obmol)) == 1

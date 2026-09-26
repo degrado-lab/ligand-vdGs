@@ -8,7 +8,7 @@ import argparse
 from ligand_vdgs.functions import utils
 from ligand_vdgs.functions.utils import _int_or_none, file_sha256
 from ligand_vdgs.functions.db_identity import identity_of
-from ligand_vdgs.functions.Frags import check_vdg_job_status
+from ligand_vdgs.functions.ligand_structure import check_vdg_job_status
 from ligand_vdgs.functions.vdg_npz_utils import load_fragment_aliases
 from ligand_vdgs.generate_vdgs.extract_fragment_smiles import (
     load_frags_dict, alias_kind, fragment_dict_keys, prepare_fragments_cached,
@@ -48,7 +48,7 @@ def provenance_path(vdg_lib_dir):
 def write_provenance(vdg_lib_dir, args, key_schema=None):
     record = {'frags_dict': os.path.abspath(args.frags_dict), 'frags_dict_sha256': file_sha256(args.frags_dict),
               'max_size': args.max_size, 'min_support': args.min_support,
-              'parent_pdb_dir': os.path.abspath(args.pdb_dir), 'parent_db_identity': identity_of(args.pdb_dir)['sha256']}
+              'parent_pdb_dir': os.path.abspath(args.pdb_dir), 'parent_db_identity': args.db_identity}
     if key_schema is not None:
         record['key_schema'] = key_schema
     os.makedirs(vdg_lib_dir, exist_ok=True)
@@ -73,9 +73,8 @@ def check_recorded_inputs(recorded, args, source, top_up, max_size_is_error):
     recorded_identity = recorded.get('db_identity')
     if recorded_identity is None:
         problems.append('missing parent-database identity')
-    elif recorded_identity != identity_of(args.pdb_dir)['sha256']:
-        problems.append(f'db identity: recorded {recorded_identity[:12]}..., now '
-                         f'{identity_of(args.pdb_dir)["sha256"][:12]}...')
+    elif recorded_identity != args.db_identity:
+        problems.append(f'db identity: recorded {recorded_identity[:12]}..., now {args.db_identity[:12]}...')
 
     recorded_pdb_dir = recorded.get('pdb_dir')
     if recorded_pdb_dir is not None and os.path.abspath(recorded_pdb_dir) != os.path.abspath(args.pdb_dir):
@@ -107,7 +106,7 @@ def check_frags_dict_identity(frags_meta, args):
     recorded = frags_meta.get('db_identity')
     if not recorded:
         raise SystemExit(f'[ERROR] {args.frags_dict} records no parent-database identity; regenerate it.')
-    if recorded.get('sha256') != identity_of(args.pdb_dir)['sha256']:
+    if recorded.get('sha256') != args.db_identity:
         raise SystemExit(f'[ERROR] {args.frags_dict} was built from a different --pdb-dir than this run.')
 
 def check_provenance(vdg_lib_dir, args):
@@ -127,12 +126,12 @@ def parse_args():
     parser.add_argument('--template', default='resources/frag_sge_template.sh', help="Path to SGE job script template.")
     parser.add_argument('--include', nargs='*', default=[], metavar='SMARTS', help="Fragment SMARTS to build regardless of estimated count.")
     parser.add_argument('--resume', action='store_true',
-                         help="Emit scripts only for unfinished fragments (per Frags.check_vdg_job_status), and allow "
+                         help="Emit scripts only for unfinished fragments (per ligand_structure.check_vdg_job_status), and allow "
                               "--sge-out-dir to be non-empty. Use --include-only to ADD fragments instead.")
     parser.add_argument('--include-only', action='store_true',
                          help="Top-up mode: build scripts for --include fragments only, skipping the count threshold.")
     parser.add_argument('--min-support', default=None, type=int,
-                         help="Min distinct parent biounits containing a fragment (DR-5), from the fragment dict. Not "
+                         help="Min distinct parent biounits containing a fragment, from the fragment dict. Not "
                               "the same unit as the old --min-instances; required for a full/resumed build, unused "
                               "under --include-only.")
     parser.add_argument('--max-size', default=5, type=int, help="Max fragment heavy-atom count. Default: 5.")
@@ -165,8 +164,10 @@ def main():
         raise SystemExit(f'[ERROR] wrapper not found at {WRAPPER_PATH}.')
     if args.min_support is None and not args.include_only:
         raise SystemExit('[ERROR] --min-support is required for a full or resumed build (min distinct parent '
-                          'biounits containing a fragment, DR-5). No default.')
+                          'biounits containing a fragment). No default.')
 
+    # One walk, pinned before the counting pass; every check and the provenance use it.
+    args.db_identity = identity_of(args.pdb_dir)['sha256']
     os.makedirs(args.sge_out_dir, exist_ok=True)
     if not args.resume and [f for f in os.listdir(args.sge_out_dir) if not f.startswith('.')]:
         raise FileExistsError(f"{args.sge_out_dir} already has files; refusing to overwrite. "

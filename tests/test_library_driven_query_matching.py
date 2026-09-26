@@ -117,6 +117,23 @@ class LibraryDrivenMatchingTests(unittest.TestCase):
         self.assertFalse(np.allclose(coords[0], coords[1]))
         self.assertTrue(np.allclose(coords[0][[0, 1, 3, 2]], coords[1]))
 
+    def test_bond_order_key_reaches_every_resonance_equivalent_oxygen(self):
+        """The query carries one Kekule form (P=O on O3 here); the library parent may have put the
+        double bond on another oxygen. Falsifier (W3 2j9y/FOO): the O-pair excluding the query's
+        double-bonded O was never enumerated, so its truth vdGs got zero hits."""
+        from tests.vacuity import assert_discriminates
+        db_name = self.add_frag('[C;!R][O;!R;D2][P;!R;D4](=[O;!R;D1])[O;!R;D1]')
+        frags, _, _ = self.match('COP(=O)(O)O')
+        pairs = {frozenset(lab[2]) - {0, 1, 2} for site in frags[db_name] for lab in site}
+        self.assertEqual(pairs, {frozenset(p) for p in ((3, 4), (3, 5), (4, 5))})
+        assert_discriminates(lambda ps: frozenset((4, 5)) in ps, [pairs],
+                             [{frozenset((3, 4)), frozenset((3, 5))}], 'non-Kekule O pair enumerated')
+        lig = ligand_with_coords('COP(=O)(O)O')
+        forms = hf.query_resonance_forms(lig)
+        self.assertEqual(sorted(next(i for i in (3, 4, 5) if f.GetBondBetweenAtoms(2, i).GetBondTypeAsDouble() == 2)
+                                for f in forms), [3, 4, 5])
+        self.assertIs(forms[0], lig)
+
     def test_repeated_and_overlapping_occurrences(self):
         """Two chemically identical sites stay two sites (they are scored
         separately), while overlapping matches of one site collapse into one."""
@@ -125,6 +142,18 @@ class LibraryDrivenMatchingTests(unittest.TestCase):
         self.assertEqual(len(frags[db_name]), 2)
         atom_sets = {site[0][2] for site in frags[db_name]}
         self.assertEqual(len(atom_sets), 2)
+
+    def test_overlapping_distinct_atom_sets_are_separate_sites(self):
+        """Falsifier (single-linkage grouping): the 1,2-diol matches {0-3}, {2-5}, {4-7} overlap 2/4
+        pairwise-adjacent, so they chained into one site although {0-3} and {4-7} are disjoint."""
+        from tests.vacuity import assert_discriminates
+        db_name = self.add_frag('[O;!R][C;!R][C;!R][O;!R]')
+        frags, _, _ = self.match('OCC(O)C(O)CO')
+        per_site = [{frozenset(lab[2]) for lab in site} for site in frags[db_name]]
+        assert_discriminates(lambda sites: all(len(s) == 1 for s in sites), [per_site],
+                             [[{frozenset(range(0, 4)), frozenset(range(2, 6)), frozenset(range(4, 8))}]],
+                             'one atom set per site')
+        self.assertEqual(sorted(sorted(next(iter(s))) for s in per_site), [[0, 1, 2, 3], [2, 3, 4, 5], [4, 5, 6, 7]])
 
     def test_incomplete_job_is_excluded_but_reported(self):
         db_name = self.add_frag('[C;!R][C;!R](=[O;!R])[O;!R]', complete=False)

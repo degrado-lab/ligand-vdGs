@@ -1,16 +1,10 @@
-import json
-import os
-import time
-import zipfile
+import json, os, time, zipfile
 
 import numpy as np
-from ligand_vdgs.functions import parent_db
 import prody as pr
-
-from ligand_vdgs.functions import utils
-from ligand_vdgs.functions.vdg_struct_utils import (
-    NONCG_LIGAND_OCC, VDM_OCC, cg_slot_occupancy)
-from ligand_vdgs.functions.Frags import check_vdg_job_status
+from ligand_vdgs.functions import parent_db, utils
+from ligand_vdgs.functions.ligand_structure import check_vdg_job_status
+from ligand_vdgs.functions.vdg_struct_utils import NONCG_LIGAND_OCC, VDM_OCC, cg_slot_occupancy
 
 def parse_pdb_with_retry(pdb_path, attempts=1, delay=0.5):
     for i in range(attempts):
@@ -436,32 +430,19 @@ def name_selstr(name):
 
 def _select_one_atom(struct, seg, chain, resnum, name):
     seg = "" if seg in (None, "", "None") else str(seg)
-    seg_clause = f"segment {seg} and " if seg else ""
-    sel = struct.select(
-        f"{seg_clause}chain {chain} and resnum {_resnum_selstr(resnum)} "
-        f"and name {name_selstr(name)}")
-    if sel is None or sel.numAtoms() == 0:
-        return None
-    if sel.numAtoms() == 1:
-        return sel[0]
+    sel = struct.select(f"{'segment ' + seg + ' and ' if seg else ''}chain {chain} and "
+                        f"resnum {_resnum_selstr(resnum)} and name {name_selstr(name)}")
+    if sel is None or not sel.numAtoms(): return None
     atoms = list(sel)
     max_occ = max(a.getOccupancy() for a in atoms)
     top = [a for a in atoms if a.getOccupancy() == max_occ]
-    if len(top) == 1:
-        return top[0]
-    for a in top:
-        if a.getAltloc() == 'A':
-            return a
-    return top[0]
+    return next((a for a in top if a.getAltloc() == 'A'), top[0])
 
 def rederive_member_coords(pdbpath, cg_seg, cg_chain, cg_resnum, cg_names,
     scrr_seg, scrr_chain, scrr_resnum, parsed_pdb=None):
-    struct = parsed_pdb
-    if struct is None:
-        struct = parse_pdb_or_none(
-            pdbpath, "this member's coordinates cannot be re-derived")
-        if struct is None:
-            return None, None
+    struct = (parsed_pdb if parsed_pdb is not None else parse_pdb_or_none(
+        pdbpath, "this member's coordinates cannot be re-derived"))
+    if struct is None: return None, None
 
     n_cg = len(cg_names)
     cg_resnum = int(cg_resnum)
@@ -474,9 +455,8 @@ def rederive_member_coords(pdbpath, cg_seg, cg_chain, cg_resnum, cg_names,
             return None, None
         cg_coords[i] = np.asarray(atom.getCoords()).reshape(3)
 
-    num_vdms = len(scrr_chain)
-    vdm_bb_coords = np.empty((num_vdms, 3, 3), dtype=float)
-    for v in range(num_vdms):
+    vdm_bb_coords = np.empty((len(scrr_chain), 3, 3), dtype=float)
+    for v in range(len(scrr_chain)):
         for a, name in enumerate(("N", "CA", "C")):
             atom = _select_one_atom(struct, scrr_seg[v], scrr_chain[v], int(scrr_resnum[v]), name)
             if atom is None:
@@ -566,10 +546,8 @@ ANNOTATION_SCHEMA = (
 CHARGE_SIGNS = ('pos', 'neut', 'neg', 'unreadable')
 
 def bucket_schema_version(data):
-    if "schema" not in getattr(data, "files", []):
-        return 1
     try:
-        return int(json.loads(str(data["schema"]))["schema_version"])
+        return int(json.loads(str(data["schema"]))["schema_version"]) if "schema" in data.files else 1
     except Exception:
         return 1
 
@@ -605,13 +583,46 @@ def load_vdg_bucket(vdg_lib_dir, frag_name, subset_size, sign, aa_bucket):
                 bb=data["nr_vdm_bb_coords"].astype(np.float32),
                 resnames=data["nr_scrr_resname"],
                 slot_flags=data["nr_slot_flag"].astype(np.int8),
-            )
+                parent_biounit=data["nr_parent_biounit"].astype(str),
+                cg_elements=data["cg_elements"].astype("U2"))
     except CORRUPT_NPZ_ERRORS as e:
         print(f"[WARNING] Could not load {npz_path}: {type(e).__name__}: {e}")
         return None
 
+BUCKET_ROW_FIELDS = ("cluster_id", "cluster_num_parents", "cg", "bb", "resnames", "slot_flags", "parent_biounit",
+                     "cg_elements")
+
+def load_vdg_bucket_all_signs(vdg_lib_dir, frag_name, subset_size, aa_bucket, fields=None):
+    """The disjoint charge-sign partitions of one bucket concatenated row-wise: `fields` (default
+    BUCKET_ROW_FIELDS; cg_elements broadcast per row), aa_bucket_parts, and per-row charge_signs and
+    partition_indices (row index within its sign's npz). None if no sign has the bucket."""
+    loaded = [(sign, b) for sign in CHARGE_SIGNS
+              if (b := load_vdg_bucket(vdg_lib_dir, frag_name, subset_size, sign, aa_bucket)) is not None]
+    if not loaded:
+        return None
+    row = lambda b, f: np.broadcast_to(b[f], (len(b["cluster_id"]), len(b[f]))) if f == "cg_elements" else b[f]
+    return dict(aa_bucket_parts=loaded[0][1]["aa_bucket_parts"],
+                charge_signs=np.concatenate([np.full(len(b["cluster_id"]), sign, "U11") for sign, b in loaded]),
+                partition_indices=np.concatenate([np.arange(len(b["cluster_id"]), dtype=np.int32) for _s, b in loaded]),
+                **{f: np.concatenate([row(b, f) for _s, b in loaded]) for f in fields or BUCKET_ROW_FIELDS})
+
+def iter_bucket_files(vdg_lib_dir, frag, subset=None):
+    """Yield (subset, sign, bucket, path) for every bucket npz of `frag` (one subset size if given);
+    nothing, with a warning, if the fragment's vdG-generation job did not complete."""
+    if not check_vdg_job_status(frag, vdg_lib_dir):
+        print(f"[WARNING] Skipping {frag!r}: no completed vdG-generation job in {vdg_lib_dir}.")
+        return
+    root = os.path.join(vdg_lib_dir, frag, "nr_vdgs")
+    subsets = [str(subset)] if subset is not None else sorted(
+        (d for d in os.listdir(root) if d.isdigit()), key=int) if os.path.isdir(root) else []
+    for k in subsets:
+        for sign in CHARGE_SIGNS:
+            d = os.path.join(root, k, sign)
+            if os.path.isdir(d):
+                yield from ((int(k), sign, f[:-4], os.path.join(d, f)) for f in sorted(os.listdir(d)) if f.endswith(".npz"))
+
 def cluster_member_indices(data, cluster_id):
-    return np.nonzero(data["mem_cluster_id"] == cluster_id)[0]
+    return np.flatnonzero(data["mem_cluster_id"] == cluster_id)
 
 def load_cluster_members(data, cluster_id, pdb_dir=None, indices=None):
     if indices is None:
@@ -638,8 +649,8 @@ def load_cluster_members(data, cluster_id, pdb_dir=None, indices=None):
 CG_SYMMETRY_FILENAME = "cg_symmetry.npz"
 
 def cg_symmetry_path(vdg_lib_dir, frag_name=None):
-    parts = [vdg_lib_dir] if frag_name is None else [vdg_lib_dir, frag_name]
-    return os.path.join(*parts, "nr_vdgs", CG_SYMMETRY_FILENAME)
+    return os.path.join(vdg_lib_dir, *([] if frag_name is None else [frag_name]),
+                        "nr_vdgs", CG_SYMMETRY_FILENAME)
 
 def write_cg_symmetry(vdglib_dir, cg_smarts, cg_automorphisms):
     perms = np.asarray([list(p) for p in cg_automorphisms], dtype=np.int32)

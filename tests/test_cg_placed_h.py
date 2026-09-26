@@ -1,4 +1,4 @@
-"""DR-62 `cg_placed_h`: per-CG-atom placed-H status, read geometrically from
+"""`cg_placed_h`: per-CG-atom placed-H status, read geometrically from
 the already-open parent atomgroup rather than the CCD template."""
 import unittest
 

@@ -78,7 +78,7 @@ class CrashDurabilityTests(unittest.TestCase):
             self.assertEqual(merged['cgvdmbb'].shape, (4, 7, 3))
 
     def test_corrupt_npz_is_reported_not_skipped(self):
-        # DR-61: bucket outputs live under a sign subdirectory now.
+        # Bucket outputs live under a sign subdirectory.
         with tempfile.TemporaryDirectory() as tmp:
             size_dir = os.path.join(tmp, 'nr_vdgs', '1', 'pos')
             os.makedirs(size_dir)

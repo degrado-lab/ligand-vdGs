@@ -150,6 +150,8 @@ def main():
             # A zero-match run still writes its profile sidecar and completion
             # marker before returning, or it is indistinguishable from a crash.
             print('No ligands contain the specified SMARTS pattern.')
+            with open(logfile, 'a') as handle:
+                handle.write('No ligand matches; no vdG buckets.\n')
             _finish(profile, logfile, main_script_start, out_dir, cg)
             return
 

@@ -22,7 +22,7 @@ from concurrent.futures.process import BrokenProcessPool
 import numpy as np
 from rdkit import Chem, RDLogger
 
-from ligand_vdgs.functions import Frags, ccd_templates, ligand_perception
+from ligand_vdgs.functions import frag_enumeration, ligand_structure, ccd_templates, ligand_perception
 from ligand_vdgs.functions.utils import fragment_key_query_mol, fragment_query_mols_equivalent
 
 RDLogger.DisableLog('rdApp.*')
@@ -85,14 +85,14 @@ def enumerate_one_resname(resname):
         out['warnings'].append(f'[WARNING] {resname}: sanitization failed ({e}).')
         return out
 
-    if not Frags.is_organic(mol):
+    if not frag_enumeration.is_organic(mol):
         out['status'] = 'not_druglike'
         return out
 
     for idx, name in enumerate(names):
         mol.GetAtomWithIdx(idx).SetProp(_NAME_PROP, name)
 
-    fragments = Frags.enumerate_induced_fragments(mol, min_frag_size, max_frag_size)
+    fragments = frag_enumeration.enumerate_induced_fragments(mol, min_frag_size, max_frag_size)
     for key, atom_index_sets in fragments.items():
         name_sets = []
         elements = None
@@ -380,7 +380,7 @@ def report_stats(logfile, stats, warnings, comparison_errors, frontier, roster,
         log.write(f'roster db_identity: {roster.get("db_identity")}\n')
         log.write(f'roster pdb_dir:     {roster.get("pdb_dir")}\n')
         log.write(f'roster ccd_identity: {roster.get("ccd_identity")}\n')
-        log.write(f'key_schema:         {Frags.KEY_SCHEMA}\n')
+        log.write(f'key_schema:         {ligand_structure.KEY_SCHEMA}\n')
         for key in sorted(params):
             log.write(f'{key}: {params[key]}\n')
         for key in sorted(stats):
@@ -471,7 +471,7 @@ def main():
 
     os.makedirs(args.outdir, exist_ok=True)
     output_results({'frags': sort_frag_dict(frag_dict), 'support': support, 'support_pooled': support_pooled,
-                    'key_schema': Frags.KEY_SCHEMA, 'db_identity': roster['db_identity'], 'roster_pdb_dir': roster.get('pdb_dir'),
+                    'key_schema': ligand_structure.KEY_SCHEMA, 'db_identity': roster['db_identity'], 'roster_pdb_dir': roster.get('pdb_dir'),
                     'ccd_identity': roster['ccd_identity'],
                     'params': params, 'stats': stats}, out_dict_path)
     print(f'Wrote {out_dict_path}: {stats["num_final_frags"]} fragments. Log: {args.logfile}', flush=True)

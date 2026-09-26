@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """top-off diff: build_set = select_fragments(N_new) \\
-already_built, already_built via Frags.check_vdg_job_status, never directory
+already_built, already_built via ligand_structure.check_vdg_job_status, never directory
 existence. Prints the diff, confirms, then prints (never runs) the --mode
 include-only command to submit it. Refuses when --n-new >= --n-old. --help."""
 import argparse

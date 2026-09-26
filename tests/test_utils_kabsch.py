@@ -3,6 +3,7 @@ import unittest
 import numpy as np
 
 from ligand_vdgs.functions.utils import kabsch
+from tests.vacuity import assert_discriminates
 
 
 class KabschDegeneracyTests(unittest.TestCase):
@@ -163,6 +164,34 @@ class KabschSsdParityTests(unittest.TestCase):
         Y[0, 0, 0] = np.nan
         with self.assertRaises(ValueError):
             kabsch_ssd(X, Y)
+
+    def test_mask_ignores_only_masked_out_non_finite_points(self):
+        """Falsifier: a masked-in NaN must still raise; a masked-out one must not leak."""
+        from ligand_vdgs.functions.utils import kabsch_ssd
+        X = np.random.default_rng(6).normal(size=(1, 5, 3)).astype(np.float32)
+        Y = X + np.float32(0.3)
+        Y[0, 0] = [np.nan, 50.0, 50.0]
+        mask = np.array([[False, True, True, True, True]])
+        np.testing.assert_allclose(kabsch_ssd(X, Y, mask=mask), 0.0, atol=1e-9)
+        with self.assertRaises(ValueError):
+            kabsch_ssd(X, Y, mask=~mask)
+        self.assertEqual(kabsch_ssd(X[:0], Y[:0], mask=mask[:0]).shape, (0,))
+
+    def test_analytic_and_lapack_batch_paths_agree(self):
+        """Falsifier: a sign or ordering error in the analytic (large-batch) path, incl. reflections."""
+        from ligand_vdgs.functions import utils
+        rng = np.random.default_rng(7)
+        M, n = 2 * utils._ANALYTIC_SV_MIN_BATCH, 6
+        X = rng.normal(size=(M, n, 3)).astype(np.float32)
+        unreflected = (X + rng.normal(scale=0.3, size=X.shape)).astype(np.float32)
+        Y = unreflected.copy()
+        Y[::2, :, 0] *= -1   # reflected targets need the proper-rotation correction
+        per_row = np.concatenate([utils.kabsch_ssd(X[i:i + 1], Y[i:i + 1]) for i in range(M)])
+        np.testing.assert_allclose(utils.kabsch_ssd(X, Y), per_row, atol=1e-9, rtol=0.0)
+        def reflects(T):
+            Xc, Tc = (A - A.mean(axis=1, keepdims=True) for A in (X.astype(float), T.astype(float)))
+            return (utils._det3(np.transpose(Xc, (0, 2, 1)) @ Tc) < 0).sum() > M // 4
+        assert_discriminates(reflects, [Y], [unreflected], 'reflection correction exercised')
 
     def test_multi_chunk_path_matches_single_chunk(self):
         # chunk_size splits the batch; each chunk must stand alone.

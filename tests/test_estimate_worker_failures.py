@@ -4,6 +4,8 @@ The pass costs minutes and writes nothing on the way, so an uncaught worker
 exception threw away the whole run. But a dropped structure that stays in the
 denominator of the extrapolation biases every fragment's count downward, which
 under-requests resources -- so dropped structures must leave the denominator too.
+Structures whose ligands all fail perception are not dropped: the miner skips the
+same ligands, so they are real zeros.
 
 Both branches route every result through the same _consume_result, so the handler
 the cluster actually runs (num_procs > 1) is the one covered here -- a spawned
@@ -122,12 +124,10 @@ class WorkerFailureTests(unittest.TestCase):
         structures, _ = self._run(fake)
         self.assertEqual(structures[FRAG], 10)
 
-    def test_all_failed_structures_leave_the_denominator(self):
-        # Unlike the ligandless case above (kept in the denominator), a structure
-        # whose every ligand failed perception must be excluded -- otherwise it
-        # extrapolates as a real zero and biases every count downward (B8). Only 2
-        # of 20 (10%), within MAX_LOST_SAMPLE_FRACTION, so the pass proceeds rather
-        # than refusing (that refusal path is covered separately).
+    def test_all_failed_structures_stay_in_the_denominator(self):
+        # Perception failure is deterministic and the miner skips the same ligands,
+        # so a structure whose every ligand failed is a real zero, like the
+        # ligandless case. Excluding it (old B8) inflated this to 20.
         calls = {'n': 0}
 
         def fake(path):
@@ -137,7 +137,21 @@ class WorkerFailureTests(unittest.TestCase):
             return {0: 1}, 0, False, False
 
         structures, _ = self._run(fake)
-        self.assertEqual(structures[FRAG], 20)
+        self.assertEqual(structures[FRAG], 18)
+
+    def test_many_all_failed_structures_do_not_refuse_the_estimate(self):
+        # Half the sample all-failed: above MAX_LOST_SAMPLE_FRACTION, which used to
+        # refuse. These are not lost samples, so the pass proceeds with real zeros.
+        calls = {'n': 0}
+
+        def fake(path):
+            calls['n'] += 1
+            if calls['n'] % 2:
+                return {}, 1, False, True
+            return {0: 1}, 0, False, False
+
+        structures, _ = self._run(fake)
+        self.assertEqual(structures[FRAG], 10)
 
 class ConsumeResultTests(unittest.TestCase):
     """_consume_result is what both branches use, so cover it directly."""

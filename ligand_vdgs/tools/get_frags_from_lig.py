@@ -5,7 +5,7 @@ and identify fragments that don't currently have a vdg library.
 
 import os
 from rdkit import Chem
-from ligand_vdgs.functions import Frags, utils
+from ligand_vdgs.functions import frag_enumeration, ligand_structure, utils
 
 # ------- Example settings --------------------------------
 list_smiles = ['CNCc1ccc(cc1)c2[nH]c3cc(F)cc4C(=O)NCCc2c34', 
@@ -37,7 +37,7 @@ for smiles in list_smiles:
         print(f'[WARNING] sanitization failed ({e}): {smiles}')
         continue
 
-    results = Frags.manually_remove_Hs(orig_mol, 'single') # rdkit's remove
+    results = frag_enumeration.manually_remove_Hs(orig_mol, 'single') # rdkit's remove
                                             # H method isn't good enough.
     if results is None:
         # H-removal/canonicalization failed (see the warning it printed); skip
@@ -52,14 +52,14 @@ for smiles in list_smiles:
     # aryl (C,c vs. [#6]). Fragment on bond radii `bond_radius` AND the postive 
     # integers less than `bond_radius`, because for example, drugs containing 
     # sulfonamide might produce only 6-atom sulfonamides and not CS(N)(=O)=O. 
-    filtered_frags = Frags.get_fragments(2, mol, 4, 5)
+    filtered_frags = frag_enumeration.get_fragments(2, mol, 4, 5)
     for sub_smiles, substruct_site_groups in filtered_frags.items():
         # Is this smiles represented in any fragment library?
         found_match = False
         for fraglib in fraglibs:
             for frag_smiles in os.listdir(fraglib):
                 if utils.smiles_equiv(frag_smiles, sub_smiles):
-                    if Frags.check_vdg_job_status(frag_smiles, fraglib):
+                    if ligand_structure.check_vdg_job_status(frag_smiles, fraglib):
                         frags_to_query['already_have'].append((sub_smiles, fraglib))
                     else:
                         frags_to_query['started_but_not_completed'].append(

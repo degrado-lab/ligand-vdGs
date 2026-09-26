@@ -8,7 +8,7 @@ only `D<n>` and `H0`/`!H0` can tell them apart.
 import pytest
 from rdkit import Chem, RDLogger
 
-from ligand_vdgs.functions import Frags
+from ligand_vdgs.functions import frag_enumeration
 
 RDLogger.DisableLog('rdApp.*')
 
@@ -17,9 +17,9 @@ def keys_for(smiles, bond_radius=2, min_size=4, max_size=5):
     mol = Chem.MolFromSmiles(smiles)
     assert mol is not None, smiles
     Chem.SanitizeMol(mol)
-    stripped = Frags.manually_remove_Hs(mol, 'single')
+    stripped = frag_enumeration.manually_remove_Hs(mol, 'single')
     assert stripped is not None, smiles
-    return set(Frags.get_fragments(bond_radius, stripped[0][0],
+    return set(frag_enumeration.get_fragments(bond_radius, stripped[0][0],
                                    min_size, max_size))
 
 

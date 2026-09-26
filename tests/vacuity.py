@@ -1,7 +1,7 @@
-"""DR-52's rule -- a check is not trusted until its refusal has been observed --
+"""The rule -- a check is not trusted until its refusal has been observed --
 applied to a clause INSIDE a test. A clause labelled non-vacuity discharges the
 reviewer's obligation to look, so one that cannot fire is worse than none
-(DR-49 addendum 1). Refusal demonstrated in test_vacuity_helper.py.
+Refusal demonstrated in test_vacuity_helper.py.
 """
 
 def assert_discriminates(clause, accepts, rejects, label=''):

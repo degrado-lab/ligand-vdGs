@@ -2,7 +2,7 @@
 
 WHY THIS EXISTS. load_bucket_counts walks the library with a raw np.load rather
 than through load_vdg_bucket, and load_vdg_bucket is the only reader that calls
-Frags.check_vdg_job_status on our behalf. A fragment directory can be populated
+ligand_structure.check_vdg_job_status on our behalf. A fragment directory can be populated
 but partial while its SGE job is still running, and this function AGGREGATES
 across buckets, so a partial fragment does not fail -- it returns counts that are
 low by an unknown amount. On 2026-09-11, 57 of 357 fragments in frag_lib_annot1
@@ -39,7 +39,7 @@ BUCKETS = {'ASP': 3, 'GLN': 5}
 
 def _make_fragment(lib_dir, cg_label, completed):
     '''Build <lib>/<cg>/nr_vdgs/1/pos/{ASP,GLN}.npz plus <lib>/<cg>/<cg>_log.
-    DR-61: buckets live one level deeper, under a charge-sign subdirectory.
+    Buckets live one level deeper, under a charge-sign subdirectory.
 
     The two variants differ ONLY in whether the log carries 'Job completed.';
     every bucket is written identically, which is what makes the guard the only

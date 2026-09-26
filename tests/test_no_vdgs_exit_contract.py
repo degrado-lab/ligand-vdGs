@@ -12,7 +12,7 @@ import unittest
 
 from ligand_vdgs.generate_vdgs import clus_and_deduplicate_vdgs as pipeline
 from ligand_vdgs.generate_vdgs import vdg_generation_wrapper as wrapper
-from ligand_vdgs.functions.Frags import check_vdg_job_status
+from ligand_vdgs.functions.ligand_structure import check_vdg_job_status
 
 
 class NoVdgsExitContractTests(unittest.TestCase):
@@ -55,7 +55,7 @@ class NoVdgsExitContractTests(unittest.TestCase):
     def test_warning_text_never_contains_the_completion_marker(self):
         """The message must not defeat the mechanism it describes.
 
-        Frags.check_vdg_job_status substring-searches the whole log for
+        ligand_structure.check_vdg_job_status substring-searches the whole log for
         'Job completed.', so a warning that quotes the phrase makes an empty
         fragment read as finished.
         """
@@ -85,10 +85,10 @@ class CountOneArityTests(unittest.TestCase):
     on EVERY path.
 
     The third field distinguishes an unreadable file (None) from a structure that
-    genuinely has no ligands ({}); the fourth (B8) distinguishes a structure whose
-    ligands are all present but every one failed perception from either of those.
-    Conflating any of the three leaves dead files in the denominator of the
-    extrapolation, biasing every count downward and under-requesting resources.
+    genuinely has no ligands ({}); only the former leaves the denominator of the
+    extrapolation. The fourth flags a structure whose ligands are all present but
+    every one failed perception; it stays in the denominator as a real zero (the
+    miner skips the same ligands) and is flagged only for the warning.
     """
 
     def _call(self, ligands):
@@ -114,13 +114,13 @@ class CountOneArityTests(unittest.TestCase):
                 # None means the file could not be read after retries; an empty
                 # mapping means it was read and had no ligands.
                 self.assertEqual(unreadable, ligands is None)
-                # No ligands to fail perception -- distinct from B8's actual case.
+                # No ligands to fail perception -- distinct from the all-failed case.
                 self.assertFalse(all_failed)
 
-    def test_all_present_ligands_failing_perception_is_not_a_clean_zero(self):
-        """B8's actual falsifier: ligands are present (not the no-ligands early
-        return above), but every one fails perception -- must be flagged, not
-        silently indistinguishable from a genuinely ligand-less structure."""
+    def test_all_present_ligands_failing_perception_is_flagged(self):
+        """Ligands are present (not the no-ligands early return above), but every
+        one fails perception -- flagged for the warning, though it still counts as
+        a real zero in the extrapolation."""
         bad_block = 'HETATM    1        XXX A 301    not numbers at all\n'
         ligands = {('A', 301, 'XXX'): bad_block, ('A', 302, 'XXX'): bad_block}
         counts, read_failures, unreadable, all_failed = self._call(ligands)

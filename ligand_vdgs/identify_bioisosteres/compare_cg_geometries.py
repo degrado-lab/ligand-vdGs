@@ -1,22 +1,8 @@
 """
-Compare fragment libraries for bioisostere identification (AA enrichment +
-CG geometry), unifying compute_aa_profiles.py + compare_aa_profiles.py.
-
-For each pair of fragment libraries (A, B) and each shared AA bucket:
-  enrichment_A/B  — log(observed / expected) cluster counts for this AA
-                    type, size-normalised by background frequency. Positive
-                    = interacts with this AA more than expected by chance.
-  min_dist        — min pairwise CG centroid distance (Å) after Kabsch-
-                    aligning backbone + CG centroid of each vdG pair. The CG
-                    centroid is included in the fit because a 3-atom (N, CA,
-                    C) backbone superposition, while well determined, is very
-                    sensitive to coordinate noise; adding the centroid ties
-                    the alignment to the CG's own position. For AA buckets
-                    with repeated residue types, all permutations of
-                    identical residues are tried and the best kept. No
-                    atom-to-atom correspondence between fragments is needed.
-  frac_A/B_matched — fraction of each library's nr vdGs with a match
-                    (< threshold) in the other library.
+Compare fragment libraries for bioisostere identification (AA enrichment + CG geometry),
+unifying compute_aa_profiles.py + compare_aa_profiles.py. See
+docs/bioisostere_identification.md ("Independent branch") for the mmd2 formula, output
+TSV reference, and flags.
 
 Usage:
     python compare_cg_geometries.py --vdg-lib-dir /path/to/frag_lib \\
@@ -29,22 +15,22 @@ Usage:
 import os
 import sys
 import math
+import hashlib
 import argparse
 import itertools
 
 import numpy as np
 
 from ligand_vdgs.functions.vdg_struct_utils import BB_LABELS
-from ligand_vdgs.functions import utils, Frags
-from ligand_vdgs.functions.vdg_npz_utils import (CHARGE_SIGNS, load_vdg_bucket,
-                                                 aa_perm_indices, resolve_fragment_alias)
+from ligand_vdgs.functions import utils, ligand_structure
+from ligand_vdgs.functions.vdg_npz_utils import (resolve_fragment_alias,
+    load_vdg_bucket_all_signs, iter_bucket_files)
 
 from ligand_vdgs.identify_bioisosteres.common import calc_single_aa_propensities
 
-
-# ---------------------------------------------------------------------------
-# AA enrichment
-# ---------------------------------------------------------------------------
+# Fields compare_pair needs from each bucket (subset of vdg_npz_utils.BUCKET_ROW_FIELDS).
+BUCKET_FIELDS = ('cg', 'bb', 'cluster_id', 'cluster_num_parents', 'resnames',
+                 'slot_flags', 'parent_biounit')
 
 def compute_single_aa_enrichments(nr_vdgs_dir):
     """Return per-residue, background-weighted enrichments or {} if absent."""
@@ -54,70 +40,76 @@ def compute_single_aa_enrichments(nr_vdgs_dir):
     except FileNotFoundError:
         return {}
 
+# Idealized N-CA-C: N-CA 1.458 A, CA-C 1.525 A, N-CA-C 111.2 deg, CA at the origin. A
+# constant, data-independent target -- never another vdG -- so the fit cannot be biased
+# by whichever library it is being compared against.
+_ang = np.radians(111.2)
+IDEAL_NCAC = np.array([[1.458, 0.0, 0.0], [0.0, 0.0, 0.0],
+                       [1.525 * np.cos(_ang), 1.525 * np.sin(_ang), 0.0]], dtype=np.float64)
 
-# ---------------------------------------------------------------------------
-# Geometric comparison
-# ---------------------------------------------------------------------------
+def _ideal_frame_points(bb_slot0, cg):
+    """CG centroids [N,3] after Kabsch-fitting each vdG's own slot-0 N/CA/C (bb_slot0,
+    [N,3,3]) onto the fixed IDEAL_NCAC. The CG never enters the fit."""
+    R, t, _ = utils.kabsch(bb_slot0, np.broadcast_to(IDEAL_NCAC, (bb_slot0.shape[0], 3, 3)))
+    return np.einsum('ni,nij->nj', cg.mean(axis=1), R) + t
 
-def compare_bucket_geometry(cg_A, bb_A, cg_B, bb_B, aa_bucket_parts,
-                             threshold, max_per_lib=1000):
+def mmd2(pts_A, w_A, pts_B, w_B):
+    """Unbiased weighted squared MMD (distance-induced kernel): the U-statistic
+    2E|X-Y| - E|X-X'| - E|Y-Y'|, excluding i==j in the self terms. Each library needs
+    >= 2 points; returns nan otherwise."""
+    def offdiag_mean(pts, w):
+        if len(w) < 2:
+            return float('nan')
+        weights = w[:, None] * w[None, :]
+        np.fill_diagonal(weights, 0.0)
+        return float((np.linalg.norm(pts[:, None] - pts[None, :], axis=-1) * weights).sum()
+                     / weights.sum())
+    def cross_mean(pts_A, w_A, pts_B, w_B):
+        weights = w_A[:, None] * w_B[None, :]
+        return float((np.linalg.norm(pts_A[:, None] - pts_B[None, :], axis=-1) * weights).sum()
+                     / weights.sum())
+    return (2 * cross_mean(pts_A, w_A, pts_B, w_B)
+            - offdiag_mean(pts_A, w_A) - offdiag_mean(pts_B, w_B))
+
+def _self_split_mmd2(pts, w, parent_biounit):
+    """mmd2 between two halves of one library, split by parent biounit (a deterministic
+    hash, not Python's randomized str hash) so a structure's clusters land in one half.
+    nan if fewer than 2 clusters end up in either half."""
+    in_half_a = np.array([int(hashlib.md5(p.encode()).hexdigest(), 16) % 2 == 0
+                          for p in parent_biounit])
+    if in_half_a.sum() < 2 or (~in_half_a).sum() < 2:
+        return float('nan')
+    return mmd2(pts[in_half_a], w[in_half_a], pts[~in_half_a], w[~in_half_a])
+
+def compare_bucket_geometry(cg_A, bb_A, w_A, parent_A, cg_B, bb_B, w_B, parent_B,
+                            max_per_lib=1000):
     """
-    Compare CG centroid distances between two libraries for one AA bucket.
+    Compare CG centroid geometry between two libraries for one AA bucket via mmd2.
 
-    cg_A/B [N,n_cg,3], bb_A/B [N,num_vdms,3,3]; aa_bucket_parts is the bucket
-    label split on '_' and defines which residue slots may be permuted. Each library is
-    subsampled to at most max_per_lib nr vdGs before the O(N_A x N_B)
-    Kabsch comparison. threshold (Å) sets the "matched" cutoff.
+    cg_A/B [N,n_cg,3], bb_A/B [N,num_vdms,3,3] (only slot 0 anchors the fit -- see
+    module docstring), w_A/B = cluster_num_parents, parent_A/B = nr_parent_biounit.
+    Each library is subsampled to at most max_per_lib nr vdGs first (a cost cap; unlike
+    the old per-pair Kabsch fit, subsampling here cannot bias the result).
 
-    Returns (min_dist, frac_A_matched, frac_B_matched).
+    Returns dict(mmd2=..., mmd2_self_A=..., mmd2_self_B=...).
     """
-    cg_A = np.asarray(cg_A, np.float32)
-    bb_A = np.asarray(bb_A, np.float32)
-    cg_B = np.asarray(cg_B, np.float32)
-    bb_B = np.asarray(bb_B, np.float32)
-
-    N_A, N_B = cg_A.shape[0], cg_B.shape[0]
-    num_vdms = bb_A.shape[1]
-    aa_perms = aa_perm_indices(list(aa_bucket_parts))
-
     rng = np.random.default_rng(0)
-    if N_A > max_per_lib:
-        idx = rng.choice(N_A, max_per_lib, replace=False)
-        cg_A, bb_A = cg_A[idx], bb_A[idx]
-        N_A = max_per_lib
-    if N_B > max_per_lib:
-        idx = rng.choice(N_B, max_per_lib, replace=False)
-        cg_B, bb_B = cg_B[idx], bb_B[idx]
-        N_B = max_per_lib
+    def subsample(cg, bb, w, parent):
+        if len(w) <= max_per_lib:
+            return cg, bb, w, parent
+        idx = rng.choice(len(w), max_per_lib, replace=False)
+        return cg[idx], bb[idx], w[idx], parent[idx]
 
-    cg_A_cents = cg_A.mean(axis=1)     # [N_A, 3]
-    cg_B_cents = cg_B.mean(axis=1)     # [N_B, 3]
+    cg_A, bb_A, w_A, parent_A = subsample(cg_A, bb_A, w_A, parent_A)
+    cg_B, bb_B, w_B, parent_B = subsample(cg_B, bb_B, w_B, parent_B)
 
-    ref_B = np.empty((N_B, num_vdms * 3 + 1, 3), dtype=np.float32)
-    ref_B[:, :num_vdms * 3] = bb_B.reshape(N_B, -1, 3)
-    ref_B[:, -1]             = cg_B_cents
+    pts_A = _ideal_frame_points(bb_A[:, 0].astype(np.float64), cg_A.astype(np.float64))
+    pts_B = _ideal_frame_points(bb_B[:, 0].astype(np.float64), cg_B.astype(np.float64))
+    w_A, w_B = w_A.astype(np.float64), w_B.astype(np.float64)
 
-    dists_min = np.full((N_A, N_B), np.inf, dtype=np.float32)
-
-    for perm in aa_perms:
-        bb_A_perm = bb_A[:, perm, :, :]
-        ref_A = np.empty((N_A, num_vdms * 3 + 1, 3), dtype=np.float32)
-        ref_A[:, :num_vdms * 3] = bb_A_perm.reshape(N_A, -1, 3)
-        ref_A[:, -1]             = cg_A_cents
-
-        for i in range(N_A):
-            R, t, _ = utils.kabsch(ref_A[i], ref_B)
-            dists = np.linalg.norm(cg_A_cents[i] @ R + t - cg_B_cents, axis=1)
-            np.minimum(dists_min[i], dists, out=dists_min[i])
-
-    return (float(dists_min.min()),
-            float((dists_min.min(axis=1) < threshold).mean()),
-            float((dists_min.min(axis=0) < threshold).mean()))
-
-
-# ---------------------------------------------------------------------------
-# Library discovery helpers
-# ---------------------------------------------------------------------------
+    return dict(mmd2=mmd2(pts_A, w_A, pts_B, w_B),
+                mmd2_self_A=_self_split_mmd2(pts_A, w_A, parent_A),
+                mmd2_self_B=_self_split_mmd2(pts_B, w_B, parent_B))
 
 def _resolve_requested_frags(vdg_lib_dir, requested):
     """Map user-given `--frags` names onto the library directories that hold them.
@@ -143,17 +135,16 @@ def _resolve_requested_frags(vdg_lib_dir, requested):
             missing.append(name)
     if missing:
         raise SystemExit(
-            f'ERROR: no fragment directory in {vdg_lib_dir} for {missing} (checked '
+            f'[ERROR] no fragment directory in {vdg_lib_dir} for {missing} (checked '
             f'fragment_aliases.tsv for collapsed protonation variants).')
     return resolved
-
 
 def _find_completed_frags(vdg_lib_dir, frag_filter):
     """Return fragment dir names with nr_vdgs/ present AND a completed job log.
 
     A directory can have nr_vdgs/ populated from a run that later crashed
     (e.g. mid-clustering); only the '<frag>_log' completion line is authoritative
-    (Frags.check_vdg_job_status). Incomplete fragments are dropped, with a warning.
+    (ligand_structure.check_vdg_job_status). Incomplete fragments are dropped, with a warning.
     """
     candidates = (_resolve_requested_frags(vdg_lib_dir, frag_filter)
                   if frag_filter else sorted(os.listdir(vdg_lib_dir)))
@@ -161,7 +152,7 @@ def _find_completed_frags(vdg_lib_dir, frag_filter):
     for d in candidates:
         if not os.path.isdir(os.path.join(vdg_lib_dir, d, 'nr_vdgs')):
             continue
-        if Frags.check_vdg_job_status(d, vdg_lib_dir):
+        if ligand_structure.check_vdg_job_status(d, vdg_lib_dir):
             completed.append(d)
         else:
             incomplete.append(d)
@@ -170,32 +161,18 @@ def _find_completed_frags(vdg_lib_dir, frag_filter):
               f'vdG-generation jobs (no "Job completed." in <frag>_log): {incomplete}')
     return completed
 
-
 def _bucket_counts(vdg_lib_dir, frag, subset_size):
-    """
-    bucket -> cluster count for every npz in one fragment/subset-size dir.
+    """bucket -> cluster count for every npz in one fragment/subset-size dir.
 
-    Deliberately not common.load_bucket_counts: that one drops X and, under
-    bb_mode='off', every bb-containing bucket (it serves the propensity path).
-    Here bb buckets are ordinary geometry rows -- and
-    the size-1 `bb` bucket is usually the library's largest.
+    Deliberately not common.load_bucket_counts: that one drops X and, under bb_mode='off',
+    every bb-containing bucket (it serves the propensity path). Here bb buckets are ordinary
+    geometry rows -- and the size-1 `bb` bucket is usually the library's largest.
     """
-    d = os.path.join(vdg_lib_dir, frag, 'nr_vdgs', str(subset_size))
-    if not os.path.isdir(d):
-        return {}
     counts = {}
-    for sign in CHARGE_SIGNS:
-        sign_dir = os.path.join(d, sign)
-        if not os.path.isdir(sign_dir):
-            continue
-        for fname in os.listdir(sign_dir):
-            if not fname.endswith('.npz'):
-                continue
-            with np.load(os.path.join(sign_dir, fname)) as npz:
-                bucket = fname[:-4]
-                counts[bucket] = counts.get(bucket, 0) + len(npz['cluster_id'])
+    for _subset, _sign, bucket, path in iter_bucket_files(vdg_lib_dir, frag, subset_size):
+        with np.load(path) as npz:
+            counts[bucket] = counts.get(bucket, 0) + len(npz['cluster_id'])
     return counts
-
 
 # Per-fragment data (enrichments, bucket counts) is reused across every pair the
 # fragment appears in; without these caches a full sweep re-reads it O(n^2) times.
@@ -205,55 +182,17 @@ def _cached_counts(cache, vdg_lib_dir, frag, subset_size):
         cache[key] = _bucket_counts(vdg_lib_dir, frag, subset_size)
     return cache[key]
 
-
-def _load_bucket_all_signs(vdg_lib_dir, frag, subset_size, aa_bucket):
-    """Load and concatenate the disjoint current-format charge partitions."""
-    buckets = [load_vdg_bucket(vdg_lib_dir, frag, subset_size, sign, aa_bucket)
-               for sign in CHARGE_SIGNS]
-    buckets = [bucket for bucket in buckets if bucket is not None]
-    if not buckets:
-        return None
-    keys = ('cg', 'bb', 'cluster_id', 'cluster_num_parents', 'resnames', 'slot_flags')
-    out = {key: np.concatenate([bucket[key] for bucket in buckets], axis=0) for key in keys}
-    out['aa_bucket_parts'] = buckets[0]['aa_bucket_parts']
-    return out
-
-
 def _cached_enrichments(cache, vdg_lib_dir, frag):
     if frag not in cache:
         cache[frag] = compute_single_aa_enrichments(
             os.path.join(vdg_lib_dir, frag, 'nr_vdgs'))
     return cache[frag]
 
-
-def _shared_aa_buckets(vdg_lib_dir, frag_A, frag_B, subset_sizes):
-    """Return set of (subset_size, aa_bucket) tuples present in both libraries."""
-    def _buckets(frag, size):
-        d = os.path.join(vdg_lib_dir, frag, 'nr_vdgs', str(size))
-        buckets = set()
-        for sign in CHARGE_SIGNS:
-            sign_dir = os.path.join(d, sign)
-            if os.path.isdir(sign_dir):
-                buckets.update(f[:-4] for f in os.listdir(sign_dir) if f.endswith('.npz'))
-        return buckets
-
-    shared = set()
-    for size in subset_sizes:
-        for bucket in _buckets(frag_A, size) & _buckets(frag_B, size):
-            shared.add((int(size), bucket))
-    return shared
-
-
-# ---------------------------------------------------------------------------
-# Main comparison loop
-# ---------------------------------------------------------------------------
-
 def _fmt(x):
     """Format a float for TSV output, or 'nan' for NaN."""
     return 'nan' if math.isnan(x) else f'{x:.4f}'
 
-
-def compare_pair(vdg_lib_dir, frag_A, frag_B, subset_sizes, threshold,
+def compare_pair(vdg_lib_dir, frag_A, frag_B, subset_sizes,
                  max_per_lib, skip_geometry, enrich_cache=None, counts_cache=None):
     """
     Compare two fragment libraries.  Returns list of row dicts for TSV output.
@@ -271,49 +210,48 @@ def compare_pair(vdg_lib_dir, frag_A, frag_B, subset_sizes, threshold,
     enrich_B = _cached_enrichments(enrich_cache, vdg_lib_dir, frag_B)
 
     rows = []
-    shared = _shared_aa_buckets(vdg_lib_dir, frag_A, frag_B, subset_sizes)
+    shared = {(size, bucket)
+              for size in subset_sizes
+              for bucket in (_cached_counts(counts_cache, vdg_lib_dir, frag_A, size).keys()
+                            & _cached_counts(counts_cache, vdg_lib_dir, frag_B, size).keys())}
 
     for subset_size, aa_bucket in sorted(shared):
-        cnt_A = _cached_counts(counts_cache, vdg_lib_dir, frag_A, subset_size)
-        cnt_B = _cached_counts(counts_cache, vdg_lib_dir, frag_B, subset_size)
-        N_A   = cnt_A.get(aa_bucket, 0)
-        N_B   = cnt_B.get(aa_bucket, 0)
+        N_A = _cached_counts(counts_cache, vdg_lib_dir, frag_A, subset_size).get(aa_bucket, 0)
+        N_B = _cached_counts(counts_cache, vdg_lib_dir, frag_B, subset_size).get(aa_bucket, 0)
 
         # Single-AA enrichment is only defined per residue type, so for
         # multi-residue buckets these columns describe aa_parts[0] alone.
         aa_parts = [p for p in aa_bucket.split('_') if p not in BB_LABELS]
-        enrich_a = enrich_A.get(aa_parts[0], float('nan')) if aa_parts else float('nan')
-        enrich_b = enrich_B.get(aa_parts[0], float('nan')) if aa_parts else float('nan')
+        aa0 = aa_parts[0] if aa_parts else None
 
-        row = dict(
-            frag_A=frag_A, frag_B=frag_B,
-            subset_size=subset_size, aa_bucket=aa_bucket,
-            N_A=N_A, N_B=N_B,
-            enrichment_A=_fmt(enrich_a), enrichment_B=_fmt(enrich_b),
-            min_dist='nan', frac_A_matched='nan', frac_B_matched='nan',
-        )
+        row = dict(frag_A=frag_A, frag_B=frag_B, subset_size=subset_size, aa_bucket=aa_bucket,
+                   N_A=N_A, N_B=N_B,
+                   enrichment_A=_fmt(enrich_A.get(aa0, float('nan')) if aa0 else float('nan')),
+                   enrichment_B=_fmt(enrich_B.get(aa0, float('nan')) if aa0 else float('nan')),
+                   mmd2='nan', mmd2_self_A='nan', mmd2_self_B='nan')
 
         if not skip_geometry and N_A > 0 and N_B > 0:
-            bucket_A = _load_bucket_all_signs(vdg_lib_dir, frag_A, subset_size, aa_bucket)
-            bucket_B = _load_bucket_all_signs(vdg_lib_dir, frag_B, subset_size, aa_bucket)
+            bucket_A = load_vdg_bucket_all_signs(vdg_lib_dir, frag_A, subset_size, aa_bucket, BUCKET_FIELDS)
+            bucket_B = load_vdg_bucket_all_signs(vdg_lib_dir, frag_B, subset_size, aa_bucket, BUCKET_FIELDS)
             if bucket_A is not None and bucket_B is not None:
                 try:
-                    # Interchangeable slots come from aa_bucket_parts, the array
-                    # contractually aligned to the slot axis of 'bb' that perm
-                    # indexes -- not from an nr vdG's resnames (which vary
-                    # within bb-containing buckets).
-                    aa_bucket_parts = bucket_A['aa_bucket_parts']
-                    if list(bucket_B['aa_bucket_parts']) != list(aa_bucket_parts):
+                    # aa_bucket_parts is the array contractually aligned to bb's slot
+                    # axis (unlike an nr vdG's resnames, which vary within bb-containing
+                    # buckets); a mismatch means the same bucket label means something
+                    # different in each library.
+                    if list(bucket_B['aa_bucket_parts']) != list(bucket_A['aa_bucket_parts']):
                         raise ValueError(
                             f'aa_bucket_parts disagree between libraries: '
-                            f'{list(aa_bucket_parts)} vs {list(bucket_B["aa_bucket_parts"])}')
-                    min_d, frac_a, frac_b = compare_bucket_geometry(
-                        bucket_A['cg'], bucket_A['bb'],
-                        bucket_B['cg'], bucket_B['bb'],
-                        aa_bucket_parts, threshold, max_per_lib)
-                    row['min_dist']        = _fmt(min_d)
-                    row['frac_A_matched']  = _fmt(frac_a)
-                    row['frac_B_matched']  = _fmt(frac_b)
+                            f'{list(bucket_A["aa_bucket_parts"])} vs '
+                            f'{list(bucket_B["aa_bucket_parts"])}')
+                    geom = compare_bucket_geometry(
+                        bucket_A['cg'], bucket_A['bb'], bucket_A['cluster_num_parents'],
+                        bucket_A['parent_biounit'],
+                        bucket_B['cg'], bucket_B['bb'], bucket_B['cluster_num_parents'],
+                        bucket_B['parent_biounit'], max_per_lib)
+                    row['mmd2']        = _fmt(geom['mmd2'])
+                    row['mmd2_self_A'] = _fmt(geom['mmd2_self_A'])
+                    row['mmd2_self_B'] = _fmt(geom['mmd2_self_B'])
                 except Exception as e:
                     print(f'    [WARNING] geometry comparison failed for '
                           f'{aa_bucket}: {e}')
@@ -322,15 +260,11 @@ def compare_pair(vdg_lib_dir, frag_A, frag_B, subset_sizes, threshold,
 
     return rows
 
-
-# ---------------------------------------------------------------------------
-# Visualisation
-# ---------------------------------------------------------------------------
-
-def plot_min_dist_heatmap(rows, frag_A, frag_B, outpath):
+def plot_mmd2_heatmap(rows, frag_A, frag_B, outpath):
     """
-    Plot min_dist as a heatmap: rows = aa_bucket, cols = subset_size.
-    Only buckets with a finite min_dist are shown.
+    Plot mmd2 as a heatmap: rows = aa_bucket, cols = subset_size.
+    Only buckets with a finite mmd2 are shown. Diverging colormap centered at 0, since
+    mmd2 is an unbiased estimator and can be slightly negative near identity.
     """
     try:
         import matplotlib
@@ -340,46 +274,41 @@ def plot_min_dist_heatmap(rows, frag_A, frag_B, outpath):
         print('[WARNING] matplotlib not available; skipping heatmap.')
         return
 
-    finite_rows = [r for r in rows if r['min_dist'] != 'nan']
+    finite_rows = [r for r in rows if r['mmd2'] != 'nan']
     if not finite_rows:
         return
 
-    # Group by subset_size; sort buckets by min_dist ascending
+    # Group by subset_size; sort buckets by mmd2 ascending
     sizes   = sorted({r['subset_size'] for r in finite_rows})
     buckets = sorted({r['aa_bucket'] for r in finite_rows},
-                     key=lambda b: min(float(r['min_dist'])
+                     key=lambda b: min(float(r['mmd2'])
                                        for r in finite_rows if r['aa_bucket'] == b))
 
     matrix = np.full((len(buckets), len(sizes)), np.nan)
     buck_idx = {b: i for i, b in enumerate(buckets)}
     size_idx = {s: j for j, s in enumerate(sizes)}
     for r in finite_rows:
-        matrix[buck_idx[r['aa_bucket']], size_idx[r['subset_size']]] = float(r['min_dist'])
+        matrix[buck_idx[r['aa_bucket']], size_idx[r['subset_size']]] = float(r['mmd2'])
 
     fig, ax = plt.subplots(figsize=(max(2, len(sizes)), max(3, len(buckets) * 0.35)))
     cmap = matplotlib.colormaps['RdYlGn_r'].copy()
     cmap.set_bad(color='lightgrey')
-    im = ax.imshow(matrix, cmap=cmap, vmin=0, vmax=3.0, aspect='auto',
-                   interpolation='nearest')
+    bound = np.nanmax(np.abs(matrix)) if np.isfinite(matrix).any() else 1.0
     ax.set_xticks(range(len(sizes)))
     ax.set_xticklabels([f'size {s}' for s in sizes], fontsize=7)
     ax.set_yticks(range(len(buckets)))
     ax.set_yticklabels(buckets, fontsize=6)
-    ax.set_title(f'CG centroid distance (Å)\n{frag_A}  vs  {frag_B}', fontsize=8, pad=8)
-    plt.colorbar(im, ax=ax, fraction=0.05, pad=0.02).ax.tick_params(labelsize=6)
+    ax.set_title(f'mmd2 (weighted, unbiased)\n{frag_A}  vs  {frag_B}', fontsize=8, pad=8)
+    plt.colorbar(ax.imshow(matrix, cmap=cmap, vmin=-bound, vmax=bound, aspect='auto',
+                          interpolation='nearest'),
+                ax=ax, fraction=0.05, pad=0.02).ax.tick_params(labelsize=6)
     plt.tight_layout()
     plt.savefig(outpath, dpi=300, bbox_inches='tight')
     plt.close()
 
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
 TSV_FIELDS = ['frag_A', 'frag_B', 'subset_size', 'aa_bucket',
-              'N_A', 'N_B', 'min_dist', 'frac_A_matched', 'frac_B_matched',
+              'N_A', 'N_B', 'mmd2', 'mmd2_self_A', 'mmd2_self_B',
               'enrichment_A', 'enrichment_B']
-
 
 def _safe_label(s):
     """Make a filesystem-safe filename label; prefix uppercase with '_' so
@@ -399,7 +328,6 @@ def _safe_label(s):
             out.append(ch)
     return ''.join(out)
 
-
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -412,10 +340,6 @@ def parse_args():
     parser.add_argument('--outdir', default=os.path.join('outputs', 'bioisosteres',
                                                           'cg_geometry'),
                         help='Output directory for TSV and PNG files.')
-    parser.add_argument('--match-threshold', type=float, default=1.5,
-                        dest='threshold',
-                        help='Å cutoff to count an nr vdG as "matched" '
-                             '(default: 1.5).')
     parser.add_argument('--subset-sizes', nargs='+', type=int, default=[1, 2],
                         dest='subset_sizes', choices=[1, 2],
                         help='Subset sizes to include (default: 1 2).')
@@ -429,7 +353,6 @@ def parse_args():
     parser.add_argument('--no-plot', action='store_true',
                         help='Skip heatmap generation.')
     return parser.parse_args()
-
 
 def main():
     args = parse_args()
@@ -458,7 +381,7 @@ def main():
             print(f'\n{frag_A}  vs  {frag_B}')
             rows = compare_pair(
                 args.vdg_lib_dir, frag_A, frag_B,
-                args.subset_sizes, args.threshold, args.max_per_lib,
+                args.subset_sizes, args.max_per_lib,
                 args.skip_geometry, enrich_cache, counts_cache)
 
             for row in rows:
@@ -467,21 +390,20 @@ def main():
 
             if rows:
                 print(f'  {len(rows)} AA buckets compared.')
-                finite = [r for r in rows if r['min_dist'] != 'nan']
+                finite = [r for r in rows if r['mmd2'] != 'nan']
                 if finite:
-                    best = min(finite, key=lambda r: float(r['min_dist']))
-                    print(f'  Best match: {best["aa_bucket"]} '
+                    best = min(finite, key=lambda r: float(r['mmd2']))
+                    print(f'  Closest bucket: {best["aa_bucket"]} '
                           f'(size {best["subset_size"]}) '
-                          f'min_dist={best["min_dist"]} Å')
+                          f'mmd2={best["mmd2"]} (self_A={best["mmd2_self_A"]})')
 
             if not args.no_plot:
                 png = os.path.join(
                     args.outdir,
-                    f'min_dist_{_safe_label(frag_A)}_vs_{_safe_label(frag_B)}.png')
-                plot_min_dist_heatmap(rows, frag_A, frag_B, png)
+                    f'mmd2_{_safe_label(frag_A)}_vs_{_safe_label(frag_B)}.png')
+                plot_mmd2_heatmap(rows, frag_A, frag_B, png)
 
     print(f'\nResults written to: {tsv_path}')
-
 
 if __name__ == '__main__':
     main()

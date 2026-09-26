@@ -12,7 +12,7 @@ rdkit sometimes parses them incorrectly.
 Hit-finder options supplied to this generator are added to every generated job, e.g.:
 
     python ligand_vdgs/score_poses/make_sge_scripts_for_hit_finder.py \
-        --rmsd-threshold 1.5 --contact-cutoff 3.8 --no-dedup
+        --rmsd-threshold 1.5 --contact-cutoff 3.8
 '''
 
 import argparse
@@ -56,16 +56,6 @@ def parse_args(argv=None):
         type=float,
         help="Pass --contact-cutoff to every hit-finder job.",
     )
-    parser.add_argument(
-        "--no-dedup",
-        action="store_true",
-        help="Pass --no-dedup to every hit-finder job.",
-    )
-    parser.add_argument(
-        "--min-shared-atoms",
-        type=int,
-        help="Pass --min-shared-atoms to every hit-finder job.",
-    )
     return parser.parse_args(argv)
 
 
@@ -76,14 +66,11 @@ def optional_hit_finder_args(args):
         ("--rmsd-threshold", args.rmsd_threshold),
         ("--ref-pdb", args.ref_pdb),
         ("--contact-cutoff", args.contact_cutoff),
-        ("--min-shared-atoms", args.min_shared_atoms),
     ):
         if value is not None:
             command_args.extend((flag, str(value)))
     if args.print_bsr_selection:
         command_args.append("--print-bsr-selection")
-    if args.no_dedup:
-        command_args.append("--no-dedup")
     return shlex.join(command_args)
 
 

@@ -177,8 +177,8 @@ class SchemaVersionIsEnforced(unittest.TestCase):
             with open(path, "wb") as handle:
                 np.savez_compressed(handle, **arrays)
             # Both readers, not just the hit-finding one: load_bucket_npz is
-            # what load_cluster_members, the bioisostere analysis and
-            # h_class_diagnostic go through, so a check in one reader only
+            # what load_cluster_members and the bioisostere analysis
+            # go through, so a check in one reader only
             # means a stale library is refused by hit finding and read
             # silently by everything else.
             with self.assertRaises(vdg_npz_utils.BucketSchemaMismatch):

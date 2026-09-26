@@ -1,5 +1,5 @@
 """assert_discriminates must REFUSE the two clauses confirmed vacuous -- the bb_
-clause (DR-49 addendum 1) and the aromatic clause (vacuity audit V7) -- and accept
+clause and the aromatic clause (vacuity audit V7) -- and accept
 their replacements. If this file goes green with the broken clauses in place, the
 helper has stopped discriminating and every call to it is worthless.
 """

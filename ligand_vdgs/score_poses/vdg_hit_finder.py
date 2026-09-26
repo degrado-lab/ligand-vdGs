@@ -2,32 +2,21 @@
 which downstream tools should import directly."""
 
 import os
-import csv
 import argparse
 import time
 import traceback
 import multiprocessing as mp
 from contextlib import redirect_stdout, redirect_stderr
 
-import pandas as pd
 import prody as pr
 
-from ligand_vdgs.functions import Frags
+from ligand_vdgs.functions import ligand_structure
 from ligand_vdgs.functions.utils import convert_time_elapsed
+from ligand_vdgs.score_poses.hit_finder_output import (
+    RESULT_FIELDS, _describe_rmsd_threshold, write_results as _write_results)
 
-from ligand_vdgs.score_poses.hit_finder_core import init_worker, process_work_item
-
-RESULT_FIELDS = [
-    "pdbfile", "struct_id", "lig_instance", "frag", "query_frag", "subset_size", "bsr_combo",
-    "aa_bucket", "charge_sign", "vdg_index", "vdg_cluster_id", "vdg_cluster_num_parents", "vdg_rmsd",
-    "rmsd_threshold", "aa_perm_idx", "q_site_idx", "q_cg_perm_idx", "q_atom_indices",
-    "R00", "R01", "R02", "R10", "R11", "R12", "R20", "R21", "R22", "t0", "t1", "t2",
-    # Backbone-only fit (query CG held out of the Kabsch objective). Measure CG
-    # placement error with these, not R/t -- R/t were fitted to the query CG.
-    "Rbb00", "Rbb01", "Rbb02", "Rbb10", "Rbb11", "Rbb12", "Rbb20", "Rbb21", "Rbb22",
-    "tbb0", "tbb1", "tbb2",
-]
-
+from ligand_vdgs.score_poses.hit_finder_core import (MATCH_MODES, init_worker, lib_entries,
+    process_work_item)
 
 def _collect_pool_results(work, async_results):
     """Collect pool tasks independently so one raised task does not lose the rest."""
@@ -42,58 +31,6 @@ def _collect_pool_results(work, async_results):
             results.append((pdbfile, "", None, [], {}, error_text))
     return results
 
-
-# -------------- write results ----------- #
-
-def _sample_name_from_pdbfile(pdbfile):
-    base = os.path.basename(str(pdbfile))
-    for ext in (".pdb.gz", ".pdb", ".cif.gz", ".cif", ".gz"):
-        if base.endswith(ext):
-            return base[:-len(ext)]
-    return os.path.splitext(base)[0]
-
-
-def _describe_rmsd_threshold(rmsd_threshold):
-    if rmsd_threshold is None:
-        return 'per-combo normalize_rmsd(n_atoms, "cgvdmbb")'
-    return str(rmsd_threshold)
-
-
-def _write_results(outdir, all_matches, rmsd_records, rmsd_threshold):
-    os.makedirs(outdir, exist_ok=True)
-
-    if rmsd_records:
-        rmsd_path = os.path.join(outdir, "ligand_rmsd_summary.tsv")
-        with open(rmsd_path, "w") as fh:
-            fh.write("pdbfile\tligand_rmsd\n")
-            for pdbfile, rmsd in sorted(rmsd_records):
-                fh.write(f"{pdbfile}\t{rmsd:.3f}\n")
-        print(f"Wrote ligand RMSD summary to: {rmsd_path}")
-
-    results_path = os.path.join(outdir, "vdg_hits.tsv")
-    with open(results_path, "w", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=RESULT_FIELDS, delimiter="\t")
-        w.writeheader()
-        w.writerows(all_matches)
-    print(f"Wrote vdG match results to:   {results_path}")
-
-    if not all_matches:
-        return
-
-    df = pd.crosstab(
-        pd.Series([_sample_name_from_pdbfile(r["pdbfile"]) for r in all_matches], name="pdb"),
-        pd.Series([r["frag"] for r in all_matches]),
-    ).sort_index(axis=0).sort_index(axis=1)
-
-    txt_path = os.path.join(outdir, "results_summary.txt")
-    with open(txt_path, "w") as fh:
-        fh.write(f"vdG hit counts per sample (rows) and fragment (columns); counts use "
-                 f"rmsd_threshold={_describe_rmsd_threshold(rmsd_threshold)}\n\n")
-        fh.write(df.to_string())
-        fh.write("\n")
-    print(f"Wrote summary table to:        {txt_path}")
-
-
 # ------------------- main ---------------- #
 
 def _load_ref_ligand(ref_path, lig_smiles):
@@ -102,7 +39,7 @@ def _load_ref_ligand(ref_path, lig_smiles):
     parse = pr.parseCIF if ref_path.endswith((".cif", ".cif.gz")) else pr.parsePDB
     try:
         # get_query_ligand_mol reports RDKit parse failures by returning None.
-        mol = Frags.get_query_ligand_mol(parse(ref_path), lig_smiles)
+        mol = ligand_structure.get_query_ligand_mol(parse(ref_path), lig_smiles)
     except (ValueError, TypeError) as e:
         mol = None
         print(f"[WARNING] Failed to extract reference ligand from {ref_path}: {e}; "
@@ -112,40 +49,32 @@ def _load_ref_ligand(ref_path, lig_smiles):
               "ligand RMSD will not be computed.", flush=True)
     return mol
 
-
 def main(argv=None):
-    p = argparse.ArgumentParser(
-        prog="vdg-hit-finder",
-        description="Find vdG hits for a ligand across a directory of models.",
-    )
+    p = argparse.ArgumentParser(prog="vdg-hit-finder",
+                                description="Find vdG hits for a ligand across a directory of models.")
     p.add_argument("--smiles", required=True, help="Ligand SMILES")
     p.add_argument("--query-dir", required=True, help="Directory of query PDB/CIF models")
     p.add_argument("--vdg-lib-dir", required=True, help="vdG library directory")
+    p.add_argument("--rmsd-threshold", type=float, default=None,
+                    help="Max bb+CG RMSD (Å) per hit. Default: derived from the total number "
+                         "of bb+CG atoms via normalize_rmsd() (same fn used during library clustering).")
     p.add_argument(
-        "--rmsd-threshold", type=float, default=None,
-        help="Max bb+CG RMSD (Å) per hit. Default: derived from the total number "
-             "of bb+CG atoms via normalize_rmsd() (same fn used during library clustering).",
-    )
+        "--match-mode", choices=MATCH_MODES, default="joint",
+        help="joint: match on bb+CG RMSD (pose scoring; slot gate: virtual CB + Pro N on the query CG). bb: placement mode, match on "
+             "backbone alone at tau*sqrt(n_atoms/N_bb); reads neither the query CG nor side "
+             "chains (slot gate: virtual CB + Pro N on the placed CG). BSR combos still come "
+             "from residues within 4.5 Å of the query ligand (default: joint).")
     p.add_argument("--ref-pdb", help="Ground-truth PDB/CIF with the same ligand; computes ligand RMSD.")
     p.add_argument("--outdir", help="Output dir (default: ./vdg-hits/<basename(query_dir)>)")
     p.add_argument("--nprocs", type=int, default=4, help="Worker processes, parallel over models (default: 4)")
     p.add_argument("--print-bsr-selection", action="store_true",
                     help="Print ProDy binding-site selection for each model.")
-    p.add_argument(
-        "--contact-cutoff", type=float, default=None,
-        help="Skip BSR combos with no atom within this distance (Å) of any CG atom. "
-             "Disabled by default; 3.8 is a reasonable value.",
-    )
-    p.add_argument(
-        "--no-dedup", dest="deduplicate", action="store_false",
-        help="Disable hit deduplication (default: hits sharing a BSR combo and at least "
-             "--min-shared-atoms query-ligand atoms collapse to the best-RMSD hit).",
-    )
-    p.add_argument(
-        "--min-shared-atoms", type=int, default=3,
-        help="Shared query-ligand atom count to call two hits duplicates (default: 3).",
-    )
+    p.add_argument("--contact-cutoff", type=float, default=None,
+                    help="Joint mode only: skip BSR combos with no backbone N/CA/C or virtual-CB atom "
+                         "within this distance (Å) of any query CG atom. Disabled by default; 3.8 is a reasonable value.")
     args = p.parse_args(argv)
+    if args.match_mode == "bb" and args.contact_cutoff is not None:
+        p.error("[ERROR] --contact-cutoff reads the query CG; it is joint-mode only.")
 
     outdir = args.outdir or os.path.join(
         os.getcwd(), "vdg-hits", os.path.basename(os.path.normpath(args.query_dir)))
@@ -159,14 +88,11 @@ def main(argv=None):
         return
 
     ref_lig_mol = _load_ref_ligand(args.ref_pdb, args.smiles) if args.ref_pdb else None
-    vdg_lib_entries = set(os.listdir(args.vdg_lib_dir))
+    vdg_lib_entries = lib_entries(args.vdg_lib_dir)
 
-    work = [
-        (pdbfile, os.path.join(args.query_dir, pdbfile), args.smiles, args.vdg_lib_dir,
-         args.rmsd_threshold, ref_lig_mol, bool(args.print_bsr_selection),
-         args.contact_cutoff, args.deduplicate, args.min_shared_atoms)
-        for pdbfile in pdbs
-    ]
+    work = [(pdbfile, os.path.join(args.query_dir, pdbfile), args.smiles, args.vdg_lib_dir,
+             args.rmsd_threshold, ref_lig_mol, bool(args.print_bsr_selection),
+             args.contact_cutoff, args.match_mode) for pdbfile in pdbs]
 
     log_path = os.path.join(outdir, "hit_finder_log.txt")
     start_time = time.perf_counter()
@@ -175,7 +101,7 @@ def main(argv=None):
 
     with open(log_path, "w") as log_fh, redirect_stdout(log_fh), redirect_stderr(log_fh):
         print("Config:")
-        for label, value in [
+        for label, value in (
             ("ligand_smiles", args.smiles),
             ("query_dir", args.query_dir),
             ("vdg_lib_dir", args.vdg_lib_dir),
@@ -183,10 +109,8 @@ def main(argv=None):
             ("rmsd_threshold", f"{_describe_rmsd_threshold(args.rmsd_threshold)} "
                                f"({'derived' if args.rmsd_threshold is None else 'fixed'})"),
             ("contact_cutoff", f"{args.contact_cutoff} (None = disabled)"),
-            ("deduplicate", args.deduplicate),
-            ("min_shared_atoms", args.min_shared_atoms),
-            ("nprocs", nprocs),
-        ]:
+            ("match_mode", args.match_mode),
+            ("nprocs", nprocs)):
             print(f"  {label:<20}: {value}")
         print()
 
@@ -226,17 +150,16 @@ def main(argv=None):
         if failed_models:
             print("Failed models:", flush=True)
             for pdbfile in failed_models:
-                print(f"  - {pdbfile}", flush=True)
+            print(f"  - {pdbfile}", flush=True)
 
         if all_frags_in_lib:
-            Frags.summarize_frags(all_frags_in_lib, frags_to_exclude=[],
-                                  frags_to_include="all", logfile_fh=log_fh)
+            ligand_structure.summarize_frags(all_frags_in_lib, frags_to_exclude=[],
+                                             frags_to_include="all", logfile_fh=log_fh)
 
         h, m, s = convert_time_elapsed(time.perf_counter() - start_time)
         print(f"\nTotal job time: {h} h, {m} mins, and {round(s)} secs.", flush=True)
 
     _write_results(outdir, all_matches, rmsd_records, args.rmsd_threshold)
-
 
 if __name__ == "__main__":
     main()
